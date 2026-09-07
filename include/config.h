@@ -38,17 +38,17 @@
 #ifndef CAN_BITRATE_KBPS
 #define CAN_BITRATE_KBPS 500 // VESC default CAN_BAUD_500K. Supported: 125, 250, 500, 1000. Must match VESC Tool "CAN Baud Rate".
 #endif
-// 0 = TWAI_MODE_NORMAL: the controller acknowledges frames; the only thing this firmware ever transmits is the
+// 0 = normal mode: the controller acknowledges frames; the only thing this firmware ever transmits is the
 //     optional COMM_GET_VALUES_SELECTIVE poll (VESC_POLL_MS below; 0 = strictly passive, never transmits).
 //     REQUIRED when the VESC and this board are the only two nodes: the VESC's bxCAN has no automatic-retransmit
 //     limit, so with a non-ACKing listener it goes error-passive and repeats one stale frame forever.
-// 1 = TWAI_MODE_LISTEN_ONLY (no ACK at all): only if another ACKing node (2nd VESC, BMS, VESC Tool adapter) exists;
+// 1 = listen-only (no ACK at all): only if another ACKing node (2nd VESC, BMS, VESC Tool adapter) exists;
 //     requires VESC_POLL_MS 0 (a listen-only controller cannot transmit).
 #ifndef CAN_LISTEN_ONLY
 #define CAN_LISTEN_ONLY 0
 #endif
 #ifndef CAN_RX_QUEUE_LEN
-#define CAN_RX_QUEUE_LEN 64 // driver RX queue (frames). Default 5 is too small for 6 status frames per 20 ms burst.
+#define CAN_RX_QUEUE_LEN 64 // RX queue between the TWAI ISR and canTask (frames). 6 status frames arrive as a burst every 20 ms.
 #endif
 #ifndef VESC_CAN_ID
 #define VESC_CAN_ID -1 // -1 = accept any VESC id and lock onto the first one seen; 0..254 = only this id (VESC Tool "VESC ID")
@@ -66,10 +66,10 @@
 #define CAN_EMA_ALPHA 0.15f // exponential smoothing of displayed I_in / I_motor / V_in (STATUS_4 current_in is unfiltered). 1.0f = off
 #endif
 #ifndef CAN_HEALTH_LOG_MS
-#define CAN_HEALTH_LOG_MS 10000 // period of the twai_get_status_info() snapshot (TEC/REC/bus errors)
+#define CAN_HEALTH_LOG_MS 10000 // period of the twai_node_get_info() health snapshot (TEC/REC/bus errors)
 #endif
 #ifndef CAN_LOG_RAW_FRAMES
-#define CAN_LOG_RAW_FRAMES 0 // 1 = log_d() every accepted raw frame (needs CORE_DEBUG_LEVEL >= 4)
+#define CAN_LOG_RAW_FRAMES 0 // 1 = debug-log every accepted raw frame (needs -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG)
 #endif
 
 // ============================================================================
@@ -93,7 +93,7 @@
 #define VESC_EXT_STALE_MS 3000 // polled values older than this are shown as "--"
 #endif
 #ifndef CAN_TX_QUEUE_LEN
-#define CAN_TX_QUEUE_LEN 4 // driver TX queue while polling is enabled (0 is used when VESC_POLL_MS == 0)
+#define CAN_TX_QUEUE_LEN 4 // TWAI node TX queue depth (>= 1); only the poll requests ever use it
 #endif
 
 // ============================================================================
@@ -104,7 +104,7 @@
                      // 9 = use the on-board BOOT button instead (fine at runtime; holding it during reset enters download mode)
 #endif
 #ifndef BUTTON_ACTIVE_LOW
-#define BUTTON_ACTIVE_LOW 1 // 1 = pressed reads LOW (button to GND, INPUT_PULLUP); 0 = pressed reads HIGH (button to 3V3, INPUT_PULLDOWN)
+#define BUTTON_ACTIVE_LOW 1 // 1 = pressed reads LOW (button to GND, internal pull-up); 0 = pressed reads HIGH (button to 3V3, internal pull-down)
 #endif
 #ifndef BUTTON_DEBOUNCE_MS
 #define BUTTON_DEBOUNCE_MS 30
@@ -149,7 +149,7 @@
 #endif
 
 // ============================================================================
-// OLED: 128x64 SSD1309 over I2C (DIYables_OLED_SSD1309 library, Adafruit GFX)
+// OLED: 128x64 SSD1309 over I2C (native u8g2 on driver/i2c_master.h, HAL in src/u8g2_hal_idf.cpp)
 // ============================================================================
 // Wired to the FireBeetle's SPI header pins (SCK -> SCL, MOSI -> SDA, RES -> RST); the C6
 // routes I2C to any GPIO through its matrix.
@@ -176,7 +176,7 @@
 #define OLED_HEIGHT 64
 #endif
 #ifndef OLED_ROTATION
-#define OLED_ROTATION 0 // 0 = normal, 2 = upside down (Adafruit GFX setRotation values 0..3; layout assumes landscape)
+#define OLED_ROTATION 0 // 0 = normal, 2 = upside down (u8g2 U8G2_R0 / U8G2_R2; layout assumes landscape)
 #endif
 #ifndef OLED_PERIOD_MS
 #define OLED_PERIOD_MS 250 // display task tick (4 Hz). A full 1 KB frame over 400 kHz I2C takes ~25 ms.
@@ -204,7 +204,7 @@
 #define GNSS_BAUDS {115200, 38400, 9600, 57600, 230400} // autobaud order: the target baud first (a receiver configured by us keeps it while powered / battery-backed), then the factory defaults 38400 (M9/M10) and 9600 (M8, MAX-M10S)
 #endif
 #ifndef GNSS_RX_BUFFER
-#define GNSS_RX_BUFFER 2048 // Serial1 RX ring (bytes). Default 256 would overflow at 10 Hz while a frame is pushed (NAV-PVT = 100 B).
+#define GNSS_RX_BUFFER 2048 // UART1 driver RX ring (bytes). 256 would overflow at 10 Hz while a display frame is pushed (NAV-PVT = 100 B).
 #endif
 #ifndef GNSS_TARGET_BAUD
 #define GNSS_TARGET_BAUD 115200 // after detection the receiver's UART1 is switched to this baud (RAM+BBR); 0 = keep the detected baud. Must be in GNSS_BAUDS.
@@ -244,7 +244,7 @@
 #define TASK_PRIO_GNSS 5
 #endif
 #ifndef TASK_PRIO_DISP
-#define TASK_PRIO_DISP 2 // above the Arduino loopTask (1), below the data producers
+#define TASK_PRIO_DISP 2 // above the supervisor (app_main, priority 1), below the data producers
 #endif
 #ifndef WDT_TIMEOUT_MS
 #define WDT_TIMEOUT_MS 20000 // task watchdog; must exceed the longest legitimate task stall (a stuck I2C bus costs 50 ms per transaction)
@@ -271,7 +271,7 @@
 #define LOG_TRIP_MS 5000    // period of the trip / efficiency log line (0 = off)
 #endif
 #ifndef SERIAL_BOOT_DELAY_MS
-#define SERIAL_BOOT_DELAY_MS 1500 // give the USB-CDC host time to re-enumerate so the boot banner is visible
+#define SERIAL_BOOT_DELAY_MS 1500 // give the USB-Serial/JTAG host time to re-enumerate so the boot banner is visible
 #endif
 #ifndef PIN_LED
 #define PIN_LED 15 // on-board green LED (active high): 1 Hz blink = VESC data fresh, slow blink = no VESC data
@@ -282,10 +282,10 @@
 #define CAN_TASK_STACK 4096 // canTask stack, bytes
 #endif
 #ifndef CAN_INSTALL_RETRY_MS
-#define CAN_INSTALL_RETRY_MS 5000 // retry period while twai_driver_install()/twai_start() keep failing
+#define CAN_INSTALL_RETRY_MS 5000 // retry period while creating / enabling the TWAI node keeps failing
 #endif
 #ifndef CAN_RX_TIMEOUT_MS
-#define CAN_RX_TIMEOUT_MS 100 // twai_receive() block time = heartbeat granularity of canTask
+#define CAN_RX_TIMEOUT_MS 100 // RX queue wait = heartbeat granularity of canTask
 #endif
 #ifndef CAN_ERR_LOG_MIN_MS
 #define CAN_ERR_LOG_MIN_MS 2000 // rate limit for bus-error / queue-full log lines (counts are aggregated)
@@ -306,20 +306,20 @@
 #define GNSS_AUTOBAUD_RETRY_MS 2000 // pause between failed autobaud passes
 #endif
 #ifndef OLED_TASK_STACK
-#define OLED_TASK_STACK 6144 // display task stack, bytes (the refresh log_d line prints the high-water mark)
+#define OLED_TASK_STACK 6144 // display task stack, bytes (the debug refresh line prints the high-water mark)
 #endif
 #ifndef OLED_INIT_RETRY_MS
 #define OLED_INIT_RETRY_MS 5000 // re-probe / re-init period while the panel is absent, and presence re-check while running
 #endif
 #ifndef OLED_I2C_TIMEOUT_MS
-#define OLED_I2C_TIMEOUT_MS 50 // Wire transaction timeout (a stuck bus costs this per transaction)
+#define OLED_I2C_TIMEOUT_MS 50 // I2C transaction timeout (a stuck bus costs this per transaction)
 #endif
 
 #ifndef OLED_BUTTON_POLL_MS
 #define OLED_BUTTON_POLL_MS 20 // display task loop period = button sampling granularity
 #endif
 #ifndef CAN_TX_WAIT_MS
-#define CAN_TX_WAIT_MS 10 // twai_transmit() block time for a poll request
+#define CAN_TX_WAIT_MS 10 // twai_node_transmit() block time for a poll request
 #endif
 #ifndef VESC_POLL_LOG_MIN_MS
 #define VESC_POLL_LOG_MIN_MS 10000 // rate limit for "no reply" / "bad reply" / "not transmitted" warnings
@@ -407,10 +407,10 @@
 #error "CAN_OWN_ID must differ from VESC_CAN_ID"
 #endif
 
-#ifndef UNIT_TEST // native host tests only; every firmware build (Arduino or not) must pass this check
+#ifndef UNIT_TEST // native host tests only; every firmware build must pass this check
 #include "sdkconfig.h"
-#if !defined(ARDUINO_ARCH_ESP32) || !defined(CONFIG_IDF_TARGET_ESP32C6)
-#error "This firmware targets the ESP32-C6 with the Arduino core (pioarduino). Check the pinned platform URL in platformio.ini."
+#if !defined(CONFIG_IDF_TARGET_ESP32C6)
+#error "This firmware targets the ESP32-C6 (ESP-IDF). Check platform / board in platformio.ini and sdkconfig.defaults."
 #endif
 #endif
 

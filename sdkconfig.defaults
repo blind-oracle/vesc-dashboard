@@ -1,0 +1,36 @@
+# boat-motor: ESP-IDF 6.1 defaults for the ESP32-C6 (DFRobot FireBeetle 2).
+# These reproduce what the Arduino core used to set implicitly. The builder derives
+# sdkconfig.<env> from this file; edit here, never in the generated file.
+CONFIG_IDF_TARGET="esp32c6"
+
+# Flash: 4 MB, QIO, 80 MHz. The PlatformIO builder checks the size against boards/*.json.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+# Partition table: partitions.csv in the project root (2 x 1.25 MB OTA app slots, spiffs, coredump).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# 1 ms tick (IDF default is 100 Hz): every pdMS_TO_TICKS() delay, the button debounce and the
+# task heartbeats assume millisecond resolution.
+CONFIG_FREERTOS_HZ=1000
+
+# Console and ESP_LOG output over the USB-Serial/JTAG port (GPIO12/13). Output is dropped, never
+# blocked, while no host is attached. UART0 (GPIO16/17) stays the ROM boot console.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Runtime log level info. Debug lines of this project's own tags are enabled per build with
+# -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG in platformio.ini (main.cpp raises those tags at boot).
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# app_main() is the supervisor: it copies a SharedState snapshot and formats ~1 KB log lines.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Optimise for size like the Arduino build (-Os).
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# Core dumps into the coredump partition (ELF format).
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y

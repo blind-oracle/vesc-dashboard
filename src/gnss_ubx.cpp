@@ -1,4 +1,4 @@
-// GNSS task: u-blox UBX receiver on HP UART1 (Serial1).
+// GNSS task: u-blox UBX receiver on HP UART1 (ESP-IDF driver/uart.h).
 //
 // Phase machine (runs entirely inside gnssTask, setup() never waits):
 //   AUTOBAUD  try each baud in GNSS_BAUDS: listen for any valid UBX frame,
@@ -10,7 +10,7 @@
 //             CFG-PRT UART1 (8N1, out UBX only). The receiver switches as soon
 //             as it has processed the frame and its ACK normally leaves at the
 //             NEW rate, so the ACK is never awaited: flush TX, 100 ms pause
-//             (u-blox integration manual), Serial1 to the target baud, RX
+//             (u-blox integration manual), UART1 to the target baud, RX
 //             discarded, up to kBaudVerifyPolls MON-VER polls as the proof (the
 //             receiver may ignore input for a moment right after the change).
 //             No reply -> back to AUTOBAUD (both bauds are in GNSS_BAUDS, so
@@ -25,11 +25,11 @@
 //
 // Rules kept throughout: the heartbeat hb_gnss is touched at least every
 // ~100 ms (every wait is a loop of short vTaskDelay), no logging or UART I/O
-// while holding the state mutex, timestamps are millis() with 0 = never.
+// while holding the state mutex, timestamps are state_now_ms() with 0 = never.
 #include "gnss_ubx.h"
 
-#include <Arduino.h>
-#include <HardwareSerial.h>
+#include <driver/uart.h>
+#include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -39,6 +39,8 @@
 #include "config.h"
 #include "shared_state.h"
 #include "ubx_min.h"
+
+static const char *TAG = "gnss";
 
 // Local fallbacks for tunables that config.h does not (yet) define.
 #ifndef GNSS_AUTOBAUD_LISTEN_MS
@@ -51,7 +53,7 @@
 #define GNSS_AUTOBAUD_RETRY_MS 2000    // pause between failed autobaud passes
 #endif
 #ifndef GNSS_TASK_STACK
-#define GNSS_TASK_STACK 4096           // bytes (Arduino's xTaskCreate takes bytes)
+#define GNSS_TASK_STACK 4096           // bytes (ESP-IDF's xTaskCreate() takes bytes)
 #endif
 #ifndef GNSS_TARGET_BAUD
 #define GNSS_TARGET_BAUD 0             // 0 = keep the detected baud (config.h normally says 115200)
@@ -65,9 +67,40 @@
 
 namespace {
 
-// Serial1 == HP UART1 on the ESP32-C6. Serial2 is the LP UART (16-byte FIFO,
-// different clock): never use it here.
-HardwareSerial &GNSS = Serial1;
+// HP UART1 on the ESP32-C6. The LP UART (16-byte FIFO, different clock) must
+// never be used here. Thin wrapper over driver/uart.h with exactly the
+// semantics the phase machine relies on; the driver is installed in gnss_start().
+constexpr uart_port_t kUart = UART_NUM_1;
+
+struct GnssUart {
+  // Bytes waiting in the driver's RX ring (0 when the driver is not installed).
+  int available() const {
+    size_t n = 0;
+    return uart_get_buffered_data_len(kUart, &n) == ESP_OK ? (int)n : 0;
+  }
+  // One byte from the ring, -1 when it is empty. Never blocks.
+  int read() const {
+    uint8_t c = 0;
+    return uart_read_bytes(kUart, &c, 1, 0) == 1 ? (int)c : -1;
+  }
+  // No TX ring is installed, so this returns once the bytes sit in the 128-byte
+  // hardware FIFO (every frame we send is smaller than that).
+  size_t write(const uint8_t *buf, size_t n) const {
+    const int w = uart_write_bytes(kUart, buf, n);
+    return w < 0 ? 0u : (size_t)w;
+  }
+  // Reprograms the divider only; callers drain TX first where that matters.
+  void updateBaudRate(uint32_t baud) const { uart_set_baudrate(kUart, baud); }
+  // Returns once the TX FIFO is empty AND the transmitter is idle, i.e. the last
+  // stop bit has left the pin (about 29 ms for a 20-byte CFG-PRT at 9600).
+  void flushTx() const { uart_wait_tx_done(kUart, pdMS_TO_TICKS(200)); }
+  // flushTx() plus discard of the RX ring and the hardware RX FIFO.
+  void flushAll() const {
+    flushTx();
+    uart_flush_input(kUart);
+  }
+};
+const GnssUart GNSS;
 
 constexpr uint32_t kBauds[] = GNSS_BAUDS;
 constexpr size_t kNumBauds = sizeof(kBauds) / sizeof(kBauds[0]);
@@ -127,7 +160,7 @@ GnssCtx s_ctx;
 
 // ---------------------------------------------------------------- small helpers
 uint32_t now_nz() {
-  const uint32_t t = millis();
+  const uint32_t t = state_now_ms();
   return t ? t : 1u;  // 0 is reserved for "never"
 }
 
@@ -269,7 +302,7 @@ bool ubx_send(uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t len) {
   uint8_t frame[64 + UBX_FRAME_OVERHEAD];
   const size_t n = ubxBuildFrame(frame, sizeof(frame), cls, id, pl, len);
   if (n == 0) {
-    log_e("GNSS: frame %02X %02X len %u does not fit the TX buffer", cls, id, (unsigned)len);
+    ESP_LOGE(TAG, "GNSS: frame %02X %02X len %u does not fit the TX buffer", cls, id, (unsigned)len);
     return false;
   }
   return GNSS.write(frame, n) == n;
@@ -281,11 +314,11 @@ bool ubx_send(uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t len) {
 // The reference snippet this replaces only wildcarded cls and therefore never
 // matched an ACK; both wildcards are required.
 bool ubx_wait_for(uint8_t cls, uint8_t id, uint32_t timeout_ms) {
-  const uint32_t start = millis();
+  const uint32_t start = state_now_ms();
   for (;;) {
     hb_touch(hb_gnss);
     if (pump_rx(cls, id)) return true;
-    if ((uint32_t)(millis() - start) >= timeout_ms) return false;
+    if ((uint32_t)(state_now_ms() - start) >= timeout_ms) return false;
     vTaskDelay(pdMS_TO_TICKS(kPumpSliceMs));
   }
 }
@@ -295,9 +328,9 @@ bool ubx_wait_for(uint8_t cls, uint8_t id, uint32_t timeout_ms) {
 // skipped). Returns +1 ACK, 0 NAK, -1 timeout / send failure.
 int ubx_send_ack(uint8_t cls, uint8_t id, const uint8_t *pl, uint16_t len) {
   if (!ubx_send(cls, id, pl, len)) return -1;
-  const uint32_t start = millis();
+  const uint32_t start = state_now_ms();
   for (;;) {
-    const uint32_t elapsed = (uint32_t)(millis() - start);
+    const uint32_t elapsed = (uint32_t)(state_now_ms() - start);
     if (elapsed >= (uint32_t)GNSS_ACK_TIMEOUT_MS) return -1;
     if (!ubx_wait_for(UBX_CLASS_ACK, UBX_ANY, (uint32_t)GNSS_ACK_TIMEOUT_MS - elapsed)) return -1;
     const UbxParser &p = s_ctx.parser;
@@ -338,7 +371,7 @@ bool autobaud_try(uint32_t baud, BaudStat &stat) {
 
   stat.bytes = s_ctx.rx_bytes;
   stat.dollars = s_ctx.rx_dollars;
-  log_d("GNSS: autobaud %lu: %s (%lu bytes, %lu '$')", (unsigned long)baud, found ? "UBX" : "nothing",
+  ESP_LOGD(TAG, "GNSS: autobaud %lu: %s (%lu bytes, %lu '$')", (unsigned long)baud, found ? "UBX" : "nothing",
         (unsigned long)stat.bytes, (unsigned long)stat.dollars);
   return found;
 }
@@ -369,7 +402,7 @@ void phase_autobaud() {
       stats[i] = BaudStat{0, 0};
       if (autobaud_try(kBauds[i], stats[i])) {
         s_ctx.baud = kBauds[i];
-        log_i("GNSS: UBX detected at %lu baud (%s)", (unsigned long)s_ctx.baud,
+        ESP_LOGI(TAG, "GNSS: UBX detected at %lu baud (%s)", (unsigned long)s_ctx.baud,
               s_ctx.have_mon_ver ? "MON-VER reply" : "unsolicited frame");
         publish_phase(GNSS_PHASE_AUTOBAUD);  // baud now known
         return;
@@ -379,7 +412,7 @@ void phase_autobaud() {
     format_baud_stats(stats, detail, sizeof(detail));
     // '$' counts > 0 mean a live NMEA receiver that ignores UBX input on this
     // port (UBX inProtoMask disabled); 0 bytes everywhere means wiring/power.
-    log_e("GNSS: no UBX reply at any baud [%s]; retrying in %u ms", detail, (unsigned)GNSS_AUTOBAUD_RETRY_MS);
+    ESP_LOGE(TAG, "GNSS: no UBX reply at any baud [%s]; retrying in %u ms", detail, (unsigned)GNSS_AUTOBAUD_RETRY_MS);
     delay_hb(GNSS_AUTOBAUD_RETRY_MS);
   }
 }
@@ -390,10 +423,10 @@ void log_mon_ver() {
   ubxCopyVerField(s_ctx.mon_ver, s_ctx.mon_ver_len, 0, 30, sw, sizeof(sw));
   ubxCopyVerField(s_ctx.mon_ver, s_ctx.mon_ver_len, 30, 10, hw, sizeof(hw));
   const unsigned n_ext = s_ctx.mon_ver_len > 40 ? (unsigned)((s_ctx.mon_ver_len - 40) / 30) : 0u;
-  log_i("GNSS: MON-VER sw=\"%s\" hw=\"%s\" extensions=%u", sw, hw, n_ext);
+  ESP_LOGI(TAG, "GNSS: MON-VER sw=\"%s\" hw=\"%s\" extensions=%u", sw, hw, n_ext);
   for (unsigned i = 0; i < n_ext; ++i) {
     ubxCopyVerField(s_ctx.mon_ver, s_ctx.mon_ver_len, (uint16_t)(40 + 30 * i), 30, ext, sizeof(ext));
-    log_i("GNSS:   ext[%u] \"%s\"", i, ext);
+    ESP_LOGI(TAG, "GNSS:   ext[%u] \"%s\"", i, ext);
   }
 }
 
@@ -404,15 +437,15 @@ void phase_detect() {
   }
   if (!s_ctx.have_mon_ver) {
     s_ctx.prot_ver_x100 = -1;
-    log_w("GNSS: no MON-VER reply; assuming a legacy (PROTVER < 27) receiver");
+    ESP_LOGW(TAG, "GNSS: no MON-VER reply; assuming a legacy (PROTVER < 27) receiver");
   } else {
     log_mon_ver();
     const int pv = ubxParseProtVer(s_ctx.mon_ver, s_ctx.mon_ver_len);
     s_ctx.prot_ver_x100 = pv > 0 ? pv : -1;
     if (pv > 0) {
-      log_i("GNSS: PROTVER %d.%02d -> %s configuration", pv / 100, pv % 100, pv >= 2700 ? "VALSET" : "legacy CFG");
+      ESP_LOGI(TAG, "GNSS: PROTVER %d.%02d -> %s configuration", pv / 100, pv % 100, pv >= 2700 ? "VALSET" : "legacy CFG");
     } else {
-      log_w("GNSS: MON-VER has no PROTVER string (u-blox 6?); assuming legacy protocol");
+      ESP_LOGW(TAG, "GNSS: MON-VER has no PROTVER string (u-blox 6?); assuming legacy protocol");
     }
   }
   publish_phase(GNSS_PHASE_DETECT);
@@ -433,23 +466,23 @@ bool configure_valset() {
   ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_UART1OUTPROT_UBX, 1);
   ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_UART1OUTPROT_NMEA, 0);
   const int r_prot = ubx_send_ack(UBX_CLASS_CFG, UBX_CFG_VALSET, pl, len);
-  log_i("GNSS: VALSET UART1OUTPROT UBX=1 NMEA=0: %s", ack_str(r_prot));
+  ESP_LOGI(TAG, "GNSS: VALSET UART1OUTPROT UBX=1 NMEA=0: %s", ack_str(r_prot));
 
   // (2) NAV-PVT every navigation epoch on UART1.
   len = ubxValsetBegin(pl, sizeof(pl));
   ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_MSGOUT_UBX_NAV_PVT_UART1, 1);
   const int r_msg = ubx_send_ack(UBX_CLASS_CFG, UBX_CFG_VALSET, pl, len);
-  log_i("GNSS: VALSET MSGOUT NAV-PVT UART1=1: %s", ack_str(r_msg));
+  ESP_LOGI(TAG, "GNSS: VALSET MSGOUT NAV-PVT UART1=1: %s", ack_str(r_msg));
 
   // (3) Measurement / navigation rate.
   len = ubxValsetBegin(pl, sizeof(pl));
   ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_RATE_MEAS, (uint32_t)GNSS_RATE_MS);
   ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_RATE_NAV, 1);
   const int r_rate = ubx_send_ack(UBX_CLASS_CFG, UBX_CFG_VALSET, pl, len);
-  log_i("GNSS: VALSET RATE MEAS=%u NAV=1: %s", (unsigned)GNSS_RATE_MS, ack_str(r_rate));
+  ESP_LOGI(TAG, "GNSS: VALSET RATE MEAS=%u NAV=1: %s", (unsigned)GNSS_RATE_MS, ack_str(r_rate));
 
   if (r_prot <= 0 && r_msg <= 0 && r_rate <= 0) {
-    log_w("GNSS: every VALSET refused despite PROTVER >= 27; falling back to legacy CFG messages");
+    ESP_LOGW(TAG, "GNSS: every VALSET refused despite PROTVER >= 27; falling back to legacy CFG messages");
     return false;
   }
 
@@ -459,8 +492,8 @@ bool configure_valset() {
   len = ubxValsetBegin(pl, sizeof(pl));
   ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_NAVSPG_DYNMODEL, 5);
   const int r_dyn = ubx_send_ack(UBX_CLASS_CFG, UBX_CFG_VALSET, pl, len);
-  log_i("GNSS: VALSET NAVSPG-DYNMODEL=5 (SEA): %s", ack_str(r_dyn));
-  (void)r_dyn;  // log-only (log_i is empty below CORE_DEBUG_LEVEL 3)
+  ESP_LOGI(TAG, "GNSS: VALSET NAVSPG-DYNMODEL=5 (SEA): %s", ack_str(r_dyn));
+  (void)r_dyn;  // log-only
 #endif
 
   s_ctx.configured = (r_msg == 1);  // the message-enable step is what makes data flow
@@ -477,9 +510,9 @@ void configure_legacy(int prot_ver) {
     const uint8_t pl[3] = {0xF0, kNmeaIds[i], 0x00};
     const int r = ubx_send_ack(UBX_CLASS_CFG, UBX_CFG_MSG, pl, 3);
     if (r == 1) nmea_off++;
-    log_i("GNSS: CFG-MSG NMEA F0 %02X off: %s", kNmeaIds[i], ack_str(r));
+    ESP_LOGI(TAG, "GNSS: CFG-MSG NMEA F0 %02X off: %s", kNmeaIds[i], ack_str(r));
   }
-  log_i("GNSS: NMEA off: %d/%u ACKed", nmea_off, (unsigned)sizeof(kNmeaIds));
+  ESP_LOGI(TAG, "GNSS: NMEA off: %d/%u ACKed", nmea_off, (unsigned)sizeof(kNmeaIds));
   (void)nmea_off;  // log-only
 
   // Navigation rate: measRate ms, navRate 1 cycle, timeRef 1 = GPS time.
@@ -491,7 +524,7 @@ void configure_legacy(int prot_ver) {
   uint8_t rate[UBX_CFG_RATE_LEN];
   ubxBuildCfgRate(rate, (uint16_t)GNSS_RATE_MS, 1, UBX_CFG_RATE_TIMEREF_GPS);
   const int r_rate = ubx_send_ack(UBX_CLASS_CFG, UBX_CFG_RATE, rate, UBX_CFG_RATE_LEN);
-  log_i("GNSS: CFG-RATE meas=%u nav=1: %s", (unsigned)GNSS_RATE_MS, ack_str(r_rate));
+  ESP_LOGI(TAG, "GNSS: CFG-RATE meas=%u nav=1: %s", (unsigned)GNSS_RATE_MS, ack_str(r_rate));
   (void)r_rate;  // log-only: the rate is a nicety, data flow does not depend on it
 
   // NAV-PVT exists from PROTVER 14 (u-blox 7). Older firmware NAKs the
@@ -500,16 +533,16 @@ void configure_legacy(int prot_ver) {
   if (prot_ver >= 1400) {
     const uint8_t pl[3] = {UBX_CLASS_NAV, UBX_NAV_PVT, 0x01};
     r_pvt = ubx_send_ack(UBX_CLASS_CFG, UBX_CFG_MSG, pl, 3);
-    log_i("GNSS: CFG-MSG NAV-PVT on: %s", ack_str(r_pvt));
+    ESP_LOGI(TAG, "GNSS: CFG-MSG NAV-PVT on: %s", ack_str(r_pvt));
   } else {
-    log_i("GNSS: PROTVER %d.%02d < 14.00, NAV-PVT unavailable", prot_ver / 100, prot_ver % 100);
+    ESP_LOGI(TAG, "GNSS: PROTVER %d.%02d < 14.00, NAV-PVT unavailable", prot_ver / 100, prot_ver % 100);
   }
   int r_vel = -1;
   if (r_pvt != 1) {
     const uint8_t pl[3] = {UBX_CLASS_NAV, UBX_NAV_VELNED, 0x01};
     r_vel = ubx_send_ack(UBX_CLASS_CFG, UBX_CFG_MSG, pl, 3);
     s_ctx.use_velned = true;
-    log_i("GNSS: CFG-MSG NAV-VELNED on (fallback): %s", ack_str(r_vel));
+    ESP_LOGI(TAG, "GNSS: CFG-MSG NAV-VELNED on (fallback): %s", ack_str(r_vel));
   }
 
 #if GNSS_DYNMODEL_SEA
@@ -519,7 +552,7 @@ void configure_legacy(int prot_ver) {
   wrU2(nav5 + 0, 0x0001);  // mask: apply dynamic model setting
   nav5[2] = 5;             // dynModel SEA
   const int r_nav5 = ubx_send_ack(UBX_CLASS_CFG, UBX_CFG_NAV5, nav5, 36);
-  log_i("GNSS: CFG-NAV5 dynModel=5 (SEA): %s", ack_str(r_nav5));
+  ESP_LOGI(TAG, "GNSS: CFG-NAV5 dynModel=5 (SEA): %s", ack_str(r_nav5));
   (void)r_nav5;  // log-only
 #endif
 
@@ -548,7 +581,7 @@ bool phase_baud() {
     // Already there: battery-backed M9/M10 from a previous boot, or an
     // unconfirmed switch that autobaud has just proven to have worked.
     if (s_ctx.baud_switch_fails > 0) {
-      log_i("GNSS: UART1 switched to %lu baud (found there by autobaud after an unconfirmed switch)",
+      ESP_LOGI(TAG, "GNSS: UART1 switched to %lu baud (found there by autobaud after an unconfirmed switch)",
             (unsigned long)kTargetBaud);
     }
     s_ctx.baud_switch_fails = 0;
@@ -557,7 +590,7 @@ bool phase_baud() {
   if (s_ctx.baud_switch_fails >= (uint8_t)GNSS_BAUD_SWITCH_ATTEMPTS) {
     if (!s_ctx.baud_switch_given_up) {
       s_ctx.baud_switch_given_up = true;
-      log_w("GNSS: baud switch to %lu failed (%u attempts without a reply at the new rate), staying at %lu",
+      ESP_LOGW(TAG, "GNSS: baud switch to %lu failed (%u attempts without a reply at the new rate), staying at %lu",
             (unsigned long)kTargetBaud, (unsigned)s_ctx.baud_switch_fails, (unsigned long)s_ctx.baud);
     }
     return true;
@@ -590,20 +623,20 @@ bool phase_baud() {
     sent = ubx_send(UBX_CLASS_CFG, UBX_CFG_PRT, prt, UBX_CFG_PRT_LEN);
   }
   if (!sent) return true;  // cannot happen (12/20-byte payloads fit the TX frame); ubx_send logged it
-  log_i("GNSS: switching UART1 %lu -> %lu baud (%s)", (unsigned long)old_baud, (unsigned long)kTargetBaud, how);
+  ESP_LOGI(TAG, "GNSS: switching UART1 %lu -> %lu baud (%s)", (unsigned long)old_baud, (unsigned long)kTargetBaud, how);
 
-  // flush() spins until the TX FIFO is empty AND the TX state machine is idle,
+  // flushTx() returns once the TX FIFO is empty AND the transmitter is idle,
   // i.e. the last stop bit has left the pin (about 29 ms for CFG-PRT at 9600).
   // updateBaudRate() only reprograms the divider, so without this the tail of
   // the frame would be garbled. Then the 100 ms u-blox asks for before any
   // data at the new rate; whatever the receiver still sends at the old rate
   // (its ACK, the tail of an NMEA sentence) lands in the ring and is dropped.
-  GNSS.flush();
+  GNSS.flushTx();
   hb_touch(hb_gnss);
   delay_hb(GNSS_BAUD_SWITCH_SETTLE_MS);
   GNSS.updateBaudRate(kTargetBaud);
   delay_hb(kSettleMs);
-  GNSS.flush(false);  // TX idle + discard the RX ring and the hardware RX FIFO (bytes captured at the old rate)
+  GNSS.flushAll();  // TX idle + discard the RX ring and the hardware RX FIFO (bytes captured at the old rate)
   s_ctx.parser.reset();
 
   // Proof: a MON-VER reply at the new rate. Any other checksum-valid frame that
@@ -621,14 +654,14 @@ bool phase_baud() {
   if (monver || s_ctx.parser.goodFrames != good0) {
     s_ctx.baud = kTargetBaud;
     s_ctx.baud_switch_fails = 0;
-    log_i("GNSS: UART1 switched to %lu baud (%s)", (unsigned long)kTargetBaud, monver ? "MON-VER reply" : "UBX frames");
+    ESP_LOGI(TAG, "GNSS: UART1 switched to %lu baud (%s)", (unsigned long)kTargetBaud, monver ? "MON-VER reply" : "UBX frames");
     publish_phase(GNSS_PHASE_CONFIGURE);  // g_state.gnss.baud = the baud in use
     return true;
   }
 
   s_ctx.baud_switch_fails++;
   s_ctx.redetects++;
-  log_w("GNSS: baud switch to %lu failed (no reply to %d MON-VER polls at the new rate, attempt %u/%u); redetecting from %lu, "
+  ESP_LOGW(TAG, "GNSS: baud switch to %lu failed (no reply to %d MON-VER polls at the new rate, attempt %u/%u); redetecting from %lu, "
         "redetect #%lu",
         (unsigned long)kTargetBaud, kBaudVerifyPolls, (unsigned)s_ctx.baud_switch_fails, (unsigned)GNSS_BAUD_SWITCH_ATTEMPTS,
         (unsigned long)old_baud, (unsigned long)s_ctx.redetects);
@@ -645,7 +678,7 @@ void phase_configure() {
   // 10 Hz (104 %) the receiver's TX buffer overflows and frames are dropped.
   const uint32_t pvt_bits_per_s = 1000000u / (uint32_t)GNSS_RATE_MS;
   if (s_ctx.baud > 0 && pvt_bits_per_s * 2u > s_ctx.baud) {
-    log_w("GNSS: NAV-PVT every %u ms needs %lu bit/s = %lu%% of %lu baud; expect dropped epochs", (unsigned)GNSS_RATE_MS,
+    ESP_LOGW(TAG, "GNSS: NAV-PVT every %u ms needs %lu bit/s = %lu%% of %lu baud; expect dropped epochs", (unsigned)GNSS_RATE_MS,
           (unsigned long)pvt_bits_per_s, (unsigned long)(pvt_bits_per_s * 100u / s_ctx.baud), (unsigned long)s_ctx.baud);
   }
 
@@ -654,7 +687,7 @@ void phase_configure() {
   if (prot_ver >= 2700) done = configure_valset();
   if (!done) configure_legacy(prot_ver);
 
-  log_i("GNSS: configured=%d velned=%d (baud %lu, PROTVER %d.%02d%s)", s_ctx.configured ? 1 : 0,
+  ESP_LOGI(TAG, "GNSS: configured=%d velned=%d (baud %lu, PROTVER %d.%02d%s)", s_ctx.configured ? 1 : 0,
         s_ctx.use_velned ? 1 : 0, (unsigned long)s_ctx.baud, prot_ver / 100, prot_ver % 100,
         s_ctx.prot_ver_x100 > 0 ? "" : " assumed");
   publish_phase(GNSS_PHASE_CONFIGURE);
@@ -672,10 +705,10 @@ void phase_run() {
     // display frame push) with a bound so a flood cannot hold us.
     for (int frames = 0; frames < 64 && pump_rx(UBX_ANY, UBX_ANY); ++frames) {
     }
-    const uint32_t silent_ms = (uint32_t)(millis() - s_ctx.last_good_frame_ms);
+    const uint32_t silent_ms = (uint32_t)(state_now_ms() - s_ctx.last_good_frame_ms);
     if (silent_ms > (uint32_t)GNSS_REDETECT_MS) {
       s_ctx.redetects++;
-      log_w("GNSS: no valid UBX frame for %lu ms (module reset or baud lost); redetect #%lu",
+      ESP_LOGW(TAG, "GNSS: no valid UBX frame for %lu ms (module reset or baud lost); redetect #%lu",
             (unsigned long)silent_ms, (unsigned long)s_ctx.redetects);
       return;
     }
@@ -701,32 +734,44 @@ void gnss_task(void *) {
 
 // ---------------------------------------------------------------- public API
 bool gnss_start() {
-  // The RX ring must be sized BEFORE begin(): setRxBufferSize() returns 0 (and
-  // keeps the 256-byte default) once the driver is running. 2048 bytes bridge a
-  // ~30 ms display frame push at 10 Hz NAV-PVT (100 bytes/epoch).
-  const size_t rx_size = GNSS.setRxBufferSize(GNSS_RX_BUFFER);
-  GNSS.begin(kBauds[0], SERIAL_8N1, PIN_GNSS_RX, PIN_GNSS_TX);
-  if (rx_size == 0) {
-    log_w("GNSS: setRxBufferSize(%u) returned 0 (called after begin?); RX ring stays at the default", (unsigned)GNSS_RX_BUFFER);
+  // RX ring sized at install time: 2048 bytes bridge a ~30 ms display frame push
+  // at 10 Hz NAV-PVT (100 bytes/epoch). No TX ring (see GnssUart::write). Whatever
+  // fails here is logged and the task still starts: it keeps the heartbeat alive
+  // and reports "no UBX reply at any baud" instead of letting the supervisor reboot
+  // the board over a UART that nothing depends on for safety.
+  uart_config_t cfg = {};
+  cfg.baud_rate = (int)kBauds[0];
+  cfg.data_bits = UART_DATA_8_BITS;
+  cfg.parity = UART_PARITY_DISABLE;
+  cfg.stop_bits = UART_STOP_BITS_1;
+  cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+  cfg.source_clk = UART_SCLK_DEFAULT;
+  esp_err_t err = uart_driver_install(kUart, GNSS_RX_BUFFER, 0, 0, nullptr, 0);
+  if (err == ESP_OK) err = uart_param_config(kUart, &cfg);
+  if (err == ESP_OK) err = uart_set_pin(kUart, PIN_GNSS_TX, PIN_GNSS_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  const bool uart_ok = err == ESP_OK;
+  if (!uart_ok) {
+    ESP_LOGE(TAG, "GNSS: UART1 setup failed: %s (rx=GPIO%d tx=GPIO%d ring=%u B)", esp_err_to_name(err), PIN_GNSS_RX,
+             PIN_GNSS_TX, (unsigned)GNSS_RX_BUFFER);
   } else {
-    log_i("GNSS: Serial1 (HP UART1) RX=GPIO%d TX=GPIO%d ring=%u B, first baud %lu, target baud %lu, rate %u ms",
-          PIN_GNSS_RX, PIN_GNSS_TX, (unsigned)rx_size, (unsigned long)kBauds[0], (unsigned long)kTargetBaud,
-          (unsigned)GNSS_RATE_MS);
+    ESP_LOGI(TAG, "GNSS: UART1 RX=GPIO%d TX=GPIO%d ring=%u B, first baud %lu, target baud %lu, rate %u ms", PIN_GNSS_RX,
+             PIN_GNSS_TX, (unsigned)GNSS_RX_BUFFER, (unsigned long)kBauds[0], (unsigned long)kTargetBaud,
+             (unsigned)GNSS_RATE_MS);
   }
 #if GNSS_RATE_MS < 200
   // Data-sheet maxima (98 % fix rate): NEO-6 5 Hz, NEO-M8N 5 Hz with its default
   // GPS+GLONASS set, MAX-M10S 3 Hz with its default GPS+GAL+BDS set; NEO-7 10 Hz,
   // NEO-M8Q/M 10 Hz, NEO-M9N 25 Hz. A faster rate is ACKed but skips epochs.
-  log_w("GNSS: GNSS_RATE_MS %u (> 5 Hz) is not guaranteed on a stock NEO-M8N / NEO-6 / default MAX-M10S", (unsigned)GNSS_RATE_MS);
+  ESP_LOGW(TAG, "GNSS: GNSS_RATE_MS %u (> 5 Hz) is not guaranteed on a stock NEO-M8N / NEO-6 / default MAX-M10S", (unsigned)GNSS_RATE_MS);
 #endif
 
   const BaseType_t ok = xTaskCreate(gnss_task, "gnss", GNSS_TASK_STACK, nullptr, TASK_PRIO_GNSS, nullptr);
   if (ok != pdPASS) {
-    log_e("GNSS: xTaskCreate failed (%ld)", (long)ok);
+    ESP_LOGE(TAG, "GNSS: xTaskCreate failed (%ld)", (long)ok);
     return false;
   }
   hb_touch(hb_gnss);  // the task has not run yet; do not look dead to the supervisor in the meantime
-  return true;
+  return uart_ok;
 }
 
 const char *gnss_phase_str(uint8_t phase) {
@@ -754,7 +799,7 @@ void gnss_log_summary(const SharedState &s, uint32_t now) {
     snprintf(protver, sizeof(protver), "?");
   }
   [[maybe_unused]] const float speed = (float)g.gspeed_mm_s * SPEED_FACTOR;  // log-only
-  log_i("GNSS phase=%s baud=%lu protver=%s cfg=%d%s fix=%u ok=%d sats=%u spd=%.2f%s sAcc=%.2fm/s pDOP=%.2f "
+  ESP_LOGI(TAG, "GNSS phase=%s baud=%lu protver=%s cfg=%d%s fix=%u ok=%d sats=%u spd=%.2f%s sAcc=%.2fm/s pDOP=%.2f "
         "utc=%02u:%02u:%02u%s age=%s good=%lu bad=%lu redetect=%lu",
         gnss_phase_str(g.phase), (unsigned long)g.baud, protver, g.configured ? 1 : 0, g.use_velned ? " velned" : "",
         (unsigned)g.fix_type, g.fix_ok ? 1 : 0, (unsigned)g.num_sv, (double)speed, SPEED_UNIT_STR,

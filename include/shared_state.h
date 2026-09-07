@@ -4,9 +4,9 @@
 // the supervisor/logger in loop()) copy a snapshot under the mutex and work on
 // the copy. Every locked region is a memcpy or a few field writes: no I/O.
 //
-// This header is Arduino-free (only <stdint.h>) so the pure display-string
+// This header is framework-free (only <stdint.h>) so the pure display-string
 // builder and the native unit tests can include it. The implementation
-// (src/shared_state.cpp) uses FreeRTOS + millis().
+// (src/shared_state.cpp) uses FreeRTOS + esp_timer.
 #pragma once
 
 #include <stdbool.h>
@@ -51,7 +51,10 @@ struct VescExt {
   uint32_t timeouts;         // requests without a complete reply within VESC_POLL_TIMEOUT_MS
 };
 
-// Legacy TWAI driver states (mirrors twai_state_t so this header stays IDF-free).
+// CAN node lifecycle as canTask sees it (IDF-free; the values are also what the
+// display strings and the tests use): UNINSTALLED = no node, STOPPED = node
+// created but disabled, RUNNING = enabled and on the bus, BUS_OFF = the node
+// went bus-off, RECOVERING = recovery started, waiting for error-active again.
 enum CanState : int
 {
   CAN_STATE_UNINSTALLED = -1,
@@ -63,18 +66,15 @@ enum CanState : int
 
 struct CanHealth
 {
-  int state;         // CanState
-  uint32_t tec, rec; // transmit / receive error counters
-  uint32_t bus_error_count;
-  uint32_t rx_missed;  // frames lost because the RX queue was full (driver counter)
-  uint32_t rx_overrun; // hardware FIFO overruns
-  uint32_t arb_lost;
-  uint32_t bus_off_count;      // BUS_OFF alerts seen
-  uint32_t recoveries;         // successful bus-off recoveries
-  uint32_t queue_full_events;  // RX_QUEUE_FULL alerts
-  uint32_t err_passive_events; // ERR_PASS alerts
-  uint32_t bus_error_events;   // BUS_ERROR alerts
-  uint32_t last_health_ms;     // time of the last twai_get_status_info() snapshot
+  int state;                   // CanState
+  uint32_t tec, rec;           // transmit / receive error counters (twai_node_get_info)
+  uint32_t bus_error_count;    // cumulative bus errors since the node was enabled (driver record)
+  uint32_t rx_missed;          // frames dropped because the ISR -> canTask queue was full
+  uint32_t arb_lost;           // arbitration-lost events (on_error callback)
+  uint32_t bus_off_count;      // bus-off events
+  uint32_t recoveries;         // completed bus-off recoveries (node error-active again)
+  uint32_t err_passive_events; // transitions into the error-passive state
+  uint32_t last_health_ms;     // time of the last twai_node_get_info() snapshot
 };
 
 // ---------------------------------------------------------------- GNSS
@@ -171,12 +171,12 @@ void state_unlock();
 SharedState state_snapshot();
 
 // ---------------------------------------------------------------- Heartbeats
-// Plain millis() stamps written by each task; read by the supervisor.
+// Plain state_now_ms() stamps written by each task; read by the supervisor.
 extern volatile uint32_t hb_can;
 extern volatile uint32_t hb_gnss;
 extern volatile uint32_t hb_disp;
 
-// millis() wrapper so headers stay Arduino-free.
+// Milliseconds since boot (32-bit, wraps like millis() did); esp_timer underneath, so headers stay framework-free.
 uint32_t state_now_ms();
 
 inline void hb_touch(volatile uint32_t &hb) { hb = state_now_ms(); }

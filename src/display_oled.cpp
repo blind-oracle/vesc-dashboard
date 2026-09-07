@@ -1,5 +1,5 @@
-// 128x64 SSD1309 OLED dashboard task (DIYables_OLED_SSD1309 over I2C, Adafruit GFX,
-// U8g2 fonts through U8g2_for_Adafruit_GFX).
+// 128x64 SSD1309 OLED dashboard task (native u8g2 over ESP-IDF driver/i2c_master.h,
+// HAL in src/u8g2_hal_idf.cpp).
 //
 // Screens (include/display_strings_oled.h, OledScreen): MAIN, EFFICIENCY, VESC 1/3,
 // VESC 2/3, VESC 3/3, GNSS, SYS. A short press of PIN_BUTTON shows the next screen
@@ -8,13 +8,13 @@
 //
 // Loop / refresh policy:
 //   * The task loop runs every OLED_BUTTON_POLL_MS (20 ms): it samples the
-//     button (time-based debounce, so the ~26 ms of a frame push does not matter)
+//     button (time-based debounce, so the ~30 ms of a frame push does not matter)
 //     and touches its heartbeat.
 //   * Every OLED_PERIOD_MS, or immediately when the screen changed, it builds
 //     the frame descriptor (OledFrame) for the current screen from a state
 //     snapshot and pushes a frame ONLY when the descriptor differs from what is
 //     on the panel (memcmp; the screen index is part of the descriptor, so a
-//     screen switch always redraws). A frame is the whole 1 KB buffer (~26 ms
+//     screen switch always redraws). A frame is the whole 1 KB buffer (~30 ms
 //     on the bus at 400 kHz); a skipped tick costs nothing but the memcmp.
 //   * Idle: after OLED_IDLE_DIM_MS without a change the contrast drops to
 //     OLED_IDLE_CONTRAST (burn-in / power); the next change or any button press
@@ -22,8 +22,9 @@
 //   * A panel that does not ACK at init is retried every OLED_INIT_RETRY_MS
 //     from the task, which keeps its heartbeat alive meanwhile (the supervisor
 //     must not reboot the board because a display is unplugged). A panel that
-//     stops ACKing later (cable, brown-out) is caught by a zero-length probe
-//     every OLED_INIT_RETRY_MS and re-initialised the same way.
+//     stops ACKing later (cable, brown-out) is caught by the failing frame
+//     transfer or by the zero-length probe every OLED_INIT_RETRY_MS, and is
+//     re-initialised the same way.
 //
 // Layout (rotation 0; all text is drawn by BASELINE with U8g2 fonts: a glyph of
 // height h with y-offset 0 occupies rows baseline-h .. baseline-1; exact numbers
@@ -48,43 +49,44 @@
 
 #include "display.h"
 
-#include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <DIYables_OLED_SSD1309.h>
-#include <U8g2_for_Adafruit_GFX.h>
+#include <driver/gpio.h>
+#include <esp_log.h>
 #include <esp_system.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <u8g2.h>
 
 #include <math.h>
 #include <string.h>
 
 #include "display_strings_oled.h"
 #include "shared_state.h"
+#include "u8g2_hal_idf.h"
+
+static const char *TAG = "oled";
 
 // ---- local fallbacks (config.h "Advanced task tunables" defines the same names; these only cover a trimmed config.h) ----
 #ifndef OLED_TASK_STACK
-#define OLED_TASK_STACK 6144     // bytes. snprintf("%f") + font decoder + a SharedState copy; the log_d refresh line prints the free minimum
+#define OLED_TASK_STACK 6144     // bytes. snprintf("%f") + font decoder + a SharedState copy; the debug refresh line prints the free minimum
 #endif
 #ifndef OLED_INIT_RETRY_MS
 #define OLED_INIT_RETRY_MS 5000  // retry period while the controller does not ACK
 #endif
 #ifndef OLED_I2C_TIMEOUT_MS
-#define OLED_I2C_TIMEOUT_MS 50   // per I2C transaction (Wire default); a stuck bus costs at most this per transfer
+#define OLED_I2C_TIMEOUT_MS 50   // per I2C transaction; a stuck bus costs at most this per transfer
 #endif
 #ifndef OLED_BUTTON_POLL_MS
 #define OLED_BUTTON_POLL_MS 20   // task loop period: button sampling granularity (debounce is time based)
 #endif
 
-// The layout below is hard-coded for a 128x64 panel in landscape; the library
-// takes uint8_t geometry and an int8_t reset pin.
+// The layout below is hard-coded for a 128x64 panel in landscape.
 static_assert(OLED_WIDTH == 128 && OLED_HEIGHT == 64, "display_oled.cpp lays out a 128x64 panel");
 static_assert(OLED_ROTATION == 0 || OLED_ROTATION == 2, "OLED_ROTATION must be 0 or 2 (landscape layout)");
-static_assert(PIN_OLED_RST >= -1 && PIN_OLED_RST <= 127, "PIN_OLED_RST must be -1 or a GPIO number");
+static_assert(PIN_OLED_RST >= -1 && PIN_OLED_RST <= 30, "PIN_OLED_RST must be -1 or an ESP32-C6 GPIO 0..30");
 static_assert(OLED_CONTRAST >= 0 && OLED_CONTRAST <= 255 && OLED_IDLE_CONTRAST >= 0 && OLED_IDLE_CONTRAST <= 255,
               "OLED contrast values are 0..255");
-// i2cInit() maps 0 Hz to 100 kHz and clamps above 1 MHz; the bus frequency must
-// equal OLED_I2C_HZ exactly or the library's setClock() calls below stop being no-ops.
 static_assert(OLED_I2C_HZ >= 1 && OLED_I2C_HZ <= 1000000, "OLED_I2C_HZ must be 1..1000000 (SSD1309 max 400 kHz)");
+static_assert(OLED_I2C_ADDR >= 0x08 && OLED_I2C_ADDR <= 0x77, "OLED_I2C_ADDR is a 7-bit address (0x3C or 0x3D)");
 static_assert(PIN_BUTTON >= -1 && PIN_BUTTON <= 30, "PIN_BUTTON must be -1 (none) or an ESP32-C6 GPIO 0..30");
 static_assert(BUTTON_DEBOUNCE_MS > 0 && BUTTON_DEBOUNCE_MS < BUTTON_LONG_PRESS_MS,
               "BUTTON_DEBOUNCE_MS must be positive and shorter than BUTTON_LONG_PRESS_MS");
@@ -92,105 +94,88 @@ static_assert(SCREEN_AUTO_RETURN_MS >= 0, "SCREEN_AUTO_RETURN_MS must be >= 0 (0
 static_assert(OLED_BUTTON_POLL_MS > 0 && OLED_BUTTON_POLL_MS <= OLED_PERIOD_MS, "OLED_BUTTON_POLL_MS must be 1..OLED_PERIOD_MS");
 static_assert(oled_layout::kWidth == OLED_WIDTH && oled_layout::kHeight == OLED_HEIGHT, "layout geometry matches the panel");
 
-// Both clocks equal: the library brackets every transfer with setClock(clkDuring)
-// / setClock(clkAfter); Wire::setClock() short-circuits when the frequency is
-// unchanged (on the IDF 5.5 HAL a real change would remove and re-add the device
-// handle twice per frame).
-static DIYables_OLED_SSD1309 oled(OLED_WIDTH, OLED_HEIGHT, &Wire, PIN_OLED_RST, OLED_I2C_HZ, OLED_I2C_HZ);
-// Font renderer. Static construction is safe (the ctor only sets its own
-// fields); begin() merely stores &oled. Holds decoder state -> display task only.
-static U8G2_FOR_ADAFRUIT_GFX u8f;
+// The u8g2 object owns the 1 KB frame buffer (full-buffer "_f" setup, static memory
+// inside u8g2) and the font decoder state -> display task only (display_start() draws
+// the boot frame before the task exists).
+static u8g2_t s_u8g2;
 
 // ---------------------------------------------------------------- hardware init
-// The library's begin() only fails on malloc and never checks for an ACK. Probe
-// the controller ourselves so a missing / mis-addressed panel is reported
-// instead of silently drawing into the void.
-// A ZERO-length transaction on purpose: arduino-esp32's i2cWrite() turns it into
-// i2c_master_probe(), which returns ESP_ERR_NOT_FOUND on a NACK -> Wire code 2
-// and logs nothing above verbose. A write WITH data that gets NACKed would make
-// the IDF driver ESP_LOGE "I2C transaction unexpected nack detected", the HAL
-// log_e "i2c_master_transmit failed" and come back as code 4, not 2.
-// Returns the Wire error: 0 ACKed, 2 address NACK (nothing at that address),
-// 5 timeout (bus stuck / floating: missing pull-ups or power), 4 other.
-static uint8_t oled_probe() {
-  Wire.beginTransmission((uint8_t)OLED_I2C_ADDR);
-  return Wire.endTransmission();
-}
+// Zero-length transaction: ESP_OK when the controller ACKed its address,
+// ESP_ERR_NOT_FOUND when nothing did (wrong address, SDA/SCL swapped, module in SPI
+// mode or unpowered), ESP_ERR_TIMEOUT when the bus never idles high (no pull-ups,
+// short). The probe is silent; a NACKed write would make the IDF driver log an error.
+static esp_err_t oled_probe() { return u8g2_hal_idf_probe(); }
 
-// Bus + controller init, safe to call repeatedly (the frame buffer is allocated
-// once, the init sequence and the optional RST pulse are re-sent each time).
-// Returns 0 when the panel answered, else a Wire error code (see oled_probe).
-static uint8_t oled_init() {
-  static bool wire_ok = false;
-  if (!wire_ok) {
-    // Pins FIRST and explicitly: the pinless Wire.begin() would start I2C0 on
-    // the board's default SDA/SCL. begin() with the same pins on a started bus
-    // only logs a warning and returns true.
-    wire_ok = Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL, OLED_I2C_HZ);
-    if (!wire_ok) {
-      log_e("OLED: Wire.begin(sda=%d, scl=%d, %lu Hz) failed", (int)PIN_OLED_SDA, (int)PIN_OLED_SCL,
-            (unsigned long)OLED_I2C_HZ);
-      return 4;
-    }
-    Wire.setTimeOut(OLED_I2C_TIMEOUT_MS);
+// Bus + controller init, safe to call repeatedly (bus and device handle are created
+// once, the reset pulse and the init sequence are re-sent each time). Returns ESP_OK
+// when the panel answered and the init sequence went through, else the driver error.
+static esp_err_t oled_init() {
+  static bool setup_done = false;
+  const U8g2HalIdfConfig hal = {PIN_OLED_SDA, PIN_OLED_SCL, PIN_OLED_RST, (uint32_t)OLED_I2C_HZ, (uint8_t)OLED_I2C_ADDR,
+                                (uint32_t)OLED_I2C_TIMEOUT_MS};
+  esp_err_t err = u8g2_hal_idf_init(hal);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "OLED: I2C bus setup failed (sda=%d scl=%d %lu Hz): %s", (int)PIN_OLED_SDA, (int)PIN_OLED_SCL,
+             (unsigned long)OLED_I2C_HZ, esp_err_to_name(err));
+    return err;
   }
-  // Probe BEFORE begin(): the init sequence is 12 write transactions and every
-  // NACKed one would cost an IDF + HAL error line (~25 lines per attempt, every
-  // OLED_INIT_RETRY_MS, for an unplugged panel). The probe alone is silent.
-  const uint8_t err = oled_probe();
-  if (err != 0) return err;
-  // periphBegin=false: the bus is ours (pins above). reset: pulse RST only when wired.
-  if (!oled.begin(SSD1309_SWITCHCAPVCC, (uint8_t)OLED_I2C_ADDR, PIN_OLED_RST >= 0, false)) {
-    log_e("OLED: frame buffer allocation failed (%u bytes)", (unsigned)(OLED_WIDTH * ((OLED_HEIGHT + 7) / 8)));
-    return 4;
+  // Probe BEFORE the init sequence: its ~12 write transactions would each cost an IDF
+  // error line for an unplugged panel, every OLED_INIT_RETRY_MS. The probe alone is silent.
+  err = oled_probe();
+  if (err != ESP_OK) return err;
+
+  if (!setup_done) {
+    // noname0 = no column offset (the panel's 128 columns map to segments 0..127).
+    u8g2_Setup_ssd1309_i2c_128x64_noname0_f(&s_u8g2, OLED_ROTATION == 2 ? U8G2_R2 : U8G2_R0, u8g2_hal_idf_byte_cb,
+                                            u8g2_hal_idf_gpio_delay_cb);
+    u8g2_SetI2CAddress(&s_u8g2, (uint8_t)(OLED_I2C_ADDR << 1));  // u8g2 keeps the 8-bit form
+    setup_done = true;
   }
-
-  oled.setRotation(OLED_ROTATION);  // the font renderer draws through the rotation-aware drawFastH/VLine overrides
-  oled.setContrast((uint8_t)OLED_CONTRAST);
-
-  // Text goes through U8g2 fonts only (no GFX setTextSize scaling anywhere).
-  // Transparent mode: glyph background pixels are not painted, so glyphs may
-  // overlap rules and the inverted title bar. NOTE: setFont() to a different
-  // font silently resets the mode to opaque; use_font() re-asserts it.
-  u8f.begin(oled);
-  u8f.setFontMode(1);
-  u8f.setFontDirection(0);
-  u8f.setForegroundColor(SSD1309_WHITE);
-  u8f.setBackgroundColor(SSD1309_BLACK);  // unused in transparent mode; the ctor leaves it uninitialised, so set it
-  return 0;
+  (void)u8g2_hal_idf_take_last_error();
+  u8g2_InitDisplay(&s_u8g2);  // RST pulse (when wired) + init sequence; leaves the panel in power-save
+  u8g2_SetPowerSave(&s_u8g2, 0);
+  u8g2_SetContrast(&s_u8g2, (uint8_t)OLED_CONTRAST);
+  // Text goes through U8g2 fonts only. Transparent mode: glyph background pixels are
+  // not painted, so glyphs may overlap rules and the inverted title bar.
+  u8g2_SetFontMode(&s_u8g2, 1);
+  u8g2_SetFontPosBaseline(&s_u8g2);
+  u8g2_SetFontDirection(&s_u8g2, 0);
+  u8g2_SetDrawColor(&s_u8g2, 1);
+  return u8g2_hal_idf_take_last_error();  // a transfer of the init sequence failed -> not initialised
 }
 
 static void log_init_ok() {
-  log_i("OLED: init ok (SSD1309 %ux%u, I2C 0x%02X @ %lu Hz, sda=%d scl=%d rst=%d)", (unsigned)OLED_WIDTH,
-        (unsigned)OLED_HEIGHT, (unsigned)OLED_I2C_ADDR, (unsigned long)OLED_I2C_HZ, (int)PIN_OLED_SDA,
-        (int)PIN_OLED_SCL, (int)PIN_OLED_RST);
+  ESP_LOGI(TAG, "OLED: init ok (SSD1309 %ux%u, I2C 0x%02X @ %lu Hz, sda=%d scl=%d rst=%d)", (unsigned)OLED_WIDTH,
+           (unsigned)OLED_HEIGHT, (unsigned)OLED_I2C_ADDR, (unsigned long)OLED_I2C_HZ, (int)PIN_OLED_SDA,
+           (int)PIN_OLED_SCL, (int)PIN_OLED_RST);
 }
 
 // ---------------------------------------------------------------- drawing
-// Everything between the OLED_DRAW markers uses only `oled` (Adafruit_GFX) and
-// `u8f`, so the host preview harness can compile it against a stub framebuffer.
+// Everything between the OLED_DRAW markers uses only the u8g2 buffer API on
+// `s_u8g2`, so the host preview harness can compile it against a stub.
 // OLED_DRAW_BEGIN
 using namespace oled_layout;
 
-// setFont() to a DIFFERENT font resets the font mode to opaque -> always re-assert transparency.
+// Always re-assert transparency after a font change (cheap; keeps the invariant local).
 static void use_font(const uint8_t *font) {
-  u8f.setFont(font);
-  u8f.setFontMode(1);
+  u8g2_SetFont(&s_u8g2, font);
+  u8g2_SetFontMode(&s_u8g2, 1);
 }
 
 // Sum of the glyph advances of an ASCII string in the current font (a missing
 // glyph advances 0). Advance-based alignment keeps tabular digits in fixed
-// columns: ink-based alignment (getUTF8Width) would shift "10.1" against
+// columns: ink-based alignment (u8g2_GetUTF8Width) would shift "10.1" against
 // "10.0" because '1' has a narrower bitmap.
 static int16_t text_advance(const char *s) {
   int16_t w = 0;
-  for (; *s; ++s) w = (int16_t)(w + u8g2_GetGlyphWidth(&u8f.u8g2, (uint16_t)(uint8_t)*s));
+  for (; *s; ++s) w = (int16_t)(w + u8g2_GetGlyphWidth(&s_u8g2, (uint16_t)(uint8_t)*s));
   return w;
 }
 
+// Byte-wise (no UTF-8 decoding): the single Latin-1 byte 0xB0 in the strings is the
+// degree sign U+00B0 of the *_tf fonts, one byte = one glyph cell.
 static void draw_text(int16_t x, int16_t baseline, const char *s) {
-  u8f.setCursor(x, baseline);
-  u8f.print(s);
+  u8g2_DrawStr(&s_u8g2, (u8g2_uint_t)x, (u8g2_uint_t)baseline, s);
 }
 
 // Right-aligns by advance: the advance box ends at rightExclusive.
@@ -209,7 +194,7 @@ static void draw_main(const OledMain &m) {
   draw_text(kColX, kColBaseline[1], m.can);
   draw_text(kColX, kColBaseline[2], m.unit);
 
-  oled.drawFastHLine(0, kRuleY, kWidth, SSD1309_WHITE);
+  u8g2_DrawHLine(&s_u8g2, 0, kRuleY, kWidth);
 
   for (int r = 0; r < 4; ++r) {
     for (int col = 0; col < 2; ++col) {
@@ -224,12 +209,12 @@ static void draw_main(const OledMain &m) {
 
 // Grid screen: inverted title bar + up to 6 monospace rows.
 static void draw_grid(const OledGrid &g) {
-  oled.fillRect(0, 0, kWidth, kTitleBarH, SSD1309_WHITE);
+  u8g2_DrawBox(&s_u8g2, 0, 0, kWidth, kTitleBarH);
   use_font(u8g2_font_6x13B_tf);
-  u8f.setForegroundColor(SSD1309_BLACK);  // transparent mode paints foreground pixels only -> black text on the bar
+  u8g2_SetDrawColor(&s_u8g2, 0);  // transparent mode paints foreground pixels only -> black text on the bar
   draw_text(kTitleX, kTitleBaseline, g.title);
   draw_text((int16_t)(kWidth - 1 - kAdvance * (int16_t)strlen(g.page)), kTitleBaseline, g.page);
-  u8f.setForegroundColor(SSD1309_WHITE);
+  u8g2_SetDrawColor(&s_u8g2, 1);
 
   use_font(u8g2_font_6x10_tf);
   const int n = g.nrows < kGridRows ? g.nrows : kGridRows;
@@ -251,10 +236,10 @@ enum class ButtonEvent : uint8_t { None, Short, Long };
 // it is accepted (time based, so the poll jitter of a frame push is harmless),
 // then the debounced level is edge-detected. Long fires ONCE while the button
 // is still held (at BUTTON_LONG_PRESS_MS) and the release after it produces no
-// Short. All stamps are millis(); the differences are unsigned (wrap-safe).
+// Short. All stamps are state_now_ms(); the differences are unsigned (wrap-safe).
 struct Button {
   bool raw_last = false;     // last raw sample (true = pressed)
-  uint32_t raw_since = 0;    // millis() of the last raw change
+  uint32_t raw_since = 0;    // time of the last raw change
   bool pressed = false;      // debounced level
   uint32_t pressed_at = 0;   // debounced press time
   bool long_fired = false;
@@ -283,9 +268,8 @@ struct Button {
   }
 };
 
-// pinMode() must have run (display_start): digitalRead() on an unconfigured pin
-// logs a warning on EVERY call.
-static bool button_raw_pressed() { return (digitalRead(PIN_BUTTON) == LOW) == (BUTTON_ACTIVE_LOW != 0); }
+// gpio_config() must have run (display_start).
+static bool button_raw_pressed() { return (gpio_get_level((gpio_num_t)PIN_BUTTON) == 0) == (BUTTON_ACTIVE_LOW != 0); }
 #endif  // PIN_BUTTON >= 0
 
 // ---------------------------------------------------------------- demo source
@@ -452,27 +436,34 @@ static void publish_stats(const DisplayStats &st) {
 }
 
 // Pushes one frame to the panel and records it as the reference for change detection.
-static void render(DispCtx &c, const OledFrame &cur, uint32_t now) {
-  const uint32_t t0 = millis();
-  oled.clearDisplay();
+// Returns false when a transfer failed (panel gone): the caller drops to the re-init path.
+static bool render(DispCtx &c, const OledFrame &cur, uint32_t now) {
+  const uint32_t t0 = state_now_ms();
+  u8g2_ClearBuffer(&s_u8g2);
   draw_frame(cur);
-  oled.display();
-  [[maybe_unused]] const uint32_t dt = (uint32_t)(millis() - t0);  // log-only
+  u8g2_SendBuffer(&s_u8g2);
+  [[maybe_unused]] const uint32_t dt = (uint32_t)(state_now_ms() - t0);  // log-only
 
+  const esp_err_t err = u8g2_hal_idf_take_last_error();
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "OLED: frame transfer failed (%s), re-initialising", esp_err_to_name(err));
+    return false;
+  }
   c.st.refreshes++;
   c.st.last_change_ms = now;
   c.prev = cur;
-  // Stack figure = the calling task's minimum free stack (bytes on ESP-IDF): the
-  // display task from refresh #2 on (#1 is the boot frame drawn from setup()/loopTask).
-  log_d("OLED: refresh %lu ms (#%lu, screen %u, stack free min %u B)", (unsigned long)dt, (unsigned long)c.st.refreshes,
-        (unsigned)cur.screen, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  // Stack figure = the calling task's minimum free stack in bytes: the display task from
+  // refresh #2 on (#1 is the boot frame drawn from app_main()).
+  ESP_LOGD(TAG, "OLED: refresh %lu ms (#%lu, screen %u, stack free min %u B)", (unsigned long)dt,
+           (unsigned long)c.st.refreshes, (unsigned)cur.screen, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  return true;
 }
 
 static void restore_contrast(DispCtx &c, const char *why) {
   if (!c.st.dimmed) return;
-  if (c.st.init_ok) oled.setContrast((uint8_t)OLED_CONTRAST);
+  if (c.st.init_ok) u8g2_SetContrast(&s_u8g2, (uint8_t)OLED_CONTRAST);
   c.st.dimmed = false;
-  log_i("OLED: contrast restored (%s)", why);
+  ESP_LOGI(TAG, "OLED: contrast restored (%s)", why);
 }
 
 // Nothing changed this tick: count it and step the idle dimming.
@@ -481,9 +472,9 @@ static void handle_idle(DispCtx &c, uint32_t now) {
 #if OLED_IDLE_DIM_MS > 0
   const uint32_t idle = (uint32_t)(now - c.st.last_change_ms);
   if (!c.st.dimmed && idle >= (uint32_t)OLED_IDLE_DIM_MS) {
-    oled.setContrast((uint8_t)OLED_IDLE_CONTRAST);
+    u8g2_SetContrast(&s_u8g2, (uint8_t)OLED_IDLE_CONTRAST);
     c.st.dimmed = true;
-    log_i("OLED: dimmed after %lu s idle", (unsigned long)(idle / 1000u));
+    ESP_LOGI(TAG, "OLED: dimmed after %lu s idle", (unsigned long)(idle / 1000u));
   }
 #else
   (void)now;
@@ -496,7 +487,7 @@ static void handle_idle(DispCtx &c, uint32_t now) {
   if (next == c.screen) return false;
   c.screen = next;
   c.st.screen = next;
-  log_i("display: screen %u (%s), %s", (unsigned)next, oled_screen_name(next), why);
+  ESP_LOGI(TAG, "display: screen %u (%s), %s", (unsigned)next, oled_screen_name(next), why);
   return true;
 }
 
@@ -529,46 +520,56 @@ static bool poll_button(DispCtx &c, uint32_t now) {
 }
 
 // One frame tick: snapshot -> descriptor -> push if it differs from the panel.
-static void frame_tick(DispCtx &c, uint32_t now) {
+// Returns false when the push failed (panel gone).
+static bool frame_tick(DispCtx &c, uint32_t now) {
 #if DISPLAY_DEMO
   SharedState s = demo_state(now);
 #else
   SharedState s = state_snapshot();
   // Clock AFTER the snapshot (as trip.cpp and the supervisor do): a producer that
-  // stamps between the loop's millis() read and the copy would otherwise sit in the
+  // stamps between the loop's clock read and the copy would otherwise sit in the
   // future, and the unsigned age test would paint its values "--" for one frame.
-  now = millis();
+  now = state_now_ms();
 #endif
   s.disp = c.st;  // the SYS screen shows this task's own counters (the published copy lags one poll)
   OledSysInfo info;
   info.uptime_s = now / 1000u;
-  info.heap_free = ESP.getFreeHeap();
-  info.heap_min = ESP.getMinFreeHeap();
+  info.heap_free = esp_get_free_heap_size();
+  info.heap_min = esp_get_minimum_free_heap_size();
   info.reset_reason = reset_reason_str(esp_reset_reason());
 
   OledFrame cur;
   oled_build_frame(s, now, c.screen, info, cur);
   if (memcmp(&cur, &c.prev, sizeof cur) == 0) {
     handle_idle(c, now);
-  } else {
-    restore_contrast(c, "value changed");
-    render(c, cur, now);
+    return true;
   }
+  restore_contrast(c, "value changed");
+  return render(c, cur, now);
+}
+
+// The panel stopped answering (failed transfer or probe): back to the retry path, which
+// re-initialises and redraws. The button keeps working meanwhile.
+static void panel_lost(DispCtx &c, uint32_t now, uint32_t &next_retry_ms) {
+  c.st.init_ok = false;
+  c.prev = OledFrame{};  // whatever is on the panel now is not what we drew
+  next_retry_ms = now;   // first re-init attempt on the next tick
+  publish_stats(c.st);
 }
 
 static void display_task(void *) {
   DispCtx &c = s_ctx;
-  uint32_t next_retry_ms = millis() + OLED_INIT_RETRY_MS;
-  uint32_t next_frame_ms = millis();  // first frame at once
-  [[maybe_unused]] uint32_t retries = 0;  // log-only
+  uint32_t next_retry_ms = state_now_ms() + OLED_INIT_RETRY_MS;
+  uint32_t next_frame_ms = state_now_ms();  // first frame at once
+  [[maybe_unused]] uint32_t retries = 0;    // log-only
   hb_touch(hb_disp);
 
-  log_i("OLED: task started (poll %u ms, frame %u ms, %u screens, button %s%d, auto-return %lu ms, demo=%d)",
-        (unsigned)OLED_BUTTON_POLL_MS, (unsigned)OLED_PERIOD_MS, (unsigned)SCREEN_COUNT,
-        PIN_BUTTON >= 0 ? "GPIO" : "none ", (int)PIN_BUTTON, (unsigned long)SCREEN_AUTO_RETURN_MS, (int)DISPLAY_DEMO);
+  ESP_LOGI(TAG, "OLED: task started (poll %u ms, frame %u ms, %u screens, button %s%d, auto-return %lu ms, demo=%d)",
+           (unsigned)OLED_BUTTON_POLL_MS, (unsigned)OLED_PERIOD_MS, (unsigned)SCREEN_COUNT,
+           PIN_BUTTON >= 0 ? "GPIO" : "none ", (int)PIN_BUTTON, (unsigned long)SCREEN_AUTO_RETURN_MS, (int)DISPLAY_DEMO);
 
   for (;;) {
-    const uint32_t now = millis();
+    const uint32_t now = state_now_ms();
     hb_touch(hb_disp);
 
     // The button works whether or not a panel answers (presses are counted either way).
@@ -579,18 +580,21 @@ static void display_task(void *) {
       if ((int32_t)(now - next_retry_ms) >= 0) {
         next_retry_ms = now + OLED_INIT_RETRY_MS;
         ++retries;
-        const uint8_t err = oled_init();
-        if (err == 0) {
+        const esp_err_t err = oled_init();
+        if (err == ESP_OK) {
           log_init_ok();
           c.st.init_ok = true;
           c.st.dimmed = false;  // oled_init() programmed OLED_CONTRAST
           OledFrame boot;
           oled_boot_frame(boot);
-          render(c, boot, millis());  // the panel RAM is garbage after init: show something now
-          next_frame_ms = millis();   // and the live frame on the next tick
+          if (render(c, boot, state_now_ms())) {  // the panel RAM is garbage after init: show something now
+            next_frame_ms = state_now_ms();       // and the live frame on the next tick
+          } else {
+            panel_lost(c, now, next_retry_ms);
+          }
         } else {
-          log_w("OLED: still no response at 0x%02X (retry %lu, Wire error %u)", (unsigned)OLED_I2C_ADDR,
-                (unsigned long)retries, (unsigned)err);
+          ESP_LOGW(TAG, "OLED: still no response at 0x%02X (retry %lu, %s)", (unsigned)OLED_I2C_ADDR,
+                   (unsigned long)retries, esp_err_to_name(err));
         }
       }
       publish_stats(c.st);
@@ -599,18 +603,15 @@ static void display_task(void *) {
     }
 
     // Panel present: re-probe it every OLED_INIT_RETRY_MS (one zero-length
-    // transaction, ~30 us). The library swallows every I2C error, so without
-    // this a loose connector or a brown-out that reset the controller (Display
-    // OFF, RAM cleared) would leave a dark panel until the next reboot. On a
-    // miss fall back to the retry path above, which re-initialises and redraws.
+    // transaction, ~30 us). A frame whose transfer fails is caught in render();
+    // the probe additionally catches a panel that vanished while nothing changed
+    // on screen. On a miss fall back to the retry path above.
     if ((int32_t)(now - next_retry_ms) >= 0) {
       next_retry_ms = now + OLED_INIT_RETRY_MS;
-      const uint8_t err = oled_probe();
-      if (err != 0) {
-        log_w("OLED: lost contact at 0x%02X (Wire error %u), re-initialising", (unsigned)OLED_I2C_ADDR, (unsigned)err);
-        c.st.init_ok = false;
-        next_retry_ms = now;  // first re-init attempt on the next tick
-        publish_stats(c.st);
+      const esp_err_t err = oled_probe();
+      if (err != ESP_OK) {
+        ESP_LOGW(TAG, "OLED: lost contact at 0x%02X (%s), re-initialising", (unsigned)OLED_I2C_ADDR, esp_err_to_name(err));
+        panel_lost(c, now, next_retry_ms);
         vTaskDelay(pdMS_TO_TICKS(OLED_BUTTON_POLL_MS));
         continue;
       }
@@ -619,12 +620,16 @@ static void display_task(void *) {
     // Frame tick every OLED_PERIOD_MS, or right away after a screen change.
     if (screen_changed || (int32_t)(now - next_frame_ms) >= 0) {
       next_frame_ms = now + OLED_PERIOD_MS;
-      frame_tick(c, now);
+      if (!frame_tick(c, now)) {
+        panel_lost(c, now, next_retry_ms);
+        vTaskDelay(pdMS_TO_TICKS(OLED_BUTTON_POLL_MS));
+        continue;
+      }
     }
     publish_stats(c.st);  // small memcpy under the lock, never while drawing
 
     // Fixed short delay rather than vTaskDelayUntil: after a slow I2C transfer
-    // there is no catch-up burst that would starve loopTask (priority 1).
+    // there is no catch-up burst that would starve the supervisor (priority 1).
     vTaskDelay(pdMS_TO_TICKS(OLED_BUTTON_POLL_MS));
   }
 }
@@ -636,34 +641,36 @@ bool display_start() {
   c.screen = SCREEN_MAIN;
 
 #if PIN_BUTTON >= 0
-  // Before the first digitalRead(): arduino-esp32 registers the pin with the
-  // peripheral manager here and warns on every read of an unconfigured pin.
-  pinMode(PIN_BUTTON, BUTTON_ACTIVE_LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
-  log_i("OLED: button on GPIO%d (active %s, debounce %u ms, long press %u ms, auto-return %lu ms)", (int)PIN_BUTTON,
-        BUTTON_ACTIVE_LOW ? "low, pull-up" : "high, pull-down", (unsigned)BUTTON_DEBOUNCE_MS,
-        (unsigned)BUTTON_LONG_PRESS_MS, (unsigned long)SCREEN_AUTO_RETURN_MS);
+  gpio_config_t btn = {};
+  btn.pin_bit_mask = 1ULL << PIN_BUTTON;
+  btn.mode = GPIO_MODE_INPUT;
+  btn.pull_up_en = BUTTON_ACTIVE_LOW ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE;
+  btn.pull_down_en = BUTTON_ACTIVE_LOW ? GPIO_PULLDOWN_DISABLE : GPIO_PULLDOWN_ENABLE;
+  gpio_config(&btn);
+  ESP_LOGI(TAG, "OLED: button on GPIO%d (active %s, debounce %u ms, long press %u ms, auto-return %lu ms)", (int)PIN_BUTTON,
+           BUTTON_ACTIVE_LOW ? "low, pull-up" : "high, pull-down", (unsigned)BUTTON_DEBOUNCE_MS,
+           (unsigned)BUTTON_LONG_PRESS_MS, (unsigned long)SCREEN_AUTO_RETURN_MS);
 #else
-  log_i("OLED: no button (PIN_BUTTON -1): main screen only");
+  ESP_LOGI(TAG, "OLED: no button (PIN_BUTTON -1): main screen only");
 #endif
 
-  const uint8_t err = oled_init();
-  if (err == 0) {
+  const esp_err_t err = oled_init();
+  if (err == ESP_OK) {
     log_init_ok();
     c.st.init_ok = true;
     OledFrame boot;  // main screen, all "--", clock "--:--", fix line BOOT, CAN line = firmware version
     oled_boot_frame(boot);
-    render(c, boot, millis());
+    if (!render(c, boot, state_now_ms())) c.st.init_ok = false;  // the task retries
   } else {
-    log_e("OLED: no response at 0x%02X (check wiring/address jumper), Wire error %u", (unsigned)OLED_I2C_ADDR,
-          (unsigned)err);
+    ESP_LOGE(TAG, "OLED: no response at 0x%02X (check wiring/address jumper): %s", (unsigned)OLED_I2C_ADDR,
+             esp_err_to_name(err));
   }
   publish_stats(c.st);
 
   // The task always runs: it retries the init and keeps hb_disp fresh either way.
   if (xTaskCreate(display_task, "disp", OLED_TASK_STACK, nullptr, TASK_PRIO_DISP, nullptr) != pdPASS) {
-    log_e("OLED: xTaskCreate failed");
+    ESP_LOGE(TAG, "OLED: xTaskCreate failed");
     return false;
   }
   return c.st.init_ok;
 }
-

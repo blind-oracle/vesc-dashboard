@@ -1,6 +1,6 @@
 #include "shared_state.h"
 
-#include <Arduino.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -38,8 +38,8 @@ void state_unlock() {
 
 SharedState state_snapshot() {
   // Copy into the caller's object while the lock is held: two consumers (the
-  // display task and loop()) share s_last_snapshot, and a copy taken from it
-  // after unlocking can be preempted mid-memcpy by the other consumer
+  // display task and the supervisor) share s_last_snapshot, and a copy taken from
+  // it after unlocking can be preempted mid-memcpy by the other consumer
   // refreshing it, handing back a torn mix of two snapshots.
   SharedState out;
   if (state_lock(50)) {
@@ -52,4 +52,7 @@ SharedState state_snapshot() {
   return out;
 }
 
-uint32_t state_now_ms() { return millis(); }
+// Milliseconds since boot, truncated to 32 bits (wraps after ~49.7 days, exactly like
+// Arduino's millis() did). Every age in the project is an unsigned difference, so the
+// wrap is harmless; 0 stays reserved for "never" by the callers that need it.
+uint32_t state_now_ms() { return (uint32_t)(esp_timer_get_time() / 1000); }
