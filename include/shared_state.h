@@ -141,22 +141,13 @@ struct TripState {
 // ---------------------------------------------------------------- Display
 struct DisplayStats
 {
-  // generic (both display types)
-  uint32_t refreshes;         // frames pushed to the panel (any kind)
+  uint32_t refreshes;         // frames pushed to the panel
   uint32_t skipped_unchanged; // ticks where nothing changed
   uint32_t last_change_ms;
-  bool dimmed;  // OLED: contrast lowered after OLED_IDLE_DIM_MS without changes
+  bool dimmed;                   // contrast lowered after OLED_IDLE_DIM_MS without changes
   bool init_ok; // controller answered at init
-  uint8_t screen;                // OLED: currently shown screen index (0 = main)
-  uint32_t button_presses;       // OLED: debounced presses seen
-  // e-ink specific (zero on the OLED build)
-  uint32_t partials; // partial refreshes since the last full refresh
-  uint32_t partials_total;
-  uint32_t fulls;
-  uint32_t last_full_ms;
-  uint32_t busy_timeouts;
-  bool hibernating;
-  bool powered_off;
+  uint8_t screen;                // currently shown screen index (0 = main)
+  uint32_t button_presses;       // debounced presses seen
 };
 
 struct SharedState

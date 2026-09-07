@@ -669,7 +669,7 @@ void phase_run() {
   for (;;) {
     hb_touch(hb_gnss);
     // pump_rx returns after each frame; drain what queued up (e.g. behind a
-    // multi-second e-paper refresh) with a bound so a flood cannot hold us.
+    // display frame push) with a bound so a flood cannot hold us.
     for (int frames = 0; frames < 64 && pump_rx(UBX_ANY, UBX_ANY); ++frames) {
     }
     const uint32_t silent_ms = (uint32_t)(millis() - s_ctx.last_good_frame_ms);
@@ -703,7 +703,7 @@ void gnss_task(void *) {
 bool gnss_start() {
   // The RX ring must be sized BEFORE begin(): setRxBufferSize() returns 0 (and
   // keeps the 256-byte default) once the driver is running. 2048 bytes bridge a
-  // multi-second e-paper refresh at 1 Hz NAV-PVT (100 bytes/epoch).
+  // ~30 ms display frame push at 10 Hz NAV-PVT (100 bytes/epoch).
   const size_t rx_size = GNSS.setRxBufferSize(GNSS_RX_BUFFER);
   GNSS.begin(kBauds[0], SERIAL_8N1, PIN_GNSS_RX, PIN_GNSS_TX);
   if (rx_size == 0) {

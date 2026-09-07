@@ -2,8 +2,6 @@
 
 ESP32-C6 firmware that listens to a VESC motor controller on CAN, polls it once a second for the few values its broadcasts lack (fault code, per-MOSFET temperatures, id/iq, vd/vq, absolute tachometer), reads ground speed and time from a u-blox GNSS receiver at 5 Hz, shows everything on a 128x64 monochrome OLED (SSD1309 controller, I2C) as seven screens cycled by a push button, and integrates speed and energy into a trip log with the boat's efficiency in Wh per nautical mile (or km). Built for the DFRobot FireBeetle 2 ESP32-C6 (DFR1075) with an MCP2551-class CAN transceiver, any 2.42" or 1.54" SSD1309 module switched to I2C mode and any receiver that speaks UBX (u-blox 6/7, M8, M9, M10 or a compatible clone). On the CAN bus the firmware acknowledges frames and transmits exactly one thing: a 7-byte `COMM_GET_VALUES_SELECTIVE` request every `VESC_POLL_MS` (1 s). It never sends a command or a setting; `-DVESC_POLL_MS=0` makes it strictly passive (ACK only).
 
-The dashboard was first built for a 4.2" Good Display GDEY042T81 e-paper panel; that panel broke. The e-ink code stays in the tree as a legacy option, selected with the `DISPLAY_TYPE` switch in `config.h` and built only by `pio run -e epd`; everything marked "legacy" below refers to it.
-
 ## 1. What it does
 
 Five FreeRTOS tasks on the single core (tick 1 ms). Priorities guarantee that CAN reception is never starved by a frame push or by a stuck I2C bus (50 ms timeout per transaction).
@@ -32,7 +30,7 @@ Files:
 
 | Path | Purpose |
 |---|---|
-| `include/config.h` | every pin and tunable plus the display selection; the only file you normally edit |
+| `include/config.h` | every pin and tunable; the only file you normally edit |
 | `include/vesc_status.h` | header-only VESC STATUS_1..6 decoder (Arduino-free, unit-tested) |
 | `include/vesc_getvalues.h` | header-only codec for active polling: request builder, `FILL_RX_BUFFER` / `PROCESS_RX_BUFFER` reassembly, CRC-16/XMODEM, mask-ordered `COMM_GET_VALUES(_SELECTIVE)` decoder, the 34-entry fault-code table (Arduino-free, unit-tested) |
 | `include/ubx_min.h` | header-only UBX frame parser, NAV-PVT / NAV-VELNED decoders and the CFG-PRT / CFG-RATE / VALSET frame builders (Arduino-free, unit-tested) |
@@ -40,14 +38,48 @@ Files:
 | `include/can_vesc.h`, `src/can_vesc.cpp` | TWAI setup, canTask, poll state machine, alerts and bus-off recovery |
 | `include/gnss_ubx.h`, `src/gnss_ubx.cpp` | Serial1 setup, autobaud, MON-VER detection, baud switch, VALSET/legacy configuration |
 | `include/trip.h`, `src/trip.cpp` | header-only trip integrator (distance, energy sources, `EFF_WINDOW_S` window, efficiency; Arduino-free, unit-tested) and the 200 ms task that feeds it snapshots and publishes `g_state.trip` |
-| `include/display.h` | `display_start()`, the one entry point both display back-ends implement |
+| `include/display.h` | `display_start()`, the display task's one entry point (implemented by `src/display_oled.cpp`) |
 | `include/display_strings_oled.h` | pure builders of all seven OLED screens (character budgets, stale -> `--`, UTC -> local clock), unit-tested |
 | `src/display_oled.cpp` | I2C bring-up and presence probe, U8g2 font rendering, button debounce, screen switching, change-detected refresh, idle dimming |
-| `include/display_strings.h`, `include/display_epd.h`, `src/display_epd.cpp` | legacy e-ink string builder and GxEPD2 task; compiled only in the `epd` env |
 | `src/main.cpp` | `setup()` and the supervisor `loop()` |
-| `test/test_vesc/`, `test/test_vesc_getvalues/`, `test/test_ubx/`, `test/test_trip/`, `test/test_display_strings_oled/`, `test/test_display_strings/` | Unity tests (one `test_main.cpp` each), run on the host with `pio test -e native` |
+| `test/test_vesc/`, `test/test_vesc_getvalues/`, `test/test_ubx/`, `test/test_trip/`, `test/test_display_strings_oled/` | Unity tests (one `test_main.cpp` each, 143 test cases), run on the host with `pio test -e native` |
 
 ## 2. Hardware and wiring
+
+### Wiring diagram
+
+```
+                                    USB-C: console + power (GPIO12/13)
+                                                    |
+ +------------------+             +-----------------+------------------+        +-----------------+
+ | u-blox GNSS      |             |  FireBeetle 2 ESP32-C6 (DFR1075)   |        | SSD1309 OLED    |
+ | UBX, 3.3 V UART  |             |   silkscreen label = GPIO number   |        | 128x64 I2C 0x3C |
+ |              VCC |-------------| 3V3                            3V3 |--------| VCC             |
+ |              GND |-------------| GND                            GND |--------| GND             |
+ |               TX |------------>| 4  PIN_GNSS_RX    PIN_OLED_SCL  23 |------->| SCL             |
+ |               RX |<------------| 5  PIN_GNSS_TX    PIN_OLED_SDA  22 |------->| SDA             |
+ +------------------+             |                   PIN_OLED_RST  14 |- opt ->| RES             |
+                                  |  on-board LED = GPIO15 (PIN_LED)   |        | DC -> GND: 0x3C |
+ +------------------+             |                                    |        | CS -> GND       |
+ | CAN transceiver  |             |                                    |        +-----------------+
+ | MCP2551 (5 V IO) |             |                   PIN_BUTTON     7 |----o   push button
+ | or 3.3 V-IO part |             |                                    |     \  to GND
+ |              TXD |<---[1k]-----| 3  PIN_CAN_TX                  GND |----o   (internal pull-up)
+ |              RXD |---[1k]--+-->| 2  PIN_CAN_RX                      |
+ | RS  -> GND       |         |   |                                    |
+ | VDD <- 5V (VESC) |      [2.2k] |                                    |
+ |              GND |---------+---| GND                                |
+ |  CANH      CANL  |             +------------------------------------+
+ +---+--------+-----+
+     |        |
+  [120R]      |   <- 120 Ohm terminator at this end of the bus
+     |        |
+     +========+=== twisted pair ===> VESC CAN connector: CANH, CANL, GND (second 120 Ohm there)
+```
+
+- Resistors: 1 kOhm in series with TXD (TXD has a 25 kOhm pull-up to 5 V inside the MCP2551; the resistor limits the current into GPIO3 while the ESP32 is in reset). The 1 kOhm / 2.2 kOhm divider exists because the MCP2551 is a 5 V part and drives RXD to 5 V, while ESP32-C6 pads take VDD + 0.3 V at most; the divider gives ~3.4 V at a 5.0 V supply (check it, see below). A 3.3 V-IO transceiver (MCP2562 with VIO = 3V3, TJA1051T/3, SN65HVD230) connects RXD to GPIO2 directly. 120 Ohm across CANH/CANL at each end of the bus.
+- 5 V: the transceiver's VDD comes from the VESC's 5 V pin (or another regulated 5 V on the boat), never from the FireBeetle 3V3; every GND is commoned. The FireBeetle itself runs from USB-C (also the console) or its battery connector; the OLED and the GNSS module take 3V3 from the board.
+- Free header pins: GPIO1, 8 and 18 (CS, DC, SD_CS on the SPI header) are not used by anything. Alternatives: the FireBeetle's default I2C pins 19 (SDA) / 20 (SCL) with `-DPIN_OLED_SDA=19 -DPIN_OLED_SCL=20`; the on-board BOOT button with `-DPIN_BUTTON=9`; `-DPIN_OLED_RST=-1` when RES is tied high on the module.
 
 Silkscreen labels on the FireBeetle 2 ESP32-C6 equal GPIO numbers.
 
@@ -96,25 +128,8 @@ Any 128x64 SSD1309 module works (Waveshare, DIYables, LCDWIKI, Diymore / ACEIRMC
 | back-side solder resistors | interface select | - | Waveshare 2.42": both 0R resistors to the "I2C" position. LCDWIKI MSP154X: 4.7k on R4 + R9 only (remove R5). Diymore / ACEIRMC 2.42": move the 4.7k from R4 to R3, bridge R5. Adafruit 2719: BS1/BS2 jumpers. 4-pin "IIC" modules come pre-configured |
 
 - Pull-ups: the SSD1309 datasheet requires external pull-ups on SDA and SCL; the C6's internal ones (~45 kOhm) are far too weak for 400 kHz. Most I2C-configured modules carry 4.7 kOhm (on LCDWIKI boards the R4/R9 parts are the pull-ups); measure SDA and SCL to VCC and add 2.2..4.7 kOhm to 3V3 if there are none. If the display is flaky, build with `-DOLED_I2C_HZ=100000` (a frame then takes ~105 ms instead of ~26 ms, still fine at 4 Hz).
-- Why the old SPI pins: the harness that ran to the e-ink already carries GPIO22/23/14, the C6 routes I2C to any GPIO through its GPIO matrix (22 and 23 are unrestricted "P2" pins) and nothing else uses SPI. The former CS/DC/BUSY pins (1, 8, 18) are free. If you prefer the FireBeetle's default I2C pins (19 = SDA, 20 = SCL, also on the GDI connector), build with `-DPIN_OLED_SDA=19 -DPIN_OLED_SCL=20`.
+- Why the SPI header pins: the OLED sits on the FireBeetle's SPI header pins (23 / SCK, 22 / MOSI, 14 / RES), which the C6 routes to I2C through its GPIO matrix (22 and 23 are unrestricted "P2" pins); nothing else uses SPI. The neighbouring CS / DC / SD_CS pins (GPIO1, 8, 18) are free. If you prefer the FireBeetle's default I2C pins (19 = SDA, 20 = SCL, also on the GDI connector), build with `-DPIN_OLED_SDA=19 -DPIN_OLED_SCL=20`.
 - Burn-in: white SSD1309 glass is rated ~20,000 h to half luminance (yellow ~50,000 h) and static images leave residual ghosts. The layout is black with sparse text (the only filled area is the 10-px title bar of the detail screens), and the contrast drops to `OLED_IDLE_CONTRAST` after `OLED_IDLE_DIM_MS` without a change (section 5). If the panel is still to be bought, a yellow one lasts longer.
-
-<details>
-<summary>Legacy e-ink: GDEY042T81 on DESPI-C02 (<code>pio run -e epd</code>)</summary>
-
-| Signal | GPIO (`config.h`) | Silkscreen | DESPI-C02 pin |
-|---|---|---|---|
-| SCK | 23 (`PIN_EPD_SCK`) | 23 / SCK | SCK |
-| MOSI | 22 (`PIN_EPD_MOSI`) | 22 / MOSI | SDI |
-| CS | 1 (`PIN_EPD_CS`) | 1 / CS | CS |
-| DC | 8 (`PIN_EPD_DC`) | 8 / DC | D/C |
-| RST | 14 (`PIN_EPD_RST`) | 14 / RES | RES |
-| BUSY | 18 (`PIN_EPD_BUSY`) | 18 / SD_CS | BUSY |
-
-- Set the DESPI-C02 "RESE" DIP switch to "3" (older adapter revision) or "2.2 Ohm" (current revision). Position 0.47 is for UC81xx-based "GDEW" panels and gives a blank or faint image on this SSD1683 panel.
-- 3.3 V only, supply and every signal line. BUSY is a panel-driven, active-high input; `config.h` refuses (`#error`) to build the `epd` env with BUSY on a strapping pin (8, 9, 15). DC on GPIO8 is a strapping pin, but an MCU-driven output, so boot is unaffected.
-- Operating temperature 0..50 C; below about 10 C set `EPD_FAST_FULL_UPDATE 0`. The pins are the FireBeetle's default SPI (GDI connector) pins, MISO unused. The e-ink build has no button and no screens.
-</details>
 
 ### GNSS receiver
 
@@ -128,7 +143,7 @@ Any u-blox receiver or clone with a 3.3 V UART: NEO-6M/7M, NEO-M8N, SAM-M8Q, NEO
 | 16, 17 | UART0, the ROM/IDF boot console. GPIO16 is driven by UART0 TX for the whole run |
 | 9 | BOOT button, boot-mode strapping. Usable as the screen button (`-DPIN_BUTTON=9`) because the level is only latched at reset |
 | 0 | battery ADC, not on the header |
-| 8, 15 | strapping pins (boot mode, JTAG select). MCU-driven outputs are fine (LED, the legacy e-ink DC); never a panel-driven input |
+| 8, 15 | strapping pins (boot mode, JTAG select). MCU-driven outputs are fine (the on-board LED is on 15); never a peripheral-driven input |
 | 4, 5 | strapping only for the SDIO edge, harmless; used for GNSS |
 
 ## 3. VESC configuration (VESC Tool)
@@ -185,7 +200,7 @@ The receiver is driven with the binary UBX protocol only; NMEA output is switche
 - Persistence and power cycles: everything is written to RAM (VALSET also to BBR, the battery-backed RAM), never to the receiver's flash, and the receiver is reconfigured on every boot and after every redetect. An M9/M10 with a backup battery comes back from a power cycle at 115200 with NAV-PVT on and NMEA off and is found by the first autobaud attempt within a second (`GNSS: UBX detected at 115200 baud (unsolicited frame)`). Any receiver without V_BCKP, and every u-blox 6/7/M8 even with one (the legacy CFG-PRT / CFG-MSG changes are RAM-only), boots at its factory baud talking NMEA: the running task sees no valid UBX frame for `GNSS_REDETECT_MS` (20 s), logs `GNSS: no valid UBX frame for 20010 ms (module reset or baud lost); redetect #1` and goes through autobaud, switch and configuration again without an ESP32 reboot, so the speed cell shows `--` for roughly half a minute. A configuration saved to the receiver's flash with u-center is left alone; note that a battery-backed M9/M10 keeps the 115200 / UBX-only port settings for u-center as well until they are changed or the battery drains.
 - `SPEED_UNIT_KNOTS 1` = knots, 0 = km/h (the examples in this README use knots). Speed shows `--` without a 2D/3D fix, when the receiver's own speed-accuracy estimate is worse than `GNSS_MAX_SACC_MM_S`, or when no NAV-PVT arrived for `GNSS_STALE_MS`. Speeds below `SPEED_MIN_SHOW` are shown as 0.0 to hide drift at the mooring; the heading on the GNSS screen is hidden (`--`) in the same case.
 - Clock: NAV-PVT carries UTC date and time with validity flags. The main screen shows `HH:MM` = UTC + `TIME_UTC_OFFSET_MIN` (e.g. 120 for UTC+2, -300 for UTC-5; negative and multi-day offsets wrap correctly, no DST logic) whenever the receiver flags both date and time valid and the epoch is fresh, even without a position fix (a time-only fix counts); otherwise `--:--`. The GNSS screen shows the raw UTC date-time with a `Z` suffix.
-- The receiver is on HP UART1 (`Serial1`) with a `GNSS_RX_BUFFER` (2048 byte) receive ring filled from the UART interrupt: 4 s of 5 Hz NAV-PVT (100 bytes per epoch), so no epoch is lost while the display task holds the CPU (an OLED frame is ~26 ms of I2C). At 10 Hz the ring holds 2 s, too little for the legacy e-ink's multi-second refreshes: keep the `epd` env at 5 Hz or raise `GNSS_RX_BUFFER` there. Serial2 is the LP UART on the C6 and is not used.
+- The receiver is on HP UART1 (`Serial1`) with a `GNSS_RX_BUFFER` (2048 byte) receive ring filled from the UART interrupt: 4 s of 5 Hz NAV-PVT (100 bytes per epoch), so no epoch is lost while the display task holds the CPU (an OLED frame is ~26 ms of I2C). At 10 Hz it still holds 2 s. Serial2 is the LP UART on the C6 and is not used.
 
 ### Efficiency and trip
 
@@ -256,25 +271,6 @@ Refresh and idle policy (`config.h`):
 
 The panel is probed with a zero-length I2C transaction before every init, so a missing display is reported instead of drawn into blindly: `display_start()` logs `OLED: no response at 0x3C (check wiring/address jumper), Wire error N` and the task retries every 5 s (`OLED: still no response at 0x3C (retry N, Wire error N)`); while running it re-probes every 5 s and re-initialises a panel that stopped answering (`OLED: lost contact at 0x3C (Wire error N), re-initialising`), so hot-plugging works in both directions. After every (re)init the panel shows the boot frame (main screen, `--` everywhere, `--:--`, `BOOT`, firmware version) and the live frame on the next tick. `-DDISPLAY_DEMO=1` (the `demo` env) feeds synthetic changing values to all seven screens (the EFFICIENCY page runs a synthetic trip at 3 m/s and ~600 W) with a 30 s hold every 2 min, a live `OT_FET` fault for 10 s per cycle and the latched `LAST OT_FET <age>` row afterwards, so you can check every layout and the idle dimming with no VESC or GNSS attached (`-DOLED_IDLE_DIM_MS=20000` to see the dimming sooner).
 
-<details>
-<summary>Legacy e-ink refresh policy (<code>epd</code> env)</summary>
-
-Landscape 400 x 300, black on white: speed in large digits with satellite count, fix state and UTC time (zone A), four tiles BATTERY V / BATTERY A / MOTOR A / POWER W (zone B) and a status bar with VESC id, TWAI state, FET temperature, GNSS baud and the partial-refresh counter `#N` (zone C).
-
-| Define | Default | Effect |
-|---|---|---|
-| `DISPLAY_PERIOD_MS` | 1000 | tick; keep at 1000 or more, a partial cycle takes 0.5..0.7 s |
-| `EPD_FULL_EVERY_N_PARTIALS` | 30 | changes are drawn with fast partial updates (~0.4 s, no flash); after this many, a full refresh (flashes) cleans ghosting ... |
-| `EPD_FULL_EVERY_MS` | 300000 | ... or at least every 5 min, whichever comes first. Lower N if ghosting is visible |
-| `EPD_POWEROFF_IDLE_MS` | 15000 | nothing changed for 15 s -> `powerOff()` (booster off, image stays) |
-| `EPD_HIBERNATE_IDLE_MS` | 600000 | ... after 10 min -> `hibernate()` (deep sleep); the next change wakes the panel with a full refresh |
-| `EPD_FAST_FULL_UPDATE` | 1 | fast full refresh (~1.1 s, fixed waveform temperature); 0 below ~10 C (2..3 s, temperature-compensated, less ghosting in the cold) |
-| `EPD_SPI_HZ`, `EPD_RESET_MS`, `EPD_ROTATION` | 4000000, 10, 0 | SPI clock (the SSD1683 allows 20 MHz), reset pulse, landscape |
-| `EPD_DIAG_BAUD` | 0 | 115200 makes GxEPD2 print refresh timings on Serial during bring-up |
-
-The first image after boot costs two full refreshes (~2.5 s). GxEPD2 hard-codes a 10 s BUSY timeout, which is why `WDT_TIMEOUT_MS` is 20 s.
-</details>
-
 ## 6. Building, flashing, testing
 
 Prerequisites: PlatformIO Core (`pio` on the PATH, e.g. `~/.platformio/penv/bin/pio`) and a USB-C cable to the FireBeetle's USB port. The platform is pinned in `platformio.ini` to a pioarduino release (`.../platform-espressif32/releases/download/55.03.31-1/platform-espressif32.zip`: Arduino core 3.3.1 on ESP-IDF 5.5.1). Do not replace it with bare `espressif32`: the registry version has no ESP32-C6 support. The first build downloads about 475 MB of toolchain and precompiled libraries plus the four display libraries (DIYables_OLED_SSD1309, U8g2_for_Adafruit_GFX, Adafruit GFX, Adafruit BusIO).
@@ -284,9 +280,8 @@ Prerequisites: PlatformIO Core (`pio` on the PATH, e.g. `~/.platformio/penv/bin/
 | `pio run` | build the default OLED firmware (env `dfrobot_firebeetle2_esp32c6`) |
 | `pio run -t upload` | build and flash over USB (`/dev/cu.usbmodem*`); hold BOOT while plugging in only if the port does not enumerate |
 | `pio device monitor` | serial console at 115200 with exception decoder and timestamps |
-| `pio test -e native` | host unit tests in six directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_ubx`, `test/test_trip`, `test/test_display_strings_oled`, `test/test_display_strings`): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, `millis()` wrap), all seven OLED screens and the clock arithmetic, legacy e-ink strings; no hardware |
+| `pio test -e native` | host unit tests in five directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_ubx`, `test/test_trip`, `test/test_display_strings_oled`; 143 test cases): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, `millis()` wrap), all seven OLED screens and the clock arithmetic; no hardware |
 | `pio run -e demo -t upload` | flash the layout demo (`DISPLAY_DEMO=1`, all screens with synthetic data, dimming after 20 s) |
-| `pio run -e epd -t upload` | legacy e-ink build (`DISPLAY_TYPE=DISPLAY_TYPE_EPD_GDEY042T81`, pulls in GxEPD2) |
 | `pio project init --ide vscode` | regenerate IntelliSense after changing `platformio.ini` |
 
 A healthy boot (Arduino `log_i` format; numbers and the `...` parts vary, the phrases are the ones the code prints) looks like:
@@ -333,7 +328,6 @@ An M9/M10 receiver logs `GNSS: PROTVER 34.10 -> VALSET configuration`, `GNSS: sw
 | Frames missing or flicker at 400 kHz | pull-ups missing or long wiring; `-DOLED_I2C_HZ=100000` |
 | Button does nothing, `btn` on the SYS screen (and `btn=` in the SYS log line) stays 0 | boot log must show `OLED: button on GPIO7 (active low, ...)`, not `OLED: no button (PIN_BUTTON -1): main screen only`; switch wired to GND (or `-DBUTTON_ACTIVE_LOW=0` for a switch to 3V3); a press shorter than `BUTTON_DEBOUNCE_MS` is ignored. A long press always returns to MAIN, so a switch stuck closed looks like "nothing happens" |
 | Clock shows `--:--` although the fix line is `3D 9sv` | the receiver has not flagged date and time valid yet (cold start: wait a minute); wrong local time = `TIME_UTC_OFFSET_MIN` (minutes, e.g. 120 for UTC+2) |
-| Legacy e-ink (`pio run -e epd`) stays blank, or every refresh takes 10 s with `Busy Timeout!` / `display: BUSY timeout during refresh` | DESPI-C02 RESE switch on "3" / "2.2 Ohm"; CS, DC, RST, BUSY wiring (GPIO1, 8, 14, 18); 3.3 V |
 | `can=RUN` but `frames=0` and every age `never` in the VESC log line, cells `--`, CAN line `CAN idle` | status messages not enabled in VESC Tool (section 3); bitrate mismatch (`CAN_BITRATE_KBPS` vs VESC Tool); RXD level shifting missing or the divider output too low; TXD not wired (no ACK, the VESC then stalls, see section 3) |
 | Status frames fine, but VESC 2/3 shows `--`, VESC 1/3 `FAULT --`, `tmo` climbs and every 10 s `VESC poll: N request(s) without a complete reply within 500 ms (VESC off, wrong id, CAN mode not VESC, or firmware without COMM_GET_VALUES_SELECTIVE); polling every 5000 ms` | VESC Tool > App Settings > General > CAN Mode must be VESC (not UAVCAN / Comm Bridge); `CAN_OWN_ID` equals the VESC id (then also `VESC: controller id 120 equals CAN_OWN_ID, polling suspended ...`); FW < 3.42 has no `COMM_GET_VALUES_SELECTIVE` (`-DVESC_GETVALUES_MASK=0`); a `VESC_CAN_ID` that no VESC has. With the VESC off these lines plus `VESC poll: N request(s) not acknowledged on the bus (VESC off? TEC=N)` and `CAN: error passive` are expected and stop as soon as it is back |
 | `VESC poll: N bad reply/replies, last: length or CRC mismatch (len N, expected 42 for mask 0x003EC03C)` now and then, `bad` on VESC 3/3 | bus errors during a reply, or another CAN master (VESC Tool over CAN, a second display) whose traffic interleaves with ours; the next poll recovers. Constant: a `VESC_GETVALUES_MASK` override the decoder does not know (`unknown layout`) |
@@ -350,7 +344,7 @@ An M9/M10 receiver logs `GNSS: PROTVER 34.10 -> VALSET configuration`, `GNSS: sw
 
 ## 7. Changing pins and tunables
 
-Everything lives in `include/config.h` as `#ifndef NAME / #define NAME value`. Either edit the file or override from `platformio.ini` without touching it, in your own environment that inherits the main one (the same pattern the `demo` and `epd` envs use):
+Everything lives in `include/config.h` as `#ifndef NAME / #define NAME value`. Either edit the file or override from `platformio.ini` without touching it, in your own environment that inherits the main one (the same pattern the `demo` env uses):
 
 ```ini
 [env:myboat]
@@ -363,11 +357,11 @@ build_flags =
 
 Then build with `pio run -e myboat -t upload`.
 
-Compile-time checks stop you from using GPIO12/13, from sharing a GPIO between two peripherals (the button pin takes part; only the pins of the selected display do: the OLED deliberately reuses the e-ink's SPI pins), from putting the legacy BUSY on 8/9/15, from an unsupported CAN bitrate, from a `CAN_OWN_ID` outside 1..254 or equal to `VESC_CAN_ID`, from polling in listen-only mode, from a `GNSS_RATE_MS` outside 50..10000 ms and from an `EFF_WINDOW_S` outside 2..120 s. `src/gnss_ubx.cpp` adds `static_assert`s that `GNSS_TARGET_BAUD` is 0 or one of `GNSS_BAUDS` and that `GNSS_BAUD_SWITCH_ATTEMPTS` is 1..255. `src/display_oled.cpp` adds `static_assert`s for 128x64, `OLED_ROTATION` 0 or 2, `PIN_OLED_RST` in -1..127, contrast 0..255, `OLED_I2C_HZ` in 1..1000000 (the bus clock must equal the configured value exactly, or the library's clock bracketing stops being free), `PIN_BUTTON` in -1..30, `BUTTON_DEBOUNCE_MS` shorter than `BUTTON_LONG_PRESS_MS` and `OLED_BUTTON_POLL_MS` not above `OLED_PERIOD_MS`.
+Compile-time checks stop you from using GPIO12/13, from sharing a GPIO between two peripherals (the button pin takes part; `PIN_OLED_RST` is checked separately because it may be -1), from an unsupported CAN bitrate, from a `CAN_OWN_ID` outside 1..254 or equal to `VESC_CAN_ID`, from polling in listen-only mode, from a `GNSS_RATE_MS` outside 50..10000 ms and from an `EFF_WINDOW_S` outside 2..120 s. `src/gnss_ubx.cpp` adds `static_assert`s that `GNSS_TARGET_BAUD` is 0 or one of `GNSS_BAUDS` and that `GNSS_BAUD_SWITCH_ATTEMPTS` is 1..255. `src/display_oled.cpp` adds `static_assert`s for 128x64, `OLED_ROTATION` 0 or 2, `PIN_OLED_RST` in -1..127, contrast 0..255, `OLED_I2C_HZ` in 1..1000000 (the bus clock must equal the configured value exactly, or the library's clock bracketing stops being free), `PIN_BUTTON` in -1..30, `BUTTON_DEBOUNCE_MS` shorter than `BUTTON_LONG_PRESS_MS` and `OLED_BUTTON_POLL_MS` not above `OLED_PERIOD_MS`.
 
 | Group | Defines |
 |---|---|
-| Display selection | `DISPLAY_TYPE` (`DISPLAY_TYPE_OLED_SSD1309`, the default, or `DISPLAY_TYPE_EPD_GDEY042T81`), `DISPLAY_DEMO` |
+| Display demo | `DISPLAY_DEMO` (1 = synthetic changing values on every screen, the `demo` env) |
 | OLED | `PIN_OLED_SCL`, `PIN_OLED_SDA`, `PIN_OLED_RST` (-1 = not wired), `OLED_I2C_ADDR`, `OLED_I2C_HZ`, `OLED_WIDTH`, `OLED_HEIGHT`, `OLED_ROTATION`, `OLED_PERIOD_MS`, `OLED_CONTRAST`, `OLED_IDLE_DIM_MS`, `OLED_IDLE_CONTRAST` |
 | Screens, button, clock | `PIN_BUTTON` (-1 = none, 9 = BOOT button), `BUTTON_ACTIVE_LOW`, `BUTTON_DEBOUNCE_MS`, `BUTTON_LONG_PRESS_MS`, `SCREEN_AUTO_RETURN_MS` (0 = stay), `TIME_UTC_OFFSET_MIN` |
 | CAN / VESC | `PIN_CAN_TX`, `PIN_CAN_RX`, `CAN_BITRATE_KBPS` (125/250/500/1000), `CAN_LISTEN_ONLY`, `CAN_RX_QUEUE_LEN`, `VESC_CAN_ID` (-1 = any), `VESC_MOTOR_POLES`, `VESC_STALE_R1_MS`, `VESC_STALE_R2_MS`, `CAN_EMA_ALPHA`, `CAN_HEALTH_LOG_MS`, `CAN_LOG_RAW_FRAMES` (also logs the poll request and reply frames) |
@@ -375,10 +369,9 @@ Compile-time checks stop you from using GPIO12/13, from sharing a GPIO between t
 | GNSS | `PIN_GNSS_RX`, `PIN_GNSS_TX`, `GNSS_BAUDS`, `GNSS_TARGET_BAUD` (0 = keep the detected baud), `GNSS_RX_BUFFER`, `GNSS_RATE_MS` (200 = 5 Hz, 100 = 10 Hz), `GNSS_DYNMODEL_SEA`, `GNSS_STALE_MS`, `GNSS_REDETECT_MS`, `GNSS_ACK_TIMEOUT_MS`, `GNSS_MAX_SACC_MM_S`, `SPEED_MIN_SHOW`, `SPEED_UNIT_KNOTS` |
 | Trip / efficiency | `TRIP_PERIOD_MS`, `EFF_WINDOW_S` (2..120 s), `EFF_MIN_SPEED_MM_S`, `EFF_MIN_DIST_M`, `EFF_UNIT_KM` (1 = Wh/km even with knots), `LOG_TRIP_MS` (0 = off) |
 | Tasks / watchdog / logging | `TASK_PRIO_CAN`, `TASK_PRIO_GNSS`, `TASK_PRIO_DISP`, `WDT_TIMEOUT_MS`, `HB_MAX_CAN_MS`, `HB_MAX_GNSS_MS`, `HB_MAX_DISP_MS`, `LOG_VESC_MS`, `LOG_GNSS_MS`, `LOG_TRIP_MS`, `LOG_SYS_MS`, `SERIAL_BOOT_DELAY_MS`, `PIN_LED`, `FW_VERSION` |
-| E-paper (legacy, `epd` env only) | `PIN_EPD_SCK`, `PIN_EPD_MOSI`, `PIN_EPD_CS`, `PIN_EPD_DC`, `PIN_EPD_RST`, `PIN_EPD_BUSY`, `EPD_SPI_HZ`, `EPD_RESET_MS`, `EPD_ROTATION`, `EPD_FAST_FULL_UPDATE`, `EPD_DIAG_BAUD`, `DISPLAY_PERIOD_MS`, `EPD_FULL_EVERY_N_PARTIALS`, `EPD_FULL_EVERY_MS`, `EPD_POWEROFF_IDLE_MS`, `EPD_HIBERNATE_IDLE_MS` |
-| Advanced (defaults are fine) | `CAN_TASK_STACK`, `CAN_INSTALL_RETRY_MS`, `CAN_RX_TIMEOUT_MS`, `CAN_ERR_LOG_MIN_MS`, `CAN_ERR_WARN_LEVEL`, `CAN_TX_WAIT_MS`, `VESC_POLL_LOG_MIN_MS`, `VESC_POLL_BACKOFF_AFTER`, `VESC_POLL_BACKOFF_MS`, `VESC_GETVALUES_MASK` (0 = plain `COMM_GET_VALUES`), `VESC_RX_BUFFER_SIZE`, `GNSS_TASK_STACK`, `GNSS_AUTOBAUD_LISTEN_MS`, `GNSS_MONVER_TIMEOUT_MS`, `GNSS_AUTOBAUD_RETRY_MS`, `OLED_TASK_STACK`, `OLED_INIT_RETRY_MS`, `OLED_I2C_TIMEOUT_MS`, `OLED_BUTTON_POLL_MS`. Not in `config.h` but overridable the same way (local `#ifndef` fallbacks in the source): `GNSS_BAUD_SWITCH_ATTEMPTS` (2), `GNSS_BAUD_SWITCH_SETTLE_MS` (100), `TASK_PRIO_TRIP` (3), `TRIP_TASK_STACK` (4096), `TRIP_DT_MAX_MS` (5000), `TRIP_COUNTER_RESET_WH` (0.5), `TRIP_EFF_MIN_FILL_S` (3), `TRIP_STALE_MS` (5000) |
+| Advanced (defaults are fine) | `CAN_TASK_STACK`, `CAN_INSTALL_RETRY_MS`, `CAN_RX_TIMEOUT_MS`, `CAN_ERR_LOG_MIN_MS`, `CAN_ERR_WARN_LEVEL`, `CAN_TX_WAIT_MS`, `VESC_POLL_LOG_MIN_MS`, `VESC_POLL_BACKOFF_AFTER`, `VESC_POLL_BACKOFF_MS`, `VESC_GETVALUES_MASK` (0 = plain `COMM_GET_VALUES`), `VESC_RX_BUFFER_SIZE`, `GNSS_TASK_STACK`, `GNSS_AUTOBAUD_LISTEN_MS`, `GNSS_MONVER_TIMEOUT_MS`, `GNSS_AUTOBAUD_RETRY_MS`, `OLED_TASK_STACK`, `OLED_INIT_RETRY_MS`, `OLED_I2C_TIMEOUT_MS`, `OLED_BUTTON_POLL_MS`. Also in `config.h`, with local `#ifndef` fallbacks in the sources so a trimmed copy still builds: `GNSS_BAUD_SWITCH_ATTEMPTS` (2), `GNSS_BAUD_SWITCH_SETTLE_MS` (100), `TASK_PRIO_TRIP` (3), `TRIP_TASK_STACK` (4096), `TRIP_DT_MAX_MS` (5000), `TRIP_COUNTER_RESET_WH` (0.5), `TRIP_EFF_MIN_FILL_S` (3), `TRIP_STALE_MS` (5000) |
 
-Notes: the OLED layout is hard-coded for 128x64 in `OLED_ROTATION` 0 or 2. `OLED_PERIOD_MS` may go down to about 50 (a frame is ~26 ms), but 250 is plenty for EMA-smoothed currents and a 5 Hz speed that is pushed only when a digit changes. `VESC_POLL_MS` can go down to 100..200 if a faster fault indication is wanted (keep `VESC_POLL_TIMEOUT_MS` below it, or accept that a poll is skipped while a reply is outstanding). `WDT_TIMEOUT_MS` must stay above GxEPD2's 10 s busy timeout in the `epd` env. `GNSS_BAUDS` is a brace list and is easiest to change in `config.h` itself; `GNSS_TARGET_BAUD` must stay 0 or one of its members, best the first one (a lost switch verification then costs one autobaud pass). `TRIP_PERIOD_MS` should match `GNSS_RATE_MS`; a longer window (`EFF_WINDOW_S`) steadies `now` at the price of a slower response.
+Notes: the OLED layout is hard-coded for 128x64 in `OLED_ROTATION` 0 or 2. `OLED_PERIOD_MS` may go down to about 50 (a frame is ~26 ms), but 250 is plenty for EMA-smoothed currents and a 5 Hz speed that is pushed only when a digit changes. `VESC_POLL_MS` can go down to 100..200 if a faster fault indication is wanted (keep `VESC_POLL_TIMEOUT_MS` below it, or accept that a poll is skipped while a reply is outstanding). `WDT_TIMEOUT_MS` (20 s) only has to exceed the longest legitimate task stall (a stuck I2C bus costs `OLED_I2C_TIMEOUT_MS` per transaction). `GNSS_BAUDS` is a brace list and is easiest to change in `config.h` itself; `GNSS_TARGET_BAUD` must stay 0 or one of its members, best the first one (a lost switch verification then costs one autobaud pass). `TRIP_PERIOD_MS` should match `GNSS_RATE_MS`; a longer window (`EFF_WINDOW_S`) steadies `now` at the price of a slower response.
 
 ## 8. Passivity and safety notes
 
@@ -386,7 +379,7 @@ Notes: the OLED layout is hard-coded for 128x64 in `OLED_ROTATION` 0 or 2. `OLED
 - The polled averages (Iavg, id/iq, vd/vq) are "since the previous read": running VESC Tool's realtime page at the same time shortens their window on both sides. Everything else is unaffected by a second reader.
 - With the VESC powered off, each unanswered request costs the controller 8 error points until it goes error-passive (~16 polls); the log then shows `CAN: error passive` and the poll warnings every 10 s and the request rate drops to every 5 s. No bus-off, and it recovers by itself when the VESC is back.
 - Displayed and logged power is signed: `v_in x current_in`, negative while regenerating (the water drives the motor); VESC Tool's realtime power stat is an absolute value, so the two can differ in sign, not in magnitude. The cells are EMA-smoothed (`CAN_EMA_ALPHA`) and may be up to `VESC_STALE_R1_MS` old; a fault shows on the VESC 1/3 page only after the next poll (up to `VESC_POLL_MS` later) and only as long as the VESC keeps it or via the latch. This is a dashboard, not a protection device: rely on the VESC's own limits and a BMS for that.
-- OLED modules are specified for roughly -40..70 C (vendor dependent; some 1.54" boards only -20..60 C), far wider than the legacy e-ink's 0..50 C, but the glass, the FPC and the boost converter must stay dry: condensation on a boat needs an enclosure or conformal coating. In direct sun a ~110 cd/m2 OLED is hard to read; a sunshade helps more than contrast.
+- OLED modules are specified for roughly -40..70 C (vendor dependent; some 1.54" boards only -20..60 C), but the glass, the FPC and the boost converter must stay dry: condensation on a boat needs an enclosure or conformal coating. In direct sun a ~110 cd/m2 OLED is hard to read; a sunshade helps more than contrast.
 - Burn-in is the OLED's wear mechanism: a dashboard that shows the same numbers for hours is the worst case. Keep `OLED_IDLE_DIM_MS` enabled and expect the panel to lose brightness over thousands of hours; the detail screens' inverted title bar is the only filled area, and the auto-return brings the sparse main screen back after a minute.
 - A hung task reboots the board after `WDT_TIMEOUT_MS` (20 s); the next banner reports `reset=TASK_WDT`. The OLED keeps its last image until the firmware pulses RES about 1.5 s into the reboot, then shows the boot frame.
 - Apart from the CAN transceiver everything is 3.3 V. Nothing on the header tolerates 5 V, and neither does an OLED module whose pull-ups would then sit at 5 V, nor a button wired to anything but GND or 3V3.

@@ -1,6 +1,6 @@
-// boat-motor: ESP32-C6 (DFRobot FireBeetle 2) VESC CAN monitor + OLED/e-ink dashboard (DISPLAY_TYPE) + u-blox GNSS speed
+// boat-motor: ESP32-C6 (DFRobot FireBeetle 2) VESC CAN monitor + SSD1309 OLED dashboard + u-blox GNSS speed
 //
-// setup(): serial banner, shared state, task watchdog, start the three worker tasks.
+// setup(): serial banner, shared state, task watchdog, start the worker tasks.
 // loop():  supervisor (Arduino loopTask, priority 1) - feeds the task watchdog only
 //          while every worker heartbeat is fresh, blinks the LED, prints periodic
 //          telemetry / GNSS / system log lines. It never touches the peripherals.
@@ -35,15 +35,9 @@ static void logConfig() {
   log_i("cfg CAN : tx=%d rx=%d %d kbit/s mode=%s rxq=%d vesc_id=%d poles=%d poll=%d ms own_id=%d", PIN_CAN_TX,
         PIN_CAN_RX, CAN_BITRATE_KBPS, CAN_LISTEN_ONLY ? "LISTEN_ONLY" : (VESC_POLL_MS > 0 ? "NORMAL(ack+poll)" : "NORMAL(ack-only)"),
         CAN_RX_QUEUE_LEN, VESC_CAN_ID, VESC_MOTOR_POLES, VESC_POLL_MS, CAN_OWN_ID);
-#if DISPLAY_TYPE == DISPLAY_TYPE_EPD_GDEY042T81
-  log_i("cfg EPD : sck=%d mosi=%d cs=%d dc=%d rst=%d busy=%d spi=%lu Hz rot=%d fastfull=%d full_every=%d/%lu ms",
-        PIN_EPD_SCK, PIN_EPD_MOSI, PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY, (unsigned long)EPD_SPI_HZ,
-        EPD_ROTATION, EPD_FAST_FULL_UPDATE, EPD_FULL_EVERY_N_PARTIALS, (unsigned long)EPD_FULL_EVERY_MS);
-#else
   log_i("cfg OLED: sda=%d scl=%d rst=%d addr=0x%02X i2c=%lu Hz %dx%d rot=%d period=%d ms dim_after=%lu ms",
         PIN_OLED_SDA, PIN_OLED_SCL, PIN_OLED_RST, (unsigned)OLED_I2C_ADDR, (unsigned long)OLED_I2C_HZ, OLED_WIDTH,
         OLED_HEIGHT, OLED_ROTATION, OLED_PERIOD_MS, (unsigned long)OLED_IDLE_DIM_MS);
-#endif
   log_i("cfg GNSS: rx=%d tx=%d rate=%d ms unit=%s rxbuf=%d", PIN_GNSS_RX, PIN_GNSS_TX, GNSS_RATE_MS, SPEED_UNIT_STR,
         GNSS_RX_BUFFER);
 }

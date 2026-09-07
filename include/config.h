@@ -4,15 +4,14 @@
 // the project hard-codes a pin. Every value is wrapped in #ifndef so it can also
 // be overridden from platformio.ini:  build_flags = -DPIN_CAN_TX=7
 //
-// Display: DISPLAY_TYPE selects the 128x64 SSD1309 OLED over I2C (default) or the
-// legacy GDEY042T81 e-ink over SPI (kept for reference, built by 'pio run -e epd').
+// Display: 128x64 SSD1309 OLED over I2C (see the OLED section).
 //
 // Board: DFRobot FireBeetle 2 ESP32-C6 (DFR1075). Silkscreen labels equal GPIO
 // numbers. Pins to leave alone: 12/13 (USB), 16/17 (UART0 boot console, GPIO16
 // is driven by UART0 TX the whole run), 9 (BOOT button), 0 (battery ADC, not on
 // the header). Strapping pins: 4/5 (SDIO edge only, harmless), 8/9 (boot mode),
-// 15 (JTAG select, on-board LED). Never put a peripheral-driven INPUT such as the
-// e-paper BUSY line on 8, 9 or 15.
+// 15 (JTAG select, on-board LED). Never put a peripheral-driven INPUT (a sensor
+// IRQ or busy line, say) on 8, 9 or 15.
 // ----------------------------------------------------------------------------
 #pragma once
 
@@ -98,7 +97,7 @@
 #endif
 
 // ============================================================================
-// Screens, button, clock (OLED build)
+// Screens, button, clock
 // ============================================================================
 #ifndef PIN_BUTTON
 #define PIN_BUTTON 7 // silkscreen "7"/INT: momentary button to GND (internal pull-up). -1 = no button.
@@ -143,13 +142,8 @@
 #endif
 
 // ============================================================================
-// Display selection
+// Display
 // ============================================================================
-#define DISPLAY_TYPE_OLED_SSD1309 1   // 128x64 monochrome OLED, SSD1309 controller, I2C (default)
-#define DISPLAY_TYPE_EPD_GDEY042T81 2 // 4.2" 400x300 e-ink, GxEPD2 over SPI (legacy, panel broke; 'pio run -e epd')
-#ifndef DISPLAY_TYPE
-#define DISPLAY_TYPE DISPLAY_TYPE_OLED_SSD1309
-#endif
 #ifndef DISPLAY_DEMO
 #define DISPLAY_DEMO 0 // 1 = render synthetic changing values (no CAN/GNSS needed) to validate the layout
 #endif
@@ -157,7 +151,8 @@
 // ============================================================================
 // OLED: 128x64 SSD1309 over I2C (DIYables_OLED_SSD1309 library, Adafruit GFX)
 // ============================================================================
-// Reuses the former e-ink SPI pins: SCK -> SCL, MOSI -> SDA, RES -> RST.
+// Wired to the FireBeetle's SPI header pins (SCK -> SCL, MOSI -> SDA, RES -> RST); the C6
+// routes I2C to any GPIO through its matrix.
 // Most modules carry their own I2C pull-ups and accept 3.3 V VCC; check yours.
 #ifndef PIN_OLED_SCL
 #define PIN_OLED_SCL 23 // silkscreen "23"/SCK  -> OLED SCL (any GPIO works on the C6, routed via the GPIO matrix)
@@ -197,62 +192,6 @@
 #endif
 
 // ============================================================================
-// E-paper: Good Display GDEY042T81 (400x300, SSD1683) via DESPI-C02 adapter
-// (legacy display, only compiled when DISPLAY_TYPE == DISPLAY_TYPE_EPD_GDEY042T81)
-// ============================================================================
-// 3.3 V ONLY (supply and data). DESPI-C02 "RESE" DIP switch: position "3"
-// (older boards) / "2.2 Ohm" (current boards) for this SSD1683 panel, NOT 0.47.
-// Uses the FireBeetle's default SPI pins (the GDI connector pins), MISO unused.
-#ifndef PIN_EPD_SCK
-#define PIN_EPD_SCK 23 // silkscreen "23"/SCK  -> DESPI-C02 SCK
-#endif
-#ifndef PIN_EPD_MOSI
-#define PIN_EPD_MOSI 22 // silkscreen "22"/MOSI -> DESPI-C02 SDI
-#endif
-#ifndef PIN_EPD_CS
-#define PIN_EPD_CS 1 // silkscreen "1"/CS    -> DESPI-C02 CS
-#endif
-#ifndef PIN_EPD_DC
-#define PIN_EPD_DC 8 // silkscreen "8"/DC    -> DESPI-C02 D/C  (strapping pin, but an MCU-driven output: safe)
-#endif
-#ifndef PIN_EPD_RST
-#define PIN_EPD_RST 14 // silkscreen "14"/RES  -> DESPI-C02 RES
-#endif
-#ifndef PIN_EPD_BUSY
-#define PIN_EPD_BUSY 18 // silkscreen "18"/SD_CS <- DESPI-C02 BUSY (active HIGH). NEVER on 8/9/15 (strapping) or 12/13 (USB).
-#endif
-#ifndef EPD_SPI_HZ
-#define EPD_SPI_HZ 4000000 // GxEPD2 default 4 MHz; SSD1683 allows up to 20 MHz. Raise to 8000000 if a 1 Hz partial cycle is too slow.
-#endif
-#ifndef EPD_RESET_MS
-#define EPD_RESET_MS 10 // reset pulse for a bare panel on DESPI-C02 (2 ms is for Waveshare "clever reset" boards)
-#endif
-#ifndef EPD_ROTATION
-#define EPD_ROTATION 0 // 0 = landscape 400x300 (native). The layout coordinates assume 0.
-#endif
-#ifndef EPD_FAST_FULL_UPDATE
-#define EPD_FAST_FULL_UPDATE 1 // 1 = fast full refresh (~1.1 s, forced temperature). 0 = temperature-compensated slow refresh (2-3 s), use below ~10 C.
-#endif
-#ifndef EPD_DIAG_BAUD
-#define EPD_DIAG_BAUD 0 // 0 = silent; 115200 = GxEPD2 prints refresh timings ("_Update_Part : N us") on Serial. Useful during bring-up.
-#endif
-#ifndef DISPLAY_PERIOD_MS
-#define DISPLAY_PERIOD_MS 1000 // display task tick. A fast partial cycle costs ~0.5-0.7 s; do not go below 1000.
-#endif
-#ifndef EPD_FULL_EVERY_N_PARTIALS
-#define EPD_FULL_EVERY_N_PARTIALS 30 // ghosting management: force a (flashing) full refresh after this many partial updates ...
-#endif
-#ifndef EPD_FULL_EVERY_MS
-#define EPD_FULL_EVERY_MS 300000 // ... or at least every 5 minutes, whichever comes first
-#endif
-#ifndef EPD_POWEROFF_IDLE_MS
-#define EPD_POWEROFF_IDLE_MS 15000 // no displayed value changed for this long -> display.powerOff() (booster off, image stays)
-#endif
-#ifndef EPD_HIBERNATE_IDLE_MS
-#define EPD_HIBERNATE_IDLE_MS 600000 // ... and after 10 min -> display.hibernate() (deep sleep). Next change wakes with a full refresh.
-#endif
-
-// ============================================================================
 // GNSS (u-blox compatible receiver, UBX protocol, HP UART1, 3.3 V logic)
 // ============================================================================
 #ifndef PIN_GNSS_RX
@@ -265,7 +204,7 @@
 #define GNSS_BAUDS {115200, 38400, 9600, 57600, 230400} // autobaud order: the target baud first (a receiver configured by us keeps it while powered / battery-backed), then the factory defaults 38400 (M9/M10) and 9600 (M8, MAX-M10S)
 #endif
 #ifndef GNSS_RX_BUFFER
-#define GNSS_RX_BUFFER 2048 // Serial1 RX ring (bytes). Default 256 overflows during multi-second e-paper refreshes (NAV-PVT = 100 B).
+#define GNSS_RX_BUFFER 2048 // Serial1 RX ring (bytes). Default 256 would overflow at 10 Hz while a frame is pushed (NAV-PVT = 100 B).
 #endif
 #ifndef GNSS_TARGET_BAUD
 #define GNSS_TARGET_BAUD 115200 // after detection the receiver's UART1 is switched to this baud (RAM+BBR); 0 = keep the detected baud. Must be in GNSS_BAUDS.
@@ -308,7 +247,7 @@
 #define TASK_PRIO_DISP 2 // above the Arduino loopTask (1), below the data producers
 #endif
 #ifndef WDT_TIMEOUT_MS
-#define WDT_TIMEOUT_MS 20000 // task watchdog; must exceed the longest display block (GxEPD2 busy timeout is 10 s)
+#define WDT_TIMEOUT_MS 20000 // task watchdog; must exceed the longest legitimate task stall (a stuck I2C bus costs 50 ms per transaction)
 #endif
 #ifndef HB_MAX_CAN_MS
 #define HB_MAX_CAN_MS 5000 // supervisor: a task heartbeat older than this stops the watchdog feed -> reboot
@@ -317,7 +256,7 @@
 #define HB_MAX_GNSS_MS 5000
 #endif
 #ifndef HB_MAX_DISP_MS
-#define HB_MAX_DISP_MS 30000 // the display heartbeat is also touched from the GxEPD2 busy callback
+#define HB_MAX_DISP_MS 30000 // the display task touches its heartbeat every OLED_BUTTON_POLL_MS
 #endif
 #ifndef LOG_VESC_MS
 #define LOG_VESC_MS 1000 // period of the all-fields VESC log line (0 = off)
@@ -446,12 +385,6 @@
 // ============================================================================
 // Compile-time sanity checks
 // ============================================================================
-#if DISPLAY_TYPE == DISPLAY_TYPE_EPD_GDEY042T81 && (PIN_EPD_BUSY == 8 || PIN_EPD_BUSY == 9 || PIN_EPD_BUSY == 15)
-#error "PIN_EPD_BUSY must not be a boot strapping pin (8, 9, 15): the panel drives it during reset"
-#endif
-#if DISPLAY_TYPE != DISPLAY_TYPE_OLED_SSD1309 && DISPLAY_TYPE != DISPLAY_TYPE_EPD_GDEY042T81
-#error "DISPLAY_TYPE must be DISPLAY_TYPE_OLED_SSD1309 or DISPLAY_TYPE_EPD_GDEY042T81"
-#endif
 #if CAN_BITRATE_KBPS != 125 && CAN_BITRATE_KBPS != 250 && CAN_BITRATE_KBPS != 500 && CAN_BITRATE_KBPS != 1000
 #error "CAN_BITRATE_KBPS must be 125, 250, 500 or 1000"
 #endif
@@ -484,19 +417,14 @@
 #ifdef __cplusplus
 namespace cfg_check
 {
-  // Only the pins of the ACTIVE display take part: the OLED deliberately reuses the e-ink's SPI pins.
-  constexpr int kPins[] = {PIN_CAN_TX, PIN_CAN_RX, PIN_GNSS_RX, PIN_GNSS_TX, PIN_LED,
-#if PIN_BUTTON >= 0 && DISPLAY_TYPE == DISPLAY_TYPE_OLED_SSD1309
+  // Every GPIO in use must be unique and off the USB pair (12/13).
+  constexpr int kPins[] = {PIN_CAN_TX, PIN_CAN_RX, PIN_GNSS_RX, PIN_GNSS_TX, PIN_LED, PIN_OLED_SCL, PIN_OLED_SDA,
+#if PIN_BUTTON >= 0
                            PIN_BUTTON,
 #endif
-#if DISPLAY_TYPE == DISPLAY_TYPE_EPD_GDEY042T81
-                           PIN_EPD_SCK, PIN_EPD_MOSI, PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY
-#else
-                           PIN_OLED_SCL, PIN_OLED_SDA
-#endif
   };
-// PIN_OLED_RST is optional (-1) and reuses the e-ink RES pin; guard it separately.
-#if PIN_OLED_RST >= 0 && DISPLAY_TYPE == DISPLAY_TYPE_OLED_SSD1309
+// PIN_OLED_RST is optional (-1); guard it separately.
+#if PIN_OLED_RST >= 0
   static_assert(PIN_OLED_RST != PIN_OLED_SCL && PIN_OLED_RST != PIN_OLED_SDA && PIN_OLED_RST != PIN_CAN_TX &&
                     PIN_OLED_RST != PIN_CAN_RX && PIN_OLED_RST != PIN_GNSS_RX && PIN_OLED_RST != PIN_GNSS_TX &&
                     PIN_OLED_RST != PIN_LED && PIN_OLED_RST != 12 && PIN_OLED_RST != 13,

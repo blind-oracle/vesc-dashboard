@@ -44,10 +44,7 @@
 //                  right-aligned to x 127, baseline 9 (rows 0..8)
 //     rows 11..62  6 rows of 21 chars, 6x10 at x 1, baselines 18/27/36/45/54/63 (9 px pitch)
 //
-// Compiled only when DISPLAY_TYPE == DISPLAY_TYPE_OLED_SSD1309 (the default);
-// 'pio run -e epd' builds src/display_epd.cpp instead.
 #include "config.h"
-#if DISPLAY_TYPE == DISPLAY_TYPE_OLED_SSD1309
 
 #include "display.h"
 
@@ -420,7 +417,7 @@ static SharedState demo_state(uint32_t now) {
 // ---------------------------------------------------------------- task
 struct DispCtx {
   OledFrame prev;          // what is on the panel right now
-  DisplayStats st;         // counters + flags, mirrored into g_state.disp (e-ink fields stay 0)
+  DisplayStats st;         // counters + flags, mirrored into g_state.disp
   uint8_t screen;          // OledScreen currently selected
   uint32_t last_press_ms;  // last debounced button event (0 = never), for the auto-return timer
 #if PIN_BUTTON >= 0
@@ -670,4 +667,3 @@ bool display_start() {
   return c.st.init_ok;
 }
 
-#endif  // DISPLAY_TYPE == DISPLAY_TYPE_OLED_SSD1309
