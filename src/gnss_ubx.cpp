@@ -5,7 +5,19 @@
 //             else poll MON-VER (factory modules are NMEA-only but still
 //             answer UBX polls). Retry forever if nothing answers.
 //   DETECT    MON-VER -> PROTVER (both "PROTVER=" and "PROTVER " spellings).
-//   CONFIGURE PROTVER >= 27: CFG-VALSET (RAM+BBR). Otherwise (or when every
+//   CONFIGURE step BAUD (GNSS_TARGET_BAUD > 0 and detected baud differs):
+//             PROTVER >= 27 -> VALSET CFG-UART1-BAUDRATE (RAM+BBR), else
+//             CFG-PRT UART1 (8N1, out UBX only). The receiver switches as soon
+//             as it has processed the frame and its ACK normally leaves at the
+//             NEW rate, so the ACK is never awaited: flush TX, 100 ms pause
+//             (u-blox integration manual), Serial1 to the target baud, RX
+//             discarded, up to kBaudVerifyPolls MON-VER polls as the proof (the
+//             receiver may ignore input for a moment right after the change).
+//             No reply -> back to AUTOBAUD (both bauds are in GNSS_BAUDS, so
+//             the receiver is found wherever it ended up); after
+//             GNSS_BAUD_SWITCH_ATTEMPTS failures in a row the detected baud is
+//             kept (logged once).
+//             Then PROTVER >= 27: CFG-VALSET (RAM+BBR). Otherwise (or when every
 //             VALSET is refused): CFG-MSG / CFG-RATE, NMEA off first,
 //             NAV-VELNED fallback when NAV-PVT is unavailable (u-blox 6).
 //   RUN       pump bytes -> UbxParser -> g_state.gnss. No valid frame for
@@ -41,6 +53,15 @@
 #ifndef GNSS_TASK_STACK
 #define GNSS_TASK_STACK 4096           // bytes (Arduino's xTaskCreate takes bytes)
 #endif
+#ifndef GNSS_TARGET_BAUD
+#define GNSS_TARGET_BAUD 0             // 0 = keep the detected baud (config.h normally says 115200)
+#endif
+#ifndef GNSS_BAUD_SWITCH_ATTEMPTS
+#define GNSS_BAUD_SWITCH_ATTEMPTS 2    // unconfirmed switches in a row before the detected baud is kept
+#endif
+#ifndef GNSS_BAUD_SWITCH_SETTLE_MS
+#define GNSS_BAUD_SWITCH_SETTLE_MS 100 // u-blox: "typically 100 ms" between the baud-change message and data at the new rate
+#endif
 
 namespace {
 
@@ -50,9 +71,27 @@ HardwareSerial &GNSS = Serial1;
 
 constexpr uint32_t kBauds[] = GNSS_BAUDS;
 constexpr size_t kNumBauds = sizeof(kBauds) / sizeof(kBauds[0]);
+constexpr uint32_t kTargetBaud = (uint32_t)GNSS_TARGET_BAUD;  // 0 = never switch
 constexpr uint32_t kPumpSliceMs = 10;    // idle delay between RX pumps
 constexpr uint32_t kHbMaxGapMs = 100;    // longest sleep without a heartbeat touch
 constexpr uint32_t kSettleMs = 50;       // after a baud change: let the UART and the receiver's current byte finish
+constexpr int kBaudVerifyPolls = 2;      // MON-VER polls at the new baud before the switch counts as failed
+
+// The attempt counter is a uint8_t and 0 would print "failed (0 attempts)" on
+// every detection episode: set GNSS_TARGET_BAUD 0 to disable the switch instead.
+static_assert(GNSS_BAUD_SWITCH_ATTEMPTS >= 1 && GNSS_BAUD_SWITCH_ATTEMPTS <= 255,
+              "GNSS_BAUD_SWITCH_ATTEMPTS must be 1..255 (0 = use GNSS_TARGET_BAUD 0 to disable the switch)");
+
+// config.h says "GNSS_TARGET_BAUD must be in GNSS_BAUDS" but cannot check it:
+// a failed switch relies on autobaud finding the receiver at the target baud.
+constexpr bool target_baud_listed() {
+  if (kTargetBaud == 0) return true;
+  for (size_t i = 0; i < kNumBauds; ++i) {
+    if (kBauds[i] == kTargetBaud) return true;
+  }
+  return false;
+}
+static_assert(target_baud_listed(), "GNSS_TARGET_BAUD must be 0 or one of GNSS_BAUDS");
 
 // NMEA standard message ids (class 0xF0) switched off on legacy receivers.
 constexpr uint8_t kNmeaIds[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x08, 0x41};  // GGA GLL GSA GSV RMC VTG ZDA TXT
@@ -74,6 +113,8 @@ struct GnssCtx {
   bool use_velned = false;
   uint32_t last_good_frame_ms = 0;
   uint32_t redetects = 0;
+  uint8_t baud_switch_fails = 0;     // unconfirmed switches in a row (reset on success and on a RUN-phase redetect)
+  bool baud_switch_given_up = false; // "staying at the detected baud" already logged
   // RX diagnostics for the current autobaud attempt
   uint32_t rx_bytes = 0;
   uint32_t rx_dollars = 0;
@@ -173,6 +214,15 @@ void handle_frame() {
     g.pdop_x100 = pvt.pDOP;
     g.lat_e7 = pvt.lat;
     g.lon_e7 = pvt.lon;
+    g.height_mm = pvt.height;
+    g.hmsl_mm = pvt.hMSL;
+    g.hacc_mm = pvt.hAcc;
+    g.vacc_mm = pvt.vAcc;
+    g.head_mot_e5 = pvt.headMot;
+    g.vel_d_mm_s = pvt.velD;
+    g.year = pvt.year;
+    g.month = pvt.month;
+    g.day = pvt.day;
     g.hour = pvt.hour;
     g.min = pvt.min;
     g.sec = pvt.sec;
@@ -433,11 +483,14 @@ void configure_legacy(int prot_ver) {
   (void)nmea_off;  // log-only
 
   // Navigation rate: measRate ms, navRate 1 cycle, timeRef 1 = GPS time.
-  uint8_t rate[6];
-  wrU2(rate + 0, (uint16_t)GNSS_RATE_MS);
-  wrU2(rate + 2, 1);
-  wrU2(rate + 4, 1);
-  const int r_rate = ubx_send_ack(UBX_CLASS_CFG, UBX_CFG_RATE, rate, 6);
+  // GNSS_RATE_MS >= 50 (config.h) is a legal measRate on every generation
+  // (>= 50 ms below PROTVER 24, >= 25 ms from 24 on), so nothing is clamped
+  // here; a rate the module cannot sustain is ACKed anyway and merely costs
+  // epochs (data-sheet maxima: NEO-6 5 Hz, NEO-7 10 Hz, NEO-M8N 5 Hz with its
+  // default GPS+GLONASS set), which is why 200 ms is the default.
+  uint8_t rate[UBX_CFG_RATE_LEN];
+  ubxBuildCfgRate(rate, (uint16_t)GNSS_RATE_MS, 1, UBX_CFG_RATE_TIMEREF_GPS);
+  const int r_rate = ubx_send_ack(UBX_CLASS_CFG, UBX_CFG_RATE, rate, UBX_CFG_RATE_LEN);
   log_i("GNSS: CFG-RATE meas=%u nav=1: %s", (unsigned)GNSS_RATE_MS, ack_str(r_rate));
   (void)r_rate;  // log-only: the rate is a nicety, data flow does not depend on it
 
@@ -473,10 +526,128 @@ void configure_legacy(int prot_ver) {
   s_ctx.configured = (r_pvt == 1) || (r_vel == 1);
 }
 
+// CONFIGURE step BAUD: move the receiver's UART1 to kTargetBaud so every later
+// ACK and every NAV-PVT epoch travels at 115200 instead of queuing behind the
+// factory NMEA burst at 9600 (NAV-PVT at 10 Hz alone is 104 % of a 9600 line).
+//
+// The ACK of a baud-change message is unreliable by design: the port is
+// reconfigured as soon as the message is processed and the acknowledge is
+// queued behind it, so it leaves at the new rate or is corrupted (M8 receiver
+// description: "Host data reception parameters may have to be changed to be
+// able to receive ... the acknowledge message"). Nothing here waits for it;
+// the only proof of success is a UBX reply at the new rate.
+//
+// Returns true to continue CONFIGURE at s_ctx.baud (switched or not), false
+// when the receiver did not answer at the target baud: the caller goes back
+// to AUTOBAUD, where GNSS_BAUDS holds both bauds, so the receiver is found
+// again wherever it ended up (a switch that worked but whose verification was
+// lost costs exactly one autobaud pass since the target baud is listed first).
+bool phase_baud() {
+  if (kTargetBaud == 0) return true;
+  if (s_ctx.baud == kTargetBaud) {
+    // Already there: battery-backed M9/M10 from a previous boot, or an
+    // unconfirmed switch that autobaud has just proven to have worked.
+    if (s_ctx.baud_switch_fails > 0) {
+      log_i("GNSS: UART1 switched to %lu baud (found there by autobaud after an unconfirmed switch)",
+            (unsigned long)kTargetBaud);
+    }
+    s_ctx.baud_switch_fails = 0;
+    return true;
+  }
+  if (s_ctx.baud_switch_fails >= (uint8_t)GNSS_BAUD_SWITCH_ATTEMPTS) {
+    if (!s_ctx.baud_switch_given_up) {
+      s_ctx.baud_switch_given_up = true;
+      log_w("GNSS: baud switch to %lu failed (%u attempts without a reply at the new rate), staying at %lu",
+            (unsigned long)kTargetBaud, (unsigned)s_ctx.baud_switch_fails, (unsigned long)s_ctx.baud);
+    }
+    return true;
+  }
+  publish_phase(GNSS_PHASE_CONFIGURE);
+
+  [[maybe_unused]] const uint32_t old_baud = s_ctx.baud;  // log-only
+  const int prot_ver = effective_prot_ver();
+  [[maybe_unused]] const char *how;  // log-only
+  bool sent;
+  if (prot_ver >= 2700) {
+    // M9/M10: one key alone (a VALSET is all-or-nothing per frame), RAM+BBR so a
+    // battery-backed module comes back at the target baud and autobaud finds it
+    // on the first try. Frame: B5 62 06 8A 0C 00 00 03 00 00 01 00 52 40 00 C2 01 00 F5 BB
+    uint8_t pl[UBX_VALSET_HEADER_LEN + 4 + 4];
+    uint16_t len = ubxValsetBegin(pl, sizeof(pl));
+    ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_UART1_BAUDRATE, kTargetBaud);
+    how = "VALSET";
+    sent = ubx_send(UBX_CLASS_CFG, UBX_CFG_VALSET, pl, len);
+  } else {
+    // u-blox 6/7/M8: CFG-PRT UART1, 8N1, input as the factory default
+    // (UBX+NMEA+RTCM), output UBX only, which also silences NMEA before the
+    // configure steps (they still send the CFG-MSG NMEA-off frames: this ACK is
+    // unreliable, so it is not known whether the mask was applied).
+    // Frame: B5 62 06 00 14 00 01 00 00 00 D0 08 00 00 00 C2 01 00 07 00 01 00 00 00 00 00 BE 72
+    uint8_t prt[UBX_CFG_PRT_LEN];
+    ubxBuildCfgPrtUart1(prt, kTargetBaud, UBX_CFG_PRT_PROTO_UBX | UBX_CFG_PRT_PROTO_NMEA | UBX_CFG_PRT_PROTO_RTCM,
+                        UBX_CFG_PRT_PROTO_UBX);
+    how = "CFG-PRT";
+    sent = ubx_send(UBX_CLASS_CFG, UBX_CFG_PRT, prt, UBX_CFG_PRT_LEN);
+  }
+  if (!sent) return true;  // cannot happen (12/20-byte payloads fit the TX frame); ubx_send logged it
+  log_i("GNSS: switching UART1 %lu -> %lu baud (%s)", (unsigned long)old_baud, (unsigned long)kTargetBaud, how);
+
+  // flush() spins until the TX FIFO is empty AND the TX state machine is idle,
+  // i.e. the last stop bit has left the pin (about 29 ms for CFG-PRT at 9600).
+  // updateBaudRate() only reprograms the divider, so without this the tail of
+  // the frame would be garbled. Then the 100 ms u-blox asks for before any
+  // data at the new rate; whatever the receiver still sends at the old rate
+  // (its ACK, the tail of an NMEA sentence) lands in the ring and is dropped.
+  GNSS.flush();
+  hb_touch(hb_gnss);
+  delay_hb(GNSS_BAUD_SWITCH_SETTLE_MS);
+  GNSS.updateBaudRate(kTargetBaud);
+  delay_hb(kSettleMs);
+  GNSS.flush(false);  // TX idle + discard the RX ring and the hardware RX FIFO (bytes captured at the old rate)
+  s_ctx.parser.reset();
+
+  // Proof: a MON-VER reply at the new rate. Any other checksum-valid frame that
+  // arrives while waiting (a NAV-PVT from an already streaming module) proves
+  // the baud just as well. Two polls, like phase_detect(): u-blox warns that
+  // right after the change "some input characters may be ignored or the port
+  // could be disabled until the interface is able to process the new baud
+  // rate", so one swallowed 8-byte poll must not cost an autobaud pass and a
+  // spurious failure count. The second poll only happens on a real failure.
+  const uint32_t good0 = s_ctx.parser.goodFrames;
+  bool monver = false;
+  for (int attempt = 0; attempt < kBaudVerifyPolls && !monver && s_ctx.parser.goodFrames == good0; ++attempt) {
+    monver = poll_mon_ver(GNSS_MONVER_TIMEOUT_MS);
+  }
+  if (monver || s_ctx.parser.goodFrames != good0) {
+    s_ctx.baud = kTargetBaud;
+    s_ctx.baud_switch_fails = 0;
+    log_i("GNSS: UART1 switched to %lu baud (%s)", (unsigned long)kTargetBaud, monver ? "MON-VER reply" : "UBX frames");
+    publish_phase(GNSS_PHASE_CONFIGURE);  // g_state.gnss.baud = the baud in use
+    return true;
+  }
+
+  s_ctx.baud_switch_fails++;
+  s_ctx.redetects++;
+  log_w("GNSS: baud switch to %lu failed (no reply to %d MON-VER polls at the new rate, attempt %u/%u); redetecting from %lu, "
+        "redetect #%lu",
+        (unsigned long)kTargetBaud, kBaudVerifyPolls, (unsigned)s_ctx.baud_switch_fails, (unsigned)GNSS_BAUD_SWITCH_ATTEMPTS,
+        (unsigned long)old_baud, (unsigned long)s_ctx.redetects);
+  return false;
+}
+
 void phase_configure() {
   s_ctx.configured = false;
   s_ctx.use_velned = false;
   publish_phase(GNSS_PHASE_CONFIGURE);
+
+  // NAV-PVT is 100 bytes = 1000 bits per epoch. Warn when it alone would take
+  // more than half the line: at 9600 that is any rate above ~4.8 Hz, and at
+  // 10 Hz (104 %) the receiver's TX buffer overflows and frames are dropped.
+  const uint32_t pvt_bits_per_s = 1000000u / (uint32_t)GNSS_RATE_MS;
+  if (s_ctx.baud > 0 && pvt_bits_per_s * 2u > s_ctx.baud) {
+    log_w("GNSS: NAV-PVT every %u ms needs %lu bit/s = %lu%% of %lu baud; expect dropped epochs", (unsigned)GNSS_RATE_MS,
+          (unsigned long)pvt_bits_per_s, (unsigned long)(pvt_bits_per_s * 100u / s_ctx.baud), (unsigned long)s_ctx.baud);
+  }
 
   const int prot_ver = effective_prot_ver();
   bool done = false;
@@ -516,8 +687,13 @@ void gnss_task(void *) {
   for (;;) {
     phase_autobaud();
     phase_detect();
+    if (!phase_baud()) continue;  // no reply at the target baud: re-find the receiver wherever it ended up
     phase_configure();
     phase_run();
+    // phase_run() returns only on a redetect (module reset or swapped): a new
+    // receiver deserves a fresh set of switch attempts.
+    s_ctx.baud_switch_fails = 0;
+    s_ctx.baud_switch_given_up = false;
   }
 }
 
@@ -533,9 +709,16 @@ bool gnss_start() {
   if (rx_size == 0) {
     log_w("GNSS: setRxBufferSize(%u) returned 0 (called after begin?); RX ring stays at the default", (unsigned)GNSS_RX_BUFFER);
   } else {
-    log_i("GNSS: Serial1 (HP UART1) RX=GPIO%d TX=GPIO%d ring=%u B, first baud %lu", PIN_GNSS_RX, PIN_GNSS_TX,
-          (unsigned)rx_size, (unsigned long)kBauds[0]);
+    log_i("GNSS: Serial1 (HP UART1) RX=GPIO%d TX=GPIO%d ring=%u B, first baud %lu, target baud %lu, rate %u ms",
+          PIN_GNSS_RX, PIN_GNSS_TX, (unsigned)rx_size, (unsigned long)kBauds[0], (unsigned long)kTargetBaud,
+          (unsigned)GNSS_RATE_MS);
   }
+#if GNSS_RATE_MS < 200
+  // Data-sheet maxima (98 % fix rate): NEO-6 5 Hz, NEO-M8N 5 Hz with its default
+  // GPS+GLONASS set, MAX-M10S 3 Hz with its default GPS+GAL+BDS set; NEO-7 10 Hz,
+  // NEO-M8Q/M 10 Hz, NEO-M9N 25 Hz. A faster rate is ACKed but skips epochs.
+  log_w("GNSS: GNSS_RATE_MS %u (> 5 Hz) is not guaranteed on a stock NEO-M8N / NEO-6 / default MAX-M10S", (unsigned)GNSS_RATE_MS);
+#endif
 
   const BaseType_t ok = xTaskCreate(gnss_task, "gnss", GNSS_TASK_STACK, nullptr, TASK_PRIO_GNSS, nullptr);
   if (ok != pdPASS) {

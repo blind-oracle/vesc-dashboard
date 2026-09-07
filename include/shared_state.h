@@ -30,6 +30,27 @@ struct VescState
   uint32_t last_frame_ms;   // time of the last accepted frame (0 = never)
 };
 
+// Values only available by actively polling the VESC (COMM_GET_VALUES_SELECTIVE),
+// see can_vesc.cpp / vesc_getvalues.h. All zero until the first complete reply.
+struct VescExt {
+  float temp_mos1, temp_mos2, temp_mos3; // per-MOSFET temperatures, degC
+  float avg_motor_current;   // A (average, unfiltered)
+  float avg_input_current;   // A
+  float avg_id, avg_iq;      // d/q axis currents, A
+  float vd, vq;              // d/q axis voltages, V
+  int32_t tacho_abs;         // absolute tachometer steps
+  uint8_t fault_code;        // mc_fault_code, 0 = FAULT_CODE_NONE
+  uint8_t status;            // bit0 timeout active, bit1 kill switch active
+  uint8_t vesc_id;           // controller id reported in the reply
+  uint32_t t_ms;             // time of the last complete, CRC-valid reply (0 = never)
+  uint8_t last_fault;        // latched: last non-zero fault code seen (the VESC clears the live byte ~500 ms after a fault)
+  uint32_t last_fault_ms;    // when it was seen (0 = never)
+  uint32_t polls_sent;       // requests transmitted
+  uint32_t replies_ok;       // complete replies decoded
+  uint32_t replies_bad;      // CRC / format failures
+  uint32_t timeouts;         // requests without a complete reply within VESC_POLL_TIMEOUT_MS
+};
+
 // Legacy TWAI driver states (mirrors twai_state_t so this header stays IDF-free).
 enum CanState : int
 {
@@ -81,11 +102,40 @@ struct GnssState
   uint32_t sacc_mm_s;     // speed accuracy estimate, mm/s
   uint16_t pdop_x100;     // position DOP * 100
   int32_t lat_e7, lon_e7; // degrees * 1e7
+  int32_t height_mm;             // height above ellipsoid, mm
+  int32_t hmsl_mm;               // height above mean sea level, mm
+  uint32_t hacc_mm, vacc_mm;     // horizontal / vertical accuracy estimates, mm
+  int32_t head_mot_e5;           // heading of motion, degrees * 1e5
+  int32_t vel_d_mm_s;            // down velocity, mm/s
+  uint16_t year;                 // UTC date of the last fix
+  uint8_t month, day;
   uint8_t hour, min, sec; // UTC time of the last fix
   bool time_valid;        // NAV-PVT valid.validTime && validDate
   uint32_t good_frames;   // checksum-valid UBX frames
   uint32_t bad_frames;    // checksum failures / oversized frames
   uint32_t redetects;     // times the task fell back to autobaud
+};
+
+// ---------------------------------------------------------------- Trip / efficiency
+// Written by the trip integrator task (src/trip.cpp) from snapshots of the VESC
+// and GNSS state; read by the EFFICIENCY screen and the logs.
+struct TripState {
+  uint32_t t_ms;             // last integrator update (0 = never)
+  uint32_t run_s;            // seconds since the integrator started
+  uint32_t moving_s;         // seconds with ground speed >= EFF_MIN_SPEED_MM_S
+  float dist_m;              // trip distance, m (GNSS ground speed integrated while moving)
+  float wh;                  // trip energy drawn from the battery, Wh
+  float wh_charged;          // trip energy returned to the battery (regen), Wh
+  float win_dist_m;          // distance over the last EFF_WINDOW_S seconds
+  float win_wh;              // net energy over the last EFF_WINDOW_S seconds
+  float win_p_avg_w;         // average electrical power over the window
+  float eff_now;             // net Wh per EFF_DIST_UNIT_M over the window (valid: eff_now_valid)
+  float eff_avg;             // net Wh per EFF_DIST_UNIT_M since startup (valid: eff_avg_valid)
+  bool eff_now_valid;        // window distance >= EFF_MIN_DIST_M and data fresh
+  bool eff_avg_valid;        // trip distance >= EFF_MIN_DIST_M
+  bool energy_from_counters; // true = VESC STATUS_3 watt-hour counters, false = v_in x current_in integration fallback
+  uint8_t win_fill_s;        // seconds of data in the window (0..EFF_WINDOW_S)
+  uint32_t counter_resets;   // VESC watt-hour counter resets detected (VESC rebooted)
 };
 
 // ---------------------------------------------------------------- Display
@@ -97,6 +147,8 @@ struct DisplayStats
   uint32_t last_change_ms;
   bool dimmed;  // OLED: contrast lowered after OLED_IDLE_DIM_MS without changes
   bool init_ok; // controller answered at init
+  uint8_t screen;                // OLED: currently shown screen index (0 = main)
+  uint32_t button_presses;       // OLED: debounced presses seen
   // e-ink specific (zero on the OLED build)
   uint32_t partials; // partial refreshes since the last full refresh
   uint32_t partials_total;
@@ -110,8 +162,10 @@ struct DisplayStats
 struct SharedState
 {
   VescState vesc;
+  VescExt vesc_ext;
   CanHealth can;
   GnssState gnss;
+  TripState trip;
   DisplayStats disp;
   uint32_t lock_failures; // state_lock() timeouts (should stay 0)
 };

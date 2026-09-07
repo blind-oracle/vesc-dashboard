@@ -1,11 +1,14 @@
 // GNSS module: u-blox UBX receiver on HP UART1 (Serial1).
 //
 // gnss_start() configures Serial1 and launches gnssTask, which runs the phase
-// machine AUTOBAUD -> DETECT (MON-VER / PROTVER) -> CONFIGURE (VALSET for
-// PROTVER >= 27, CFG-MSG/CFG-RATE otherwise, NAV-VELNED fallback for u-blox 6)
-// -> RUN (NAV-PVT into g_state.gnss). No valid UBX frame for GNSS_REDETECT_MS
-// while running sends it back to AUTOBAUD, so a power-cycled or swapped module
-// recovers without an ESP32 reboot.
+// machine AUTOBAUD -> DETECT (MON-VER / PROTVER) -> CONFIGURE (first the BAUD
+// step: the receiver's UART1 is moved to GNSS_TARGET_BAUD by VALSET
+// CFG-UART1-BAUDRATE or legacy CFG-PRT and verified with a MON-VER poll at the
+// new rate; then VALSET for PROTVER >= 27, CFG-MSG/CFG-RATE otherwise,
+// NAV-VELNED fallback for u-blox 6) -> RUN (NAV-PVT into g_state.gnss). No
+// valid UBX frame for GNSS_REDETECT_MS while running, or no reply at the
+// target baud after the switch, sends it back to AUTOBAUD, so a power-cycled or
+// swapped module recovers without an ESP32 reboot.
 //
 // All UART and FreeRTOS code lives in src/gnss_ubx.cpp; the protocol parser
 // and builders are in the Arduino-free include/ubx_min.h.

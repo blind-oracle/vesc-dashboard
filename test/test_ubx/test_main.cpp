@@ -1,5 +1,7 @@
 // Native (host) unit tests for include/ubx_min.h: UBX framing, checksum,
-// NAV-PVT / NAV-VELNED decoding, MON-VER PROTVER parsing, VALSET building.
+// NAV-PVT / NAV-VELNED decoding, MON-VER PROTVER parsing, VALSET building,
+// the baud-switch frames (VALSET CFG-UART1-BAUDRATE, legacy CFG-PRT) and the
+// CFG-RATE / VALSET rate frames sent by src/gnss_ubx.cpp.
 //   pio test -e native
 // Arduino-free: only ubx_min.h and <unity.h>.
 #include <unity.h>
@@ -122,6 +124,196 @@ void test_valset_value_sizes_and_capacity() {
   TEST_ASSERT_FALSE(ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_NAVSPG_DYNMODEL, 5));  // no room
   TEST_ASSERT_EQUAL_UINT16(9, len);
   TEST_ASSERT_FALSE(ubxValsetAppend(pl, len, 64, 0x50000001u, 1));  // U8 unsupported
+}
+
+// The reference frames below are quoted byte-for-byte from the u-blox
+// interface descriptions (M8 CFG-PRT / CFG-RATE, M9/M10 CFG-VALSET keys). This
+// recomputes their Fletcher-8 checksum from the quoted body so a typo in the
+// expectation cannot silently agree with a wrong builder.
+static void assertQuotedFrameChecksum(const uint8_t *f, size_t n) {
+  TEST_ASSERT_TRUE(n >= 8);
+  TEST_ASSERT_EQUAL_HEX8(0xB5, f[0]);
+  TEST_ASSERT_EQUAL_HEX8(0x62, f[1]);
+  TEST_ASSERT_EQUAL_UINT16((uint16_t)(n - 8), rdU2(f + 4));
+  uint8_t a = 0, b = 0;
+  ubxChecksum(f + 2, n - 4, a, b);
+  TEST_ASSERT_EQUAL_HEX8(f[n - 2], a);
+  TEST_ASSERT_EQUAL_HEX8(f[n - 1], b);
+}
+
+// ---------------------------------------------------------------- baud switch frames
+// PROTVER >= 27: CFG-VALSET {CFG-UART1-BAUDRATE 0x40520001 (U4) = 115200}, the
+// frame phase_baud() sends alone, RAM+BBR (default layers) and RAM-only.
+void test_valset_uart1_baudrate_frame() {
+  TEST_ASSERT_EQUAL_UINT8(4, ubxValsetValueSize(UBX_KEY_CFG_UART1_BAUDRATE));  // U4
+  uint8_t pl[UBX_VALSET_HEADER_LEN + 4 + 4];
+  uint16_t len = ubxValsetBegin(pl, sizeof(pl));
+  TEST_ASSERT_TRUE(ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_UART1_BAUDRATE, 115200u));
+  TEST_ASSERT_EQUAL_UINT16(12, len);
+  TEST_ASSERT_FALSE(ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_UART1_BAUDRATE, 115200u));  // exactly one key fits
+
+  uint8_t frame[32];
+  size_t n = ubxBuildFrame(frame, sizeof(frame), UBX_CLASS_CFG, UBX_CFG_VALSET, pl, len);
+  const uint8_t expected[] = {0xB5, 0x62, 0x06, 0x8A, 0x0C, 0x00,  // header, len 12
+                              0x00, 0x03, 0x00, 0x00,              // version 0, layers RAM|BBR
+                              0x01, 0x00, 0x52, 0x40,              // key 0x40520001 LE
+                              0x00, 0xC2, 0x01, 0x00,              // 115200 = 0x0001C200 LE
+                              0xF5, 0xBB};
+  assertQuotedFrameChecksum(expected, sizeof(expected));
+  TEST_ASSERT_EQUAL_UINT32(sizeof(expected), (uint32_t)n);
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, frame, sizeof(expected));
+
+  // RAM only (layers 0x01): only the layer byte and the checksum change.
+  len = ubxValsetBegin(pl, sizeof(pl), UBX_VALSET_LAYER_RAM);
+  TEST_ASSERT_TRUE(ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_UART1_BAUDRATE, 115200u));
+  n = ubxBuildFrame(frame, sizeof(frame), UBX_CLASS_CFG, UBX_CFG_VALSET, pl, len);
+  const uint8_t expectedRam[] = {0xB5, 0x62, 0x06, 0x8A, 0x0C, 0x00, 0x00, 0x01, 0x00, 0x00,
+                                 0x01, 0x00, 0x52, 0x40, 0x00, 0xC2, 0x01, 0x00, 0xF3, 0xA5};
+  assertQuotedFrameChecksum(expectedRam, sizeof(expectedRam));
+  TEST_ASSERT_EQUAL_UINT32(sizeof(expectedRam), (uint32_t)n);
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expectedRam, frame, sizeof(expectedRam));
+}
+
+// PROTVER < 27: the 20-byte CFG-PRT payload for UART1, 115200 8N1, as sent by
+// phase_baud(): input UBX+NMEA+RTCM (the M8 factory mask), output UBX only.
+void test_cfg_prt_uart1_payload_115200() {
+  uint8_t pl[UBX_CFG_PRT_LEN];
+  memset(pl, 0xAA, sizeof(pl));
+  const size_t plen = ubxBuildCfgPrtUart1(pl, 115200u, UBX_CFG_PRT_PROTO_UBX | UBX_CFG_PRT_PROTO_NMEA | UBX_CFG_PRT_PROTO_RTCM,
+                                          UBX_CFG_PRT_PROTO_UBX);
+  TEST_ASSERT_EQUAL_UINT32(20, (uint32_t)plen);
+  const uint8_t expectedPl[20] = {0x01, 0x00,              // portID UART1, reserved
+                                  0x00, 0x00,              // txReady
+                                  0xD0, 0x08, 0x00, 0x00,  // mode 0x000008D0 = 8N1
+                                  0x00, 0xC2, 0x01, 0x00,  // baudRate 115200
+                                  0x07, 0x00,              // inProtoMask UBX+NMEA+RTCM
+                                  0x01, 0x00,              // outProtoMask UBX
+                                  0x00, 0x00,              // flags
+                                  0x00, 0x00};             // reserved
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expectedPl, pl, 20);
+  // Field readers agree with the layout.
+  TEST_ASSERT_EQUAL_UINT8(UBX_CFG_PRT_UART1, rdU1(pl + 0));
+  TEST_ASSERT_EQUAL_HEX32(UBX_CFG_PRT_MODE_8N1, rdU4(pl + 4));
+  TEST_ASSERT_EQUAL_UINT32(115200u, rdU4(pl + 8));
+  TEST_ASSERT_EQUAL_HEX16(0x0007, rdU2(pl + 12));
+  TEST_ASSERT_EQUAL_HEX16(0x0001, rdU2(pl + 14));
+
+  uint8_t frame[40];
+  size_t n = ubxBuildFrame(frame, sizeof(frame), UBX_CLASS_CFG, UBX_CFG_PRT, pl, (uint16_t)plen);
+  const uint8_t expected[] = {0xB5, 0x62, 0x06, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0xD0, 0x08, 0x00, 0x00,
+                              0x00, 0xC2, 0x01, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBE, 0x72};
+  assertQuotedFrameChecksum(expected, sizeof(expected));
+  TEST_ASSERT_EQUAL_UINT32(sizeof(expected), (uint32_t)n);
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expected, frame, sizeof(expected));
+
+  // Variant with inProtoMask UBX+NMEA only (the gpsd/PX4 mask): ... 03 00 01 00 ... BA 52.
+  ubxBuildCfgPrtUart1(pl, 115200u, UBX_CFG_PRT_PROTO_UBX | UBX_CFG_PRT_PROTO_NMEA, UBX_CFG_PRT_PROTO_UBX);
+  n = ubxBuildFrame(frame, sizeof(frame), UBX_CLASS_CFG, UBX_CFG_PRT, pl, 20);
+  const uint8_t expectedIn3[] = {0xB5, 0x62, 0x06, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0xD0, 0x08, 0x00, 0x00,
+                                 0x00, 0xC2, 0x01, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0xBA, 0x52};
+  assertQuotedFrameChecksum(expectedIn3, sizeof(expectedIn3));
+  TEST_ASSERT_EQUAL_UINT32(sizeof(expectedIn3), (uint32_t)n);
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expectedIn3, frame, sizeof(expectedIn3));
+
+  // Baud only (output UBX+NMEA kept): ... 07 00 03 00 ... C0 7E.
+  ubxBuildCfgPrtUart1(pl, 115200u, 0x0007, UBX_CFG_PRT_PROTO_UBX | UBX_CFG_PRT_PROTO_NMEA);
+  n = ubxBuildFrame(frame, sizeof(frame), UBX_CLASS_CFG, UBX_CFG_PRT, pl, 20);
+  const uint8_t expectedOut3[] = {0xB5, 0x62, 0x06, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0xD0, 0x08, 0x00, 0x00,
+                                  0x00, 0xC2, 0x01, 0x00, 0x07, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x7E};
+  assertQuotedFrameChecksum(expectedOut3, sizeof(expectedOut3));
+  TEST_ASSERT_EQUAL_UINT32(sizeof(expectedOut3), (uint32_t)n);
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expectedOut3, frame, sizeof(expectedOut3));
+
+  // Other bauds land in the U4 field little-endian; null payload is rejected.
+  ubxBuildCfgPrtUart1(pl, 9600u, 0x0007, 0x0003);
+  TEST_ASSERT_EQUAL_UINT32(9600u, rdU4(pl + 8));
+  ubxBuildCfgPrtUart1(pl, 230400u, 0x0007, 0x0003);
+  TEST_ASSERT_EQUAL_UINT32(230400u, rdU4(pl + 8));
+  TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)ubxBuildCfgPrtUart1(nullptr, 115200u, 0x0007, 0x0001));
+}
+
+// The replies the baud switch may or may not see: ACK-ACK for a VALSET and
+// for a CFG-PRT, each carrying {cls, id} of the acknowledged message. The
+// receiver usually emits them at the NEW baud, so gnss_ubx.cpp never waits
+// for them; the parser still has to recognise them when they do arrive.
+void test_ack_frames_for_baud_switch() {
+  const uint8_t ackValset[] = {0xB5, 0x62, 0x05, 0x01, 0x02, 0x00, 0x06, 0x8A, 0x98, 0xC1};
+  const uint8_t ackPrt[] = {0xB5, 0x62, 0x05, 0x01, 0x02, 0x00, 0x06, 0x00, 0x0E, 0x37};
+  assertQuotedFrameChecksum(ackValset, sizeof(ackValset));
+  assertQuotedFrameChecksum(ackPrt, sizeof(ackPrt));
+  UbxParser p;
+  TEST_ASSERT_EQUAL_INT(1, feedAll(p, ackValset, sizeof(ackValset)));
+  TEST_ASSERT_TRUE(p.matches(UBX_CLASS_ACK, UBX_ACK_ACK));
+  TEST_ASSERT_EQUAL_HEX8(UBX_CLASS_CFG, p.payload()[0]);
+  TEST_ASSERT_EQUAL_HEX8(UBX_CFG_VALSET, p.payload()[1]);
+  TEST_ASSERT_EQUAL_INT(1, feedAll(p, ackPrt, sizeof(ackPrt)));
+  TEST_ASSERT_TRUE(p.matches(UBX_CLASS_ACK, UBX_ACK_ACK));
+  TEST_ASSERT_EQUAL_HEX8(UBX_CLASS_CFG, p.payload()[0]);
+  TEST_ASSERT_EQUAL_HEX8(UBX_CFG_PRT, p.payload()[1]);
+  // A CFG-PRT poll for UART1 (1-byte payload) builds to B5 62 06 00 01 00 01 08 22.
+  const uint8_t portId = UBX_CFG_PRT_UART1;
+  uint8_t frame[16];
+  const size_t n = ubxBuildFrame(frame, sizeof(frame), UBX_CLASS_CFG, UBX_CFG_PRT, &portId, 1);
+  const uint8_t expectedPoll[] = {0xB5, 0x62, 0x06, 0x00, 0x01, 0x00, 0x01, 0x08, 0x22};
+  assertQuotedFrameChecksum(expectedPoll, sizeof(expectedPoll));
+  TEST_ASSERT_EQUAL_UINT32(sizeof(expectedPoll), (uint32_t)n);
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expectedPoll, frame, sizeof(expectedPoll));
+}
+
+// ---------------------------------------------------------------- rate frames
+// Legacy CFG-RATE {measRate, navRate 1, timeRef GPS} for 5 Hz and 10 Hz, as
+// configure_legacy() sends for GNSS_RATE_MS 200 / 100.
+void test_cfg_rate_frames() {
+  uint8_t pl[UBX_CFG_RATE_LEN];
+  TEST_ASSERT_EQUAL_UINT32(6, (uint32_t)ubxBuildCfgRate(pl, 200, 1, UBX_CFG_RATE_TIMEREF_GPS));
+  TEST_ASSERT_EQUAL_UINT16(200, rdU2(pl + 0));
+  TEST_ASSERT_EQUAL_UINT16(1, rdU2(pl + 2));
+  TEST_ASSERT_EQUAL_UINT16(1, rdU2(pl + 4));
+  uint8_t frame[24];
+  size_t n = ubxBuildFrame(frame, sizeof(frame), UBX_CLASS_CFG, UBX_CFG_RATE, pl, 6);
+  const uint8_t expected200[] = {0xB5, 0x62, 0x06, 0x08, 0x06, 0x00, 0xC8, 0x00, 0x01, 0x00, 0x01, 0x00, 0xDE, 0x6A};
+  assertQuotedFrameChecksum(expected200, sizeof(expected200));
+  TEST_ASSERT_EQUAL_UINT32(sizeof(expected200), (uint32_t)n);
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expected200, frame, sizeof(expected200));
+
+  ubxBuildCfgRate(pl, 100, 1, UBX_CFG_RATE_TIMEREF_GPS);
+  n = ubxBuildFrame(frame, sizeof(frame), UBX_CLASS_CFG, UBX_CFG_RATE, pl, 6);
+  const uint8_t expected100[] = {0xB5, 0x62, 0x06, 0x08, 0x06, 0x00, 0x64, 0x00, 0x01, 0x00, 0x01, 0x00, 0x7A, 0x12};
+  assertQuotedFrameChecksum(expected100, sizeof(expected100));
+  TEST_ASSERT_EQUAL_UINT32(sizeof(expected100), (uint32_t)n);
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expected100, frame, sizeof(expected100));
+
+  // 1 Hz / UTC reference for completeness; null payload rejected.
+  ubxBuildCfgRate(pl, 1000, 1, UBX_CFG_RATE_TIMEREF_UTC);
+  TEST_ASSERT_EQUAL_UINT16(1000, rdU2(pl + 0));
+  TEST_ASSERT_EQUAL_UINT16(0, rdU2(pl + 4));
+  TEST_ASSERT_EQUAL_UINT32(0, (uint32_t)ubxBuildCfgRate(nullptr, 200, 1, 1));
+}
+
+// VALSET {RATE-MEAS, RATE-NAV=1} RAM+BBR for 5 Hz and 10 Hz (configure_valset step 3).
+void test_valset_rate_frames() {
+  uint8_t pl[UBX_VALSET_HEADER_LEN + 2 * (4 + 2)];
+  uint16_t len = ubxValsetBegin(pl, sizeof(pl));
+  TEST_ASSERT_TRUE(ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_RATE_MEAS, 200));
+  TEST_ASSERT_TRUE(ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_RATE_NAV, 1));
+  TEST_ASSERT_EQUAL_UINT16(16, len);
+  uint8_t frame[32];
+  size_t n = ubxBuildFrame(frame, sizeof(frame), UBX_CLASS_CFG, UBX_CFG_VALSET, pl, len);
+  const uint8_t expected200[] = {0xB5, 0x62, 0x06, 0x8A, 0x10, 0x00, 0x00, 0x03, 0x00, 0x00, 0x01, 0x00,
+                                 0x21, 0x30, 0xC8, 0x00, 0x02, 0x00, 0x21, 0x30, 0x01, 0x00, 0x11, 0x6B};
+  assertQuotedFrameChecksum(expected200, sizeof(expected200));
+  TEST_ASSERT_EQUAL_UINT32(sizeof(expected200), (uint32_t)n);
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expected200, frame, sizeof(expected200));
+
+  len = ubxValsetBegin(pl, sizeof(pl));
+  TEST_ASSERT_TRUE(ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_RATE_MEAS, 100));
+  TEST_ASSERT_TRUE(ubxValsetAppend(pl, len, sizeof(pl), UBX_KEY_CFG_RATE_NAV, 1));
+  n = ubxBuildFrame(frame, sizeof(frame), UBX_CLASS_CFG, UBX_CFG_VALSET, pl, len);
+  const uint8_t expected100[] = {0xB5, 0x62, 0x06, 0x8A, 0x10, 0x00, 0x00, 0x03, 0x00, 0x00, 0x01, 0x00,
+                                 0x21, 0x30, 0x64, 0x00, 0x02, 0x00, 0x21, 0x30, 0x01, 0x00, 0xAD, 0x4B};
+  assertQuotedFrameChecksum(expected100, sizeof(expected100));
+  TEST_ASSERT_EQUAL_UINT32(sizeof(expected100), (uint32_t)n);
+  TEST_ASSERT_EQUAL_HEX8_ARRAY(expected100, frame, sizeof(expected100));
 }
 
 // ---------------------------------------------------------------- NAV-PVT
@@ -445,6 +637,11 @@ int main(int, char **) {
   RUN_TEST(test_build_frame_rejects_small_buffer);
   RUN_TEST(test_valset_reference_frame);
   RUN_TEST(test_valset_value_sizes_and_capacity);
+  RUN_TEST(test_valset_uart1_baudrate_frame);
+  RUN_TEST(test_cfg_prt_uart1_payload_115200);
+  RUN_TEST(test_ack_frames_for_baud_switch);
+  RUN_TEST(test_cfg_rate_frames);
+  RUN_TEST(test_valset_rate_frames);
   RUN_TEST(test_navpvt_92_bytes_decodes);
   RUN_TEST(test_navpvt_84_bytes_accepted);
   RUN_TEST(test_navpvt_short_or_wrong_id_rejected);

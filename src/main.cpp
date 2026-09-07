@@ -12,6 +12,7 @@
 #include "config.h"
 #include "display.h"
 #include "gnss_ubx.h"
+#include "trip.h"
 #include "shared_state.h"
 
 [[maybe_unused]] static const char *resetReasonStr(esp_reset_reason_t r) {  // log-only (unused below CORE_DEBUG_LEVEL 3)
@@ -31,8 +32,9 @@
 }
 
 static void logConfig() {
-  log_i("cfg CAN : tx=%d rx=%d %d kbit/s mode=%s rxq=%d vesc_id=%d poles=%d", PIN_CAN_TX, PIN_CAN_RX, CAN_BITRATE_KBPS,
-        CAN_LISTEN_ONLY ? "LISTEN_ONLY" : "NORMAL(ack-only)", CAN_RX_QUEUE_LEN, VESC_CAN_ID, VESC_MOTOR_POLES);
+  log_i("cfg CAN : tx=%d rx=%d %d kbit/s mode=%s rxq=%d vesc_id=%d poles=%d poll=%d ms own_id=%d", PIN_CAN_TX,
+        PIN_CAN_RX, CAN_BITRATE_KBPS, CAN_LISTEN_ONLY ? "LISTEN_ONLY" : (VESC_POLL_MS > 0 ? "NORMAL(ack+poll)" : "NORMAL(ack-only)"),
+        CAN_RX_QUEUE_LEN, VESC_CAN_ID, VESC_MOTOR_POLES, VESC_POLL_MS, CAN_OWN_ID);
 #if DISPLAY_TYPE == DISPLAY_TYPE_EPD_GDEY042T81
   log_i("cfg EPD : sck=%d mosi=%d cs=%d dc=%d rst=%d busy=%d spi=%lu Hz rot=%d fastfull=%d full_every=%d/%lu ms",
         PIN_EPD_SCK, PIN_EPD_MOSI, PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY, (unsigned long)EPD_SPI_HZ,
@@ -74,7 +76,8 @@ void setup() {
   [[maybe_unused]] const bool canOk = can_vesc_start();  // log-only below CORE_DEBUG_LEVEL 3
   [[maybe_unused]] const bool gnssOk = gnss_start();
   [[maybe_unused]] const bool dispOk = display_start();
-  log_i("started: can=%d gnss=%d display=%d", canOk, gnssOk, dispOk);
+  [[maybe_unused]] const bool tripOk = trip_start();
+  log_i("started: can=%d gnss=%d display=%d trip=%d", canOk, gnssOk, dispOk, tripOk);
 }
 
 // A heartbeat that was never touched counts as fresh during the first max_age ms
@@ -89,7 +92,7 @@ static bool hbOk(uint32_t hb, uint32_t now, uint32_t max_age) {
 }
 
 void loop() {
-  static uint32_t nextVescLog = 0, nextGnssLog = 0, nextSysLog = 0, nextStaleLog = 0, nextBlink = 0;
+  static uint32_t nextVescLog = 0, nextGnssLog = 0, nextTripLog = 0, nextSysLog = 0, nextStaleLog = 0, nextBlink = 0;
   static bool led = false;
 
   // Snapshot BEFORE reading the clock: every timestamp inside s must be <= now,
@@ -128,15 +131,21 @@ void loop() {
     nextGnssLog = now + LOG_GNSS_MS;
     gnss_log_summary(s, now);
   }
+  if (LOG_TRIP_MS && (int32_t)(now - nextTripLog) >= 0) {
+    nextTripLog = now + LOG_TRIP_MS;
+    trip_log_summary(s, now);
+  }
   if (LOG_SYS_MS && (int32_t)(now - nextSysLog) >= 0) {
     nextSysLog = now + LOG_SYS_MS;
     log_i("SYS up=%lus reset=%s heap=%lu minheap=%lu lockfail=%lu | can=%s tec=%lu rec=%lu busoff=%lu | disp ok=%d "
-          "refreshes=%lu skipped=%lu dim=%d fulls=%lu hib=%d off=%d | hb can=%lu gnss=%lu disp=%lu",
+          "refreshes=%lu skipped=%lu dim=%d scr=%u btn=%lu | poll sent=%lu ok=%lu bad=%lu to=%lu | hb can=%lu gnss=%lu disp=%lu",
           (unsigned long)(now / 1000), resetReasonStr(esp_reset_reason()), (unsigned long)ESP.getFreeHeap(),
           (unsigned long)ESP.getMinFreeHeap(), (unsigned long)s.lock_failures, can_state_str(s.can.state),
           (unsigned long)s.can.tec, (unsigned long)s.can.rec, (unsigned long)s.can.bus_off_count, s.disp.init_ok,
           (unsigned long)s.disp.refreshes, (unsigned long)s.disp.skipped_unchanged, s.disp.dimmed,
-          (unsigned long)s.disp.fulls, s.disp.hibernating, s.disp.powered_off, (unsigned long)age_ms(hb_can, now),
+          (unsigned)s.disp.screen, (unsigned long)s.disp.button_presses, (unsigned long)s.vesc_ext.polls_sent,
+          (unsigned long)s.vesc_ext.replies_ok, (unsigned long)s.vesc_ext.replies_bad, (unsigned long)s.vesc_ext.timeouts,
+          (unsigned long)age_ms(hb_can, now),
           (unsigned long)age_ms(hb_gnss, now), (unsigned long)age_ms(hb_disp, now));
   }
 

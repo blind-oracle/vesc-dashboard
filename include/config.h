@@ -39,10 +39,12 @@
 #ifndef CAN_BITRATE_KBPS
 #define CAN_BITRATE_KBPS 500 // VESC default CAN_BAUD_500K. Supported: 125, 250, 500, 1000. Must match VESC Tool "CAN Baud Rate".
 #endif
-// 0 = TWAI_MODE_NORMAL: the controller acknowledges frames but this firmware NEVER transmits (protocol-passive).
+// 0 = TWAI_MODE_NORMAL: the controller acknowledges frames; the only thing this firmware ever transmits is the
+//     optional COMM_GET_VALUES_SELECTIVE poll (VESC_POLL_MS below; 0 = strictly passive, never transmits).
 //     REQUIRED when the VESC and this board are the only two nodes: the VESC's bxCAN has no automatic-retransmit
 //     limit, so with a non-ACKing listener it goes error-passive and repeats one stale frame forever.
-// 1 = TWAI_MODE_LISTEN_ONLY (no ACK at all): only if another ACKing node (2nd VESC, BMS, VESC Tool adapter) exists.
+// 1 = TWAI_MODE_LISTEN_ONLY (no ACK at all): only if another ACKing node (2nd VESC, BMS, VESC Tool adapter) exists;
+//     requires VESC_POLL_MS 0 (a listen-only controller cannot transmit).
 #ifndef CAN_LISTEN_ONLY
 #define CAN_LISTEN_ONLY 0
 #endif
@@ -53,7 +55,7 @@
 #define VESC_CAN_ID -1 // -1 = accept any VESC id and lock onto the first one seen; 0..254 = only this id (VESC Tool "VESC ID")
 #endif
 #ifndef VESC_MOTOR_POLES
-#define VESC_MOTOR_POLES 14 // VESC Tool > Motor Settings > Additional Info > Motor Poles. mech rpm = erpm / (poles/2). Logging only.
+#define VESC_MOTOR_POLES 10 // VESC Tool > Motor Settings > Additional Info > Motor Poles. mech rpm = erpm / (poles/2). Logging only.
 #endif
 #ifndef VESC_STALE_R1_MS
 #define VESC_STALE_R1_MS 2000 // STATUS 1/4/5 ("Rate 1", default 50 Hz) older than this are shown as "--"
@@ -69,6 +71,75 @@
 #endif
 #ifndef CAN_LOG_RAW_FRAMES
 #define CAN_LOG_RAW_FRAMES 0 // 1 = log_d() every accepted raw frame (needs CORE_DEBUG_LEVEL >= 4)
+#endif
+
+// ============================================================================
+// Active VESC polling (COMM_GET_VALUES_SELECTIVE over CAN)
+// ============================================================================
+// The status frames carry most data passively. Fault code, per-MOSFET
+// temperatures, id/iq, vd/vq and the absolute tachometer are only available by
+// asking the VESC (CAN_PACKET_PROCESS_SHORT_BUFFER carrying COMM_GET_VALUES_SELECTIVE,
+// answered as FILL_RX_BUFFER/PROCESS_RX_BUFFER frames). This is the ONLY place the
+// firmware transmits on the bus. Set VESC_POLL_MS 0 for a strictly passive (ACK-only) node.
+#ifndef VESC_POLL_MS
+#define VESC_POLL_MS 1000 // request period in ms; 0 = never transmit anything
+#endif
+#ifndef CAN_OWN_ID
+#define CAN_OWN_ID 120 // our controller id on the VESC bus: 1..254, must differ from every VESC id (255 = broadcast)
+#endif
+#ifndef VESC_POLL_TIMEOUT_MS
+#define VESC_POLL_TIMEOUT_MS 500 // an incomplete reply is discarded after this long
+#endif
+#ifndef VESC_EXT_STALE_MS
+#define VESC_EXT_STALE_MS 3000 // polled values older than this are shown as "--"
+#endif
+#ifndef CAN_TX_QUEUE_LEN
+#define CAN_TX_QUEUE_LEN 4 // driver TX queue while polling is enabled (0 is used when VESC_POLL_MS == 0)
+#endif
+
+// ============================================================================
+// Screens, button, clock (OLED build)
+// ============================================================================
+#ifndef PIN_BUTTON
+#define PIN_BUTTON 7 // silkscreen "7"/INT: momentary button to GND (internal pull-up). -1 = no button.
+                     // 9 = use the on-board BOOT button instead (fine at runtime; holding it during reset enters download mode)
+#endif
+#ifndef BUTTON_ACTIVE_LOW
+#define BUTTON_ACTIVE_LOW 1 // 1 = pressed reads LOW (button to GND, INPUT_PULLUP); 0 = pressed reads HIGH (button to 3V3, INPUT_PULLDOWN)
+#endif
+#ifndef BUTTON_DEBOUNCE_MS
+#define BUTTON_DEBOUNCE_MS 30
+#endif
+#ifndef BUTTON_LONG_PRESS_MS
+#define BUTTON_LONG_PRESS_MS 1500 // long press -> back to the main screen
+#endif
+#ifndef SCREEN_AUTO_RETURN_MS
+#define SCREEN_AUTO_RETURN_MS 60000 // after this long on another screen, return to the main screen; 0 = stay
+#endif
+#ifndef TIME_UTC_OFFSET_MIN
+#define TIME_UTC_OFFSET_MIN 0 // displayed clock = GNSS UTC + this many minutes (e.g. 120 for UTC+2). No DST logic.
+#endif
+
+// ============================================================================
+// Trip / efficiency (src/trip.cpp, EFFICIENCY screen)
+// ============================================================================
+// Distance = GNSS ground speed integrated while moving; energy = VESC watt-hour
+// counters (STATUS_3), falling back to v_in x current_in integration while
+// STATUS_3 is not being received. Efficiency = Wh per distance unit.
+#ifndef TRIP_PERIOD_MS
+#define TRIP_PERIOD_MS 200      // integrator tick (matches the 5 Hz GNSS rate)
+#endif
+#ifndef EFF_WINDOW_S
+#define EFF_WINDOW_S 10         // "now" efficiency = last this many seconds
+#endif
+#ifndef EFF_MIN_SPEED_MM_S
+#define EFF_MIN_SPEED_MM_S 500  // below this ground speed no distance is integrated (GNSS drift at the mooring); 500 mm/s ~ 1 kn
+#endif
+#ifndef EFF_MIN_DIST_M
+#define EFF_MIN_DIST_M 10       // a window / trip shorter than this shows "--" instead of a meaningless ratio
+#endif
+#ifndef EFF_UNIT_KM
+#define EFF_UNIT_KM 0           // 0 = follow the speed unit (knots -> Wh/NM, km/h -> Wh/km); 1 = always Wh/km
 #endif
 
 // ============================================================================
@@ -191,13 +262,16 @@
 #define PIN_GNSS_TX 5 // silkscreen "5"/LP_TX -> GNSS module RX (board has a 499 Ohm series resistor, fine)
 #endif
 #ifndef GNSS_BAUDS
-#define GNSS_BAUDS {38400, 9600, 115200, 57600, 230400} // autobaud order: M9/M10 firmware default 38400; M8 and MAX-M10S factory 9600
+#define GNSS_BAUDS {115200, 38400, 9600, 57600, 230400} // autobaud order: the target baud first (a receiver configured by us keeps it while powered / battery-backed), then the factory defaults 38400 (M9/M10) and 9600 (M8, MAX-M10S)
 #endif
 #ifndef GNSS_RX_BUFFER
 #define GNSS_RX_BUFFER 2048 // Serial1 RX ring (bytes). Default 256 overflows during multi-second e-paper refreshes (NAV-PVT = 100 B).
 #endif
+#ifndef GNSS_TARGET_BAUD
+#define GNSS_TARGET_BAUD 115200 // after detection the receiver's UART1 is switched to this baud (RAM+BBR); 0 = keep the detected baud. Must be in GNSS_BAUDS.
+#endif
 #ifndef GNSS_RATE_MS
-#define GNSS_RATE_MS 1000 // navigation rate (CFG-RATE-MEAS / CFG-RATE measRate). 1000 = 1 Hz. M8 minimum 50-100.
+#define GNSS_RATE_MS 200    // navigation rate: 200 = 5 Hz (safe on every M8/M9/M10 with all constellations); 100 = 10 Hz needs a fast module and GNSS_TARGET_BAUD >= 38400
 #endif
 #ifndef GNSS_DYNMODEL_SEA
 #define GNSS_DYNMODEL_SEA 1 // 1 = set the receiver dynamic model to SEA (5); 0 = leave the receiver default
@@ -218,7 +292,7 @@
 #define SPEED_MIN_SHOW 0.3f // speeds below this (in the display unit) are shown as 0.0 to hide GNSS drift at rest
 #endif
 #ifndef SPEED_UNIT_KNOTS
-#define SPEED_UNIT_KNOTS 0 // 1 = knots (mm/s * 0.00194384), 0 = km/h (mm/s * 0.0036)
+#define SPEED_UNIT_KNOTS 0  // 1 = knots (mm/s * 0.00194384), 0 = km/h (mm/s * 0.0036)
 #endif
 
 // ============================================================================
@@ -253,6 +327,9 @@
 #endif
 #ifndef LOG_SYS_MS
 #define LOG_SYS_MS 10000 // uptime / heap / reset reason / CAN health / display counters (0 = off)
+#endif
+#ifndef LOG_TRIP_MS
+#define LOG_TRIP_MS 5000    // period of the trip / efficiency log line (0 = off)
 #endif
 #ifndef SERIAL_BOOT_DELAY_MS
 #define SERIAL_BOOT_DELAY_MS 1500 // give the USB-CDC host time to re-enumerate so the boot banner is visible
@@ -299,6 +376,53 @@
 #define OLED_I2C_TIMEOUT_MS 50 // Wire transaction timeout (a stuck bus costs this per transaction)
 #endif
 
+#ifndef OLED_BUTTON_POLL_MS
+#define OLED_BUTTON_POLL_MS 20 // display task loop period = button sampling granularity
+#endif
+#ifndef CAN_TX_WAIT_MS
+#define CAN_TX_WAIT_MS 10 // twai_transmit() block time for a poll request
+#endif
+#ifndef VESC_POLL_LOG_MIN_MS
+#define VESC_POLL_LOG_MIN_MS 10000 // rate limit for "no reply" / "bad reply" / "not transmitted" warnings
+#endif
+#ifndef VESC_POLL_BACKOFF_AFTER
+#define VESC_POLL_BACKOFF_AFTER 3 // consecutive polls without a reply before slowing down ...
+#endif
+#ifndef VESC_POLL_BACKOFF_MS
+#define VESC_POLL_BACKOFF_MS 5000 // ... to this period (a STATUS frame resumes the normal rate at once)
+#endif
+#ifndef VESC_GETVALUES_MASK
+#define VESC_GETVALUES_MASK 0x003EC03Cu // COMM_GET_VALUES_SELECTIVE field mask (fields the STATUS frames lack); 0 = plain COMM_GET_VALUES
+#endif
+#ifndef VESC_RX_BUFFER_SIZE
+#define VESC_RX_BUFFER_SIZE 512 // reassembly buffer for polled replies (VESC maximum packet payload)
+#endif
+
+#ifndef GNSS_BAUD_SWITCH_ATTEMPTS
+#define GNSS_BAUD_SWITCH_ATTEMPTS 2    // unconfirmed baud switches in a row before the detected baud is kept
+#endif
+#ifndef GNSS_BAUD_SWITCH_SETTLE_MS
+#define GNSS_BAUD_SWITCH_SETTLE_MS 100 // u-blox: "typically 100 ms" between the baud-change message and data at the new rate
+#endif
+#ifndef TASK_PRIO_TRIP
+#define TASK_PRIO_TRIP 3          // trip integrator task: between the display (2) and the data producers (GNSS 5, CAN 6)
+#endif
+#ifndef TRIP_TASK_STACK
+#define TRIP_TASK_STACK 4096      // bytes
+#endif
+#ifndef TRIP_DT_MAX_MS
+#define TRIP_DT_MAX_MS 5000       // longest step integrated after a stall; beyond it time is dropped, not integrated
+#endif
+#ifndef TRIP_COUNTER_RESET_WH
+#define TRIP_COUNTER_RESET_WH 0.5f // a watt-hour counter delta below -this means the VESC rebooted (counters restarted)
+#endif
+#ifndef TRIP_EFF_MIN_FILL_S
+#define TRIP_EFF_MIN_FILL_S 3     // closed one-second window buckets needed before the "now" efficiency is shown
+#endif
+#ifndef TRIP_STALE_MS
+#define TRIP_STALE_MS 5000        // TripState older than this -> the EFFICIENCY screen shows "--"
+#endif
+
 // ============================================================================
 // Derived values (do not edit)
 // ============================================================================
@@ -308,6 +432,15 @@
 #else
 #define SPEED_FACTOR 0.0036f // mm/s -> km/h
 #define SPEED_UNIT_STR "km/h"
+#endif
+#if SPEED_UNIT_KNOTS && !EFF_UNIT_KM
+#define EFF_DIST_UNIT_M 1852.0f // one nautical mile
+#define EFF_DIST_UNIT_STR "NM"
+#define EFF_UNIT_STR "Wh/NM"
+#else
+#define EFF_DIST_UNIT_M 1000.0f
+#define EFF_DIST_UNIT_STR "km"
+#define EFF_UNIT_STR "Wh/km"
 #endif
 
 // ============================================================================
@@ -325,6 +458,21 @@
 #if PIN_CAN_TX == PIN_CAN_RX
 #error "PIN_CAN_TX and PIN_CAN_RX must differ"
 #endif
+#if CAN_LISTEN_ONLY && VESC_POLL_MS > 0
+#error "VESC_POLL_MS > 0 requires CAN_LISTEN_ONLY 0: a listen-only controller cannot transmit (set VESC_POLL_MS 0 for a passive node)"
+#endif
+#if GNSS_RATE_MS < 50 || GNSS_RATE_MS > 10000
+#error "GNSS_RATE_MS must be 50..10000 ms (u-blox M8 minimum 50-100 ms)"
+#endif
+#if EFF_WINDOW_S < 2 || EFF_WINDOW_S > 120
+#error "EFF_WINDOW_S must be 2..120 seconds"
+#endif
+#if CAN_OWN_ID < 1 || CAN_OWN_ID > 254
+#error "CAN_OWN_ID must be 1..254 (255 is the CAN broadcast id)"
+#endif
+#if VESC_CAN_ID >= 0 && VESC_CAN_ID == CAN_OWN_ID
+#error "CAN_OWN_ID must differ from VESC_CAN_ID"
+#endif
 
 #ifndef UNIT_TEST // native host tests only; every firmware build (Arduino or not) must pass this check
 #include "sdkconfig.h"
@@ -338,6 +486,9 @@ namespace cfg_check
 {
   // Only the pins of the ACTIVE display take part: the OLED deliberately reuses the e-ink's SPI pins.
   constexpr int kPins[] = {PIN_CAN_TX, PIN_CAN_RX, PIN_GNSS_RX, PIN_GNSS_TX, PIN_LED,
+#if PIN_BUTTON >= 0 && DISPLAY_TYPE == DISPLAY_TYPE_OLED_SSD1309
+                           PIN_BUTTON,
+#endif
 #if DISPLAY_TYPE == DISPLAY_TYPE_EPD_GDEY042T81
                            PIN_EPD_SCK, PIN_EPD_MOSI, PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY
 #else

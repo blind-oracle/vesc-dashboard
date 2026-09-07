@@ -18,6 +18,13 @@
 //   ACK-ACK 0x05 0x01 / ACK-NAK 0x05 0x00, payload {cls, id} of the acked msg.
 //   CFG-VALSET 0x06 0x8A (PROTVER >= 27): {0 version, layers, 2 reserved,
 //            key U4 LE, value(size from key bits 28..30) ...}.
+//   CFG-PRT  0x06 0x00  len 20, UART port configuration of u-blox 6/7/M8
+//            (PROTVER < 27): {portID U1, reserved U1, txReady X2, mode X4,
+//            baudRate U4, inProtoMask X2, outProtoMask X2, flags X2, res U1[2]}.
+//   CFG-RATE 0x06 0x08  len 6: {measRate U2 ms, navRate U2 cycles, timeRef U2}.
+//            measRate >= 50 ms below PROTVER 24 (>= 25 ms from 24 on); navRate
+//            is fixed to 1 below PROTVER 18. A rate the module cannot sustain
+//            is ACKed anyway and shows up as missing epochs, never as a NAK.
 #pragma once
 
 #include <stdbool.h>
@@ -63,12 +70,32 @@
 #define UBX_KEY_CFG_RATE_MEAS 0x30210001u                 // U2 ms
 #define UBX_KEY_CFG_RATE_NAV 0x30210002u                  // U2 cycles
 #define UBX_KEY_CFG_NAVSPG_DYNMODEL 0x20110021u           // U1 (E1), 5 = SEA
+#define UBX_KEY_CFG_UART1_BAUDRATE 0x40520001u            // U4 bit/s; the port switches as soon as the message is processed
 
 // VALSET header bytes: version 0, layers RAM|BBR (never FLASH: we reconfigure
 // on every boot instead of wearing the receiver's flash), 2 reserved.
 #define UBX_VALSET_LAYER_RAM 0x01u
 #define UBX_VALSET_LAYER_BBR 0x02u
 #define UBX_VALSET_HEADER_LEN 4u
+
+// CFG-PRT UART payload (20 bytes, u-blox 6/7/M8 receiver descriptions).
+// mode 0x000008D0: bit4 reserved1 = 1 (Antaris compatibility), charLen bits
+// 6-7 = 11 (8 data bits), parity bits 9-11 = 100 (none), nStopBits bits 12-13
+// = 00 (1 stop bit): the 8N1 constant gpsd and PX4 send. Protocol masks: bit0
+// UBX, bit1 NMEA, bit2 RTCM2 (input only; M8 factory inProtoMask is 0x0007,
+// outProtoMask 0x0003). The change is RAM-only on these receivers: without a
+// CFG-CFG save they boot at their factory baud again (autobaud re-finds them).
+#define UBX_CFG_PRT_LEN 20u
+#define UBX_CFG_PRT_UART1 0x01u
+#define UBX_CFG_PRT_MODE_8N1 0x000008D0u
+#define UBX_CFG_PRT_PROTO_UBX 0x0001u
+#define UBX_CFG_PRT_PROTO_NMEA 0x0002u
+#define UBX_CFG_PRT_PROTO_RTCM 0x0004u
+
+// CFG-RATE payload (6 bytes); timeRef 0 = UTC, 1 = GPS time.
+#define UBX_CFG_RATE_LEN 6u
+#define UBX_CFG_RATE_TIMEREF_UTC 0u
+#define UBX_CFG_RATE_TIMEREF_GPS 1u
 
 // NAV-PVT fixType values.
 #define UBX_FIX_NONE 0u
@@ -434,4 +461,32 @@ static inline bool ubxValsetAppend(uint8_t *pl, uint16_t &len, uint16_t cap, uin
   }
   len = (uint16_t)(len + vs);
   return true;
+}
+
+// ---------------------------------------------------------------- legacy CFG builders
+// CFG-PRT payload for UART1: 8N1 at baud, with the given input/output protocol
+// masks (UBX_CFG_PRT_PROTO_*). txReady, flags and the reserved bytes are 0.
+// Returns UBX_CFG_PRT_LEN (20), or 0 when payload20 is null. Sending it
+// reconfigures the port immediately, so the ACK normally leaves at the NEW
+// baud (or is corrupted): callers verify with a poll at the new rate instead.
+static inline size_t ubxBuildCfgPrtUart1(uint8_t *payload20, uint32_t baud, uint16_t inProto, uint16_t outProto) {
+  if (payload20 == 0) return 0;
+  memset(payload20, 0, UBX_CFG_PRT_LEN);
+  payload20[0] = (uint8_t)UBX_CFG_PRT_UART1;  // portID
+  wrU4(payload20 + 4, UBX_CFG_PRT_MODE_8N1);  // mode
+  wrU4(payload20 + 8, baud);                  // baudRate
+  wrU2(payload20 + 12, inProto);              // inProtoMask
+  wrU2(payload20 + 14, outProto);             // outProtoMask
+  return UBX_CFG_PRT_LEN;
+}
+
+// CFG-RATE payload: measurement period ms, navigation cycles per measurement
+// (1 on every generation that matters), time reference. Returns
+// UBX_CFG_RATE_LEN (6), or 0 when payload6 is null.
+static inline size_t ubxBuildCfgRate(uint8_t *payload6, uint16_t measMs, uint16_t navCycles, uint16_t timeRef) {
+  if (payload6 == 0) return 0;
+  wrU2(payload6 + 0, measMs);
+  wrU2(payload6 + 2, navCycles);
+  wrU2(payload6 + 4, timeRef);
+  return UBX_CFG_RATE_LEN;
 }
