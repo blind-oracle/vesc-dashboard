@@ -1,0 +1,42 @@
+# boat-motor: second sdkconfig fragment for the 'bms' env (JK BMS over BLE). Applied AFTER
+# sdkconfig.defaults via board_build.cmake_extra_args = -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.bms".
+# The builder only re-runs CMake when sdkconfig.defaults or sdkconfig.<env> changed: after editing
+# this file run `touch sdkconfig.defaults` (or delete sdkconfig.bms). All symbols verified in ESP-IDF 6.1 Kconfig.
+
+# NimBLE host, central + observer roles only (no advertising, no GATT server, no security/bonding).
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+# GATT_SERVER depends on ROLE_PERIPHERAL and MAX_BONDS / NVS_PERSIST on SECURITY_ENABLE: with those off the
+# three symbols disappear from the generated sdkconfig (that is the intended "off"); kept here for clarity.
+CONFIG_BT_NIMBLE_GATT_SERVER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_MAX_BONDS=1
+CONFIG_BT_NIMBLE_MAX_CCCDS=1
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=n
+# No NVS writes from the host (no bonding store): the only BLE-related flash write is the PHY
+# calibration blob at the first controller enable, which happens before the CAN node exists.
+CONFIG_BT_NIMBLE_NVS_PERSIST=n
+CONFIG_BT_NIMBLE_ENABLE_CONN_REATTEMPT=n
+# BLE 4.2 feature set is enough for the JK module (legacy advertising, ATT notifications).
+CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=n
+# 256-byte preferred MTU: a 300-byte JK frame then arrives in 2..3 notifications (modules answer 131/247/517).
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
+CONFIG_BT_LE_CONTROLLER_TASK_STACK_SIZE=4096
+# Wi-Fi is never started; drop the software coexistence hooks (CONFIG_ESP_WIFI_ENABLED itself is not settable).
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+
+# Measured (init-only build, 2026-09-09): firmware.bin 641,664 B vs 292,480 B without BLE (+349 KB), static RAM +3.7 KB.
+# Optional RAM trims (examples/bluetooth/nimble/blecent/sdkconfig.defaults.mini; defaults are 24/24), enable after the first heap measurement:
+# CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6
+# CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+# CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=12
+# CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=15
+# CONFIG_BT_ALARM_MAX_NUM=15
+# Optional: lower TX power (the BMS is metres away, fewer 190 mA peaks on the 3V3 rail):
+# CONFIG_BT_LE_DFT_TX_POWER_LEVEL_P3=y

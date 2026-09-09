@@ -150,6 +150,48 @@ struct DisplayStats
   uint32_t button_presses;       // debounced presses seen
 };
 
+#if BMS_UI_ENABLE
+// ---------------------------------------------------------------- BMS (JK BMS over BLE)
+// Written by bmsTask (src/bms_ble.cpp) after every decoded cell-info frame; read by the
+// BMS / CELLS screens and the logs. Present when the BLE client is built or in the demo.
+enum BmsLink : uint8_t {
+  BMS_LINK_OFF = 0,     // BLE not started / init failed
+  BMS_LINK_SCANNING,    // looking for the BMS (or waiting out a back-off)
+  BMS_LINK_CONNECTING,  // connect request in flight
+  BMS_LINK_SETUP,       // connected: MTU, discovery, subscribe, 0x97/0x96 sent, waiting for the first frame
+  BMS_LINK_STREAM,      // cell-info frames arriving
+};
+
+enum BmsProto : uint8_t { BMS_PROTO_UNKNOWN = 0, BMS_PROTO_JK02_24S = 1, BMS_PROTO_JK02_32S = 2 };
+
+struct BmsState {
+  uint32_t t_ms;                  // last decoded cell-info frame (0 = never)
+  uint8_t link;                   // BmsLink
+  uint8_t proto;                  // BmsProto (0 while unknown / implausible)
+  uint8_t cell_count;             // non-zero cells in the frame (<= 32; only the first BMS_CELLS_MAX are stored)
+  uint16_t cell_mv[BMS_CELLS_MAX];
+  uint16_t cell_min_mv, cell_max_mv, cell_avg_mv, cell_delta_mv;
+  uint8_t cell_min_idx, cell_max_idx; // 1-based, 0 = none (computed from non-zero cells)
+  uint32_t pack_mv;
+  int32_t current_ma;             // JK sign: positive = charging (BMS_CURRENT_SIGN flips it for the screens)
+  int32_t power_mw;               // pack_mv x current_ma, same sign as current_ma
+  int16_t t1_d, t2_d, mos_d;      // temperatures, 0.1 degC, signed
+  uint8_t soc_pct, soh_pct;
+  uint32_t remaining_mah, nominal_mah, cycle_count;
+  int16_t balance_ma;
+  uint8_t balance_action;
+  bool chg_mos_on, dis_mos_on;
+  uint32_t errors;                // alarm bitmask (16 valid bits on 24S, 32 on 32S)
+  char model[17], sw[9];          // from the device-info frame ("" until received)
+  char addr[18];                  // peer address "aa:bb:cc:dd:ee:ff" ("" until seen)
+  int8_t rssi;
+  uint16_t mtu;
+  uint8_t last_disc_reason;
+  uint32_t link_since_ms;         // when the current link state was entered (0 = never)
+  uint32_t frames_ok, frames_crc_bad, frames_resync, notify_dropped, connects, disconnects;
+};
+#endif  // BMS_UI_ENABLE
+
 struct SharedState
 {
   VescState vesc;
@@ -157,6 +199,9 @@ struct SharedState
   CanHealth can;
   GnssState gnss;
   TripState trip;
+#if BMS_UI_ENABLE
+  BmsState bms;
+#endif
   DisplayStats disp;
   uint32_t lock_failures; // state_lock() timeouts (should stay 0)
 };
@@ -175,6 +220,7 @@ SharedState state_snapshot();
 extern volatile uint32_t hb_can;
 extern volatile uint32_t hb_gnss;
 extern volatile uint32_t hb_disp;
+extern volatile uint32_t hb_bms;   // bmsTask (logged; gates the watchdog only when HB_MAX_BMS_MS > 0)
 
 // Milliseconds since boot (32-bit, wraps like millis() did); esp_timer underneath, so headers stay framework-free.
 uint32_t state_now_ms();

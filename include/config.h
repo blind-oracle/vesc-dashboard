@@ -142,6 +142,50 @@
 #endif
 
 // ============================================================================
+// BMS over BLE (JK BMS, NimBLE central; src/bms_ble.cpp, include/jk_bms.h)
+// ============================================================================
+// Reads a Jikong (JK) BMS over Bluetooth LE: service 0xFFE0 / characteristic 0xFFE1,
+// commands 0x97 (device info) and 0x96 (cell info stream). Only built in the 'bms'
+// environment (sdkconfig.defaults.bms enables the NimBLE host). A JK BMS accepts ONE
+// BLE central: the phone app cannot be connected at the same time.
+#ifndef BMS_BLE_ENABLE
+#define BMS_BLE_ENABLE 0          // 1 = build the NimBLE client + bmsTask (needs 'pio run -e bms'); 0 = no BLE code at all
+#endif
+#ifndef BMS_BLE_ADDR
+#define BMS_BLE_ADDR ""           // BMS Bluetooth MAC "C8:47:8C:12:34:56" = connect by address (passive scan); "" = match by name prefix / 0xFFE0 (active scan)
+#endif
+#ifndef BMS_BLE_NAME_PREFIX
+#define BMS_BLE_NAME_PREFIX "JK"  // advertised name prefix ("JK-..." / "JK_..."); the name is user-editable in the JK app
+#endif
+#ifndef BMS_PROTOCOL
+#define BMS_PROTOCOL 0            // 0 = auto (device-info sw >= 11 or JK-PB -> 32S layout, else 24S; confirmed by a cell-sum check), 1 = force JK02_24S, 2 = force JK02_32S
+#endif
+#ifndef BMS_CELLS_MAX
+#define BMS_CELLS_MAX 24          // 1..32 cells kept in the shared state and shown on ceil(n/12) CELLS pages
+#endif
+#ifndef BMS_CURRENT_SIGN
+#define BMS_CURRENT_SIGN 1        // 1 = discharge-positive on screen (same sign as the BA/PW cells); 0 = JK app convention (charge-positive)
+#endif
+#ifndef BMS_STALE_MS
+#define BMS_STALE_MS 10000        // no decoded cell-info frame for this long -> every BMS value shows "--" (frames arrive every ~0.5 s)
+#endif
+#ifndef BMS_RECONNECT_MS
+#define BMS_RECONNECT_MS 2000     // first back-off after a disconnect / failed connect ...
+#endif
+#ifndef BMS_RECONNECT_MAX_MS
+#define BMS_RECONNECT_MAX_MS 30000 // ... doubling up to this
+#endif
+#ifndef BMS_RECONNECT_FAILS
+#define BMS_RECONNECT_FAILS 3     // direct reconnects to the last known address before falling back to scanning
+#endif
+#ifndef HB_MAX_BMS_MS
+#define HB_MAX_BMS_MS 0           // 0 = never gate the task watchdog on the BMS task (its heartbeat age is only logged); > 0 = gate like the other tasks
+#endif
+#ifndef LOG_BMS_MS
+#define LOG_BMS_MS 5000           // period of the BMS log line (0 = off)
+#endif
+
+// ============================================================================
 // Display
 // ============================================================================
 #ifndef DISPLAY_DEMO
@@ -362,6 +406,46 @@
 #define TRIP_STALE_MS 5000        // TripState older than this -> the EFFICIENCY screen shows "--"
 #endif
 
+#ifndef BMS_TASK_PRIO
+#define BMS_TASK_PRIO 4           // bmsTask: between tripTask (3) and gnssTask (5); the NimBLE host/controller tasks run at 21/23 regardless
+#endif
+#ifndef BMS_TASK_STACK
+#define BMS_TASK_STACK 4096       // bytes
+#endif
+#ifndef BMS_CONNECT_TIMEOUT_MS
+#define BMS_CONNECT_TIMEOUT_MS 10000 // ble_gap_connect() duration; a peer that does not answer (phone app connected) costs this per attempt
+#endif
+#ifndef BMS_SETUP_TIMEOUT_MS
+#define BMS_SETUP_TIMEOUT_MS 8000 // MTU exchange + service/characteristic/descriptor discovery + CCCD write must finish within this
+#endif
+#ifndef BMS_FIRST_FRAME_TIMEOUT_MS
+#define BMS_FIRST_FRAME_TIMEOUT_MS 15000 // first CRC-valid, plausible cell-info frame after subscribing, else terminate + back-off
+#endif
+#ifndef BMS_POLL_MS
+#define BMS_POLL_MS 5000          // 0x96 re-send period until the unsolicited cell-info stream starts
+#endif
+#ifndef BMS_SCAN_FAST_MS
+#define BMS_SCAN_FAST_MS 30000    // fast scan preset duration after boot / after a disconnect ...
+#endif
+#ifndef BMS_SCAN_FAST_ITVL_MS
+#define BMS_SCAN_FAST_ITVL_MS 60  // ... interval / window of the fast preset (~50 % RX duty)
+#endif
+#ifndef BMS_SCAN_FAST_WINDOW_MS
+#define BMS_SCAN_FAST_WINDOW_MS 30
+#endif
+#ifndef BMS_SCAN_SLOW_ITVL_MS
+#define BMS_SCAN_SLOW_ITVL_MS 1000 // slow preset while the BMS is absent (~3 % RX duty)
+#endif
+#ifndef BMS_SCAN_SLOW_WINDOW_MS
+#define BMS_SCAN_SLOW_WINDOW_MS 30
+#endif
+#ifndef BMS_MSG_BUF_BYTES
+#define BMS_MSG_BUF_BYTES 2048    // NimBLE host -> bmsTask message buffer (a 300-byte frame arrives as 2..15 notifications)
+#endif
+#ifndef BMS_APP_HINT_S
+#define BMS_APP_HINT_S 60         // after this long without a link the BMS screen adds the "app open?" hint
+#endif
+
 // ============================================================================
 // Derived values (do not edit)
 // ============================================================================
@@ -381,6 +465,9 @@
 #define EFF_DIST_UNIT_STR "km"
 #define EFF_UNIT_STR "Wh/km"
 #endif
+// BMS: the shared state / screens exist when the BLE client is built or in the display demo; CELLS pages hold 12 cells each.
+#define BMS_UI_ENABLE (BMS_BLE_ENABLE || DISPLAY_DEMO)
+#define BMS_CELL_PAGES ((BMS_CELLS_MAX + 11) / 12)
 
 // ============================================================================
 // Compile-time sanity checks
@@ -407,10 +494,26 @@
 #error "CAN_OWN_ID must differ from VESC_CAN_ID"
 #endif
 
+#if BMS_CELLS_MAX < 1 || BMS_CELLS_MAX > 32
+#error "BMS_CELLS_MAX must be 1..32"
+#endif
+#if BMS_PROTOCOL < 0 || BMS_PROTOCOL > 2
+#error "BMS_PROTOCOL must be 0 (auto), 1 (JK02_24S) or 2 (JK02_32S)"
+#endif
+#if BMS_BLE_ENABLE && BMS_TASK_PRIO >= TASK_PRIO_GNSS
+#error "BMS_TASK_PRIO must stay below the data producers (TASK_PRIO_GNSS / TASK_PRIO_CAN)"
+#endif
+#if BMS_SCAN_FAST_WINDOW_MS > BMS_SCAN_FAST_ITVL_MS || BMS_SCAN_SLOW_WINDOW_MS > BMS_SCAN_SLOW_ITVL_MS
+#error "BLE scan window must not exceed the scan interval"
+#endif
+
 #ifndef UNIT_TEST // native host tests only; every firmware build must pass this check
 #include "sdkconfig.h"
 #if !defined(CONFIG_IDF_TARGET_ESP32C6)
 #error "This firmware targets the ESP32-C6 (ESP-IDF). Check platform / board in platformio.ini and sdkconfig.defaults."
+#endif
+#if BMS_BLE_ENABLE && !defined(CONFIG_BT_NIMBLE_ENABLED)
+#error "BMS_BLE_ENABLE needs the NimBLE host: build the 'bms' env (sdkconfig.defaults.bms), see platformio.ini"
 #endif
 #endif
 

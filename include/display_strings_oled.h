@@ -1,7 +1,8 @@
 // Pure, deterministic builders of everything shown on the 128x64 OLED: the main
-// dashboard (OledMain), the six detail "grid" screens (OledGrid: efficiency,
-// three VESC pages, GNSS, SYS), the screen enum, the layout constants shared by
-// the renderer and the host tests and the UTC -> local clock arithmetic.
+// dashboard (OledMain), the detail "grid" screens (OledGrid: efficiency, three
+// VESC pages, with BMS_UI_ENABLE the BMS summary and the CELLS pages, GNSS, SYS),
+// the screen enum, the layout constants shared by the renderer and the host tests
+// and the UTC -> local clock arithmetic.
 // Fault-code names come from vesc_getvalues.h (the CAN codec's 34-entry
 // mc_fault_code table), so there is a single source.
 //
@@ -15,7 +16,8 @@
 //     received is rendered as "--"; nothing stale is ever shown as live data.
 //     Freshness windows: STATUS 1/4/5 -> VESC_STALE_R1_MS, STATUS 2/3/6 ->
 //     VESC_STALE_R2_MS, polled values (g_state.vesc_ext) -> VESC_EXT_STALE_MS,
-//     GNSS -> GNSS_STALE_MS, trip integrator (g_state.trip) -> TRIP_STALE_MS.
+//     GNSS -> GNSS_STALE_MS, trip integrator (g_state.trip) -> TRIP_STALE_MS,
+//     BMS (g_state.bms) -> BMS_STALE_MS while the BLE link is streaming.
 //   * Character budgets are hard limits enforced by clip(): the renderer lays
 //     out fixed-width cells with a 6 px monospace font (see oled_layout). A
 //     number that does not fit its budget drops decimals, then switches to
@@ -49,25 +51,71 @@
 
 // ---------------------------------------------------------------- screens
 // Cycled by short presses of PIN_BUTTON (wrapping); a long press or the
-// SCREEN_AUTO_RETURN_MS timer goes back to SCREEN_MAIN.
+// SCREEN_AUTO_RETURN_MS timer goes back to SCREEN_MAIN. The BMS screens exist
+// only with BMS_UI_ENABLE (BLE client built, or the display demo): SCREEN_BMS
+// and BMS_CELL_PAGES CELLS pages (12 cells each) sit between VESC 3/3 and GNSS,
+// so SCREEN_COUNT is 7 without them and 8 + BMS_CELL_PAGES with them.
 enum OledScreen : uint8_t {
   SCREEN_MAIN = 0,  // speed, clock, fix, CAN line + 8 telemetry cells
   SCREEN_EFF,       // "EFFICIENCY": Wh per NM/km now (EFF_WINDOW_S) and per trip, trip distance / energy / times, mean speed
   SCREEN_VESC_A,    // "VESC 1/3": fault (live, or the last latched one with its age), live electrical values, temperatures, Ah/Wh
   SCREEN_VESC_B,    // "VESC 2/3": polled values (MOSFET 1 temp, avg input current, id/iq, vd/vq, tacho abs, status)
   SCREEN_VESC_C,    // "VESC 3/3": inputs (PPM/ADC/PID) and CAN / poll counters
+#if BMS_UI_ENABLE
+  SCREEN_BMS,       // "BMS 16S": link status, pack V/I/P, SOC, Ah/cycles, temperatures, lowest/highest cell, delta, MOS flags / alarm
+  SCREEN_CELLS_0,   // "CELLS 1/2": 12 cell voltages per page, column-major, L/H marks on the lowest/highest cell
+  SCREEN_CELLS_LAST = SCREEN_CELLS_0 + BMS_CELL_PAGES - 1,  // last CELLS page (== SCREEN_CELLS_0 with a single page)
+  SCREEN_GNSS = SCREEN_CELLS_LAST + 1,  // fix, position, accuracies, speed/heading, UTC date-time
+#else
   SCREEN_GNSS,      // fix, position, accuracies, speed/heading, UTC date-time
+#endif
   SCREEN_SYS,       // firmware, uptime, heap, CAN/GNSS driver state, button/lock counters
   SCREEN_COUNT
 };
 
+#if BMS_UI_ENABLE
+static_assert(BMS_CELL_PAGES >= 1 && BMS_CELL_PAGES <= 3, "BMS_CELLS_MAX 1..32 gives 1..3 CELLS pages");
+
+// Name of CELLS page `page` (0-based): "CELLS" with a single page, else "CELLS 1/2" ...
+// Literals only (no static buffer): the display task and the logger may both call it.
+inline const char *oled_cells_name(unsigned page) {
+#if BMS_CELL_PAGES == 1
+  return page == 0 ? "CELLS" : "?";
+#elif BMS_CELL_PAGES == 2
+  static const char *const kNames[2] = {"CELLS 1/2", "CELLS 2/2"};
+  return page < 2u ? kNames[page] : "?";
+#else
+  static const char *const kNames[3] = {"CELLS 1/3", "CELLS 2/3", "CELLS 3/3"};
+  return page < 3u ? kNames[page] : "?";
+#endif
+}
+
+// JK alarm bit names, bit 0 first, the order of the BMS's 32-bit alarm mask (16 valid
+// bits on the 24S layout, 32 on the 32S one); <= 6 chars each so "ALM <name>+" fits
+// the last BMS row. Kept here (not in jk_bms.h) so the screens stay header-only.
+inline const char *oled_bms_error_name(unsigned bit) {
+  static const char *const kNames[32] = {
+      "WIRE_R", "MOS_OT", "CELLNO", "BIT3",   "FULL",   "PACKOV", "CHG_OC", "CHG_SC",
+      "CHG_OT", "CHG_UT", "COPROC", "CELLUV", "PACKUV", "DIS_OC", "DIS_SC", "DIS_OT",
+      "CMOSAB", "DMOSAB", "GPS",    "PASSWD", "DISON",  "BAT_OT", "TSENS",  "PLMOD",
+      "SCPREL", "DOCP2",  "DOCP3",  "DIS_UT", "GPSLCK", "BIT29",  "BIT30",  "BIT31"};
+  return bit < 32u ? kNames[bit] : "?";
+}
+#endif  // BMS_UI_ENABLE
+
 inline const char *oled_screen_name(uint8_t screen) {
+#if BMS_UI_ENABLE
+  if (screen >= SCREEN_CELLS_0 && screen <= SCREEN_CELLS_LAST) return oled_cells_name((unsigned)(screen - SCREEN_CELLS_0));
+#endif
   switch (screen) {
     case SCREEN_MAIN: return "MAIN";
     case SCREEN_EFF: return "EFF";
     case SCREEN_VESC_A: return "VESC 1/3";
     case SCREEN_VESC_B: return "VESC 2/3";
     case SCREEN_VESC_C: return "VESC 3/3";
+#if BMS_UI_ENABLE
+    case SCREEN_BMS: return "BMS";
+#endif
     case SCREEN_GNSS: return "GNSS";
     case SCREEN_SYS: return "SYS";
     default: return "?";
@@ -177,8 +225,8 @@ struct OledMain {
 };
 
 struct OledGrid {
-  char title[16];    // "EFFICIENCY" / "VESC 1/3" / "GNSS" / "SYS 0.1.0"  (<= 15, bold)
-  char page[6];      // "2/7"                                           (<= 5, right-aligned in the bar)
+  char title[16];    // "EFFICIENCY" / "VESC 1/3" / "BMS 16S" / "CELLS 1/2 16S" / "SYS 0.1.0"  (<= 15, bold)
+  char page[6];      // "2/7" / "7/10"                                  (<= 5, right-aligned in the bar)
   char rows[6][22];  // <= 21 monospace chars each
   uint8_t nrows;     // rows in use (always 6 here)
 };
@@ -543,11 +591,14 @@ inline void build_main_can(const SharedState &s, const VescFresh &f, OledMain &o
 
 // ---- grid helpers ---------------------------------------------------------------
 // Zeroes the grid and fills the title bar: title left, "n/N" (1-based screen index) right.
+// The index is clamped to the last screen: a page indicator never reads above N/N, and the
+// bound keeps "%u/%u" within the 5-char budget for -Wformat-truncation (SCREEN_COUNT <= 11).
 inline void grid_begin(OledGrid &g, const char *title, uint8_t screen) {
   memset(&g, 0, sizeof g);
   copy_str(g.title, sizeof g.title, title);
   clip(g.title, sizeof g.title, kTitleChars);
-  snprintf(g.page, sizeof g.page, "%u/%u", (unsigned)screen + 1u, (unsigned)SCREEN_COUNT);
+  const unsigned page = screen < SCREEN_COUNT ? (unsigned)screen + 1u : (unsigned)SCREEN_COUNT;
+  snprintf(g.page, sizeof g.page, "%u/%u", page, (unsigned)SCREEN_COUNT);
   clip(g.page, sizeof g.page, kPageChars);
   g.nrows = kGridRows;
 }
@@ -648,6 +699,119 @@ inline void fmt_uptime(char *buf, size_t n, uint32_t sec) {
   else if (sec < 100u * 86400u) snprintf(buf, n, "%lud%02luh", (unsigned long)(sec / 86400u), (unsigned long)((sec / 3600u) % 24u));
   else snprintf(buf, n, "%lud", (unsigned long)(sec / 86400u));
 }
+
+#if BMS_UI_ENABLE
+// ---- BMS pieces -------------------------------------------------------------------
+// The BMS screens show live values only while the link is streaming AND the last
+// decoded cell-info frame is within BMS_STALE_MS: the link state alone is not
+// enough (a link that stopped delivering frames must not keep stale cells alive),
+// and a fresh stamp alone is not either (the link may have dropped since).
+inline bool bms_streaming(const BmsState &b, uint32_t now) {
+  return b.link == BMS_LINK_STREAM && fresh(b.t_ms, now, BMS_STALE_MS);
+}
+
+// Pack current / power in the display sign: BMS_CURRENT_SIGN 1 negates the JK value
+// (positive = charging) so a discharge reads positive like the BA/PW cells do.
+inline float bms_signed(int32_t v) { return BMS_CURRENT_SIGN ? -(float)v : (float)v; }
+
+// Age of a producer stamp; 0 when the producer stamped after our `now` was read (never 49 days).
+inline uint32_t age_clamped(uint32_t t_ms, uint32_t now) {
+  const uint32_t ms = (uint32_t)(now - t_ms);
+  return (int32_t)ms < 0 ? 0u : ms;
+}
+
+// Cell voltage "3.347" from millivolts. 10 V and more is no cell (a decode error):
+// "--" rather than a 6-char number that would push its row past 21 characters.
+inline void fmt_cell_mv(char *buf, size_t n, uint16_t mv) {
+  if (mv >= 10000u) fmt_dashes(buf, n);
+  else snprintf(buf, n, "%u.%03u", (unsigned)mv / 1000u, (unsigned)mv % 1000u);
+}
+
+// "lo 9:3.347" / "hi14:3.352": 2-char label, index right-aligned in 2, no blank before
+// the colon (two of these fill the 21-char row exactly); "lo --" when the producer has
+// no index (0 = no non-zero cell) or an implausible one (a JK BMS has <= 32 cells).
+inline void fmt_cell_ref(char *buf, size_t n, const char *label, uint8_t idx, uint16_t mv) {
+  char v[8];
+  if (idx < 1 || idx > 32) {
+    snprintf(buf, n, "%s --", label);
+    return;
+  }
+  fmt_cell_mv(v, sizeof v, mv);
+  snprintf(buf, n, "%s%2u:%s", label, (unsigned)idx % 100u, v);
+}
+
+// Temperature from 0.1 degC units with `dec` decimals ("6", "-3", "2.5"); "--" outside
+// -40..200 degC (sensor absent / decode error, like the VESC temperatures).
+inline void fmt_temp_d(char *buf, size_t n, int16_t t_d, int dec) {
+  const float t = (float)t_d / 10.0f;
+  if (temp_plausible(t)) fmt_num(buf, n, t, dec, 5);
+  else fmt_dashes(buf, n);
+}
+
+// One CELLS slot (<= 10 chars): "%2u <volts>" + 'L' / 'H' on the pack's lowest / highest
+// cell, "%2u --" for a cell the pack does not have, one beyond BMS_CELLS_MAX, or any cell
+// while not streaming. No trailing blank (the marker is appended only when there is one).
+inline void fmt_cell_slot(char *buf, size_t n, const BmsState &b, bool live, unsigned cell) {
+  const bool have = live && cell >= 1u && cell <= (unsigned)b.cell_count && cell <= (unsigned)BMS_CELLS_MAX;
+  if (!have) {
+    snprintf(buf, n, "%2u --", cell % 100u);
+    return;
+  }
+  char v[8];
+  fmt_cell_mv(v, sizeof v, b.cell_mv[cell - 1u]);
+  snprintf(buf, n, "%2u %s", cell % 100u, v);
+  if (cell == b.cell_min_idx) append_str(buf, n, "L");
+  else if (cell == b.cell_max_idx) append_str(buf, n, "H");
+}
+
+// Status row of the BMS screen while nothing live is shown (<= 21 chars; "last" = age
+// of the last decoded frame, omitted before the first one):
+//   "BLE OFF    no BMS"      BLE not started / init failed
+//   "SCAN 34s   last 2m"     scanning for 34 s ("SCAN 34s" alone before any frame; "SCAN" if the
+//                           scan start was never stamped)
+//   "SCAN 1m    app open?"   scanning for BMS_APP_HINT_S+ with no frame ever: a JK BMS takes one
+//                           central, so the phone app probably holds the link
+//   "CONNECTING last 2m"     connect request in flight
+//   "SETUP      last 2m"     connected: MTU / discovery / subscribe pending
+//   "CONNECTED  layout ?"    frames arrive but the cell layout could not be detected
+//   "NO DATA    last 12s"    streaming state, but the last frame is older than BMS_STALE_MS
+//   "WAIT DATA"              streaming state, first frame pending
+inline void build_bms_status(const BmsState &b, uint32_t now, char *row) {
+  char l[24], r[16], age[8];
+  const bool seen = b.t_ms != 0;
+  if (seen) {
+    fmt_age_short(age, sizeof age, age_clamped(b.t_ms, now));
+    snprintf(r, sizeof r, "last %s", age);
+  } else {
+    r[0] = '\0';
+  }
+  switch (b.link) {
+    case BMS_LINK_OFF: row2(row, "BLE OFF", "no BMS"); return;
+    case BMS_LINK_SCANNING: {
+      const uint32_t scan_ms = b.link_since_ms ? age_clamped(b.link_since_ms, now) : 0u;
+      if (b.link_since_ms) {
+        fmt_age_short(age, sizeof age, scan_ms);
+        snprintf(l, sizeof l, "SCAN %s", age);
+      } else {
+        snprintf(l, sizeof l, "SCAN");
+      }
+      if (!seen && b.link_since_ms && scan_ms >= (uint32_t)BMS_APP_HINT_S * 1000u) row2(row, l, "app open?");
+      else row2(row, l, r);
+      return;
+    }
+    case BMS_LINK_CONNECTING: row2(row, "CONNECTING", r); return;
+    case BMS_LINK_SETUP:
+      if (b.proto == BMS_PROTO_UNKNOWN && b.frames_ok > 0) row2(row, "CONNECTED", "layout ?");
+      else row2(row, "SETUP", r);
+      return;
+    case BMS_LINK_STREAM:
+      if (seen) row2(row, "NO DATA", r);
+      else row1(row, "WAIT DATA");
+      return;
+    default: row2(row, "BLE ?", r); return;  // unknown link value: stay defined
+  }
+}
+#endif  // BMS_UI_ENABLE
 
 }  // namespace oled_detail
 
@@ -983,16 +1147,129 @@ inline void oled_build_eff(const SharedState &s, uint32_t now, OledGrid &g) {
   row2(g.rows[5], l, r);
 }
 
+#if BMS_UI_ENABLE
+// "BMS 16S" (cell count once a frame was decoded, else "BMS"): live only while
+// bms_streaming(); otherwise row 0 explains the link (build_bms_status) and the
+// value rows keep their labels with "--" (the delta row gives way to the status).
+//   Vbat 53.56 Ibat 12.4    pack V (2 decimals), pack A (1 decimal; discharge positive with BMS_CURRENT_SIGN 1)
+//   P 664W     SOC 87%      pack power (same sign as Ibat, kW from 10 kW), state of charge
+//   Ah 269.4/310 cyc 17     remaining / nominal capacity, cycles (the count gets the room the capacities leave, >= 3 chars)
+//   T 6/6      MOS 2.5      T1/T2 whole degrees, MOSFET temperature with a decimal ("--" outside -40..200)
+//   lo 9:3.347 hi14:3.352   lowest and highest cell as index:volts ("lo --" without an index)
+//   d 5mV CD bal 0.00A      cell delta, charge/discharge MOSFET flags ('-' = off), balance current (JK sign, <= 4 chars)
+//   d 5mV CD ALM CELLUV+    with an alarm the balance current gives way to the first set bit's name, '+' = more bits;
+//                           "mV" is dropped when a wide delta would push the row past 21 ("d 123 CD ALM CELLUV+")
+inline void oled_build_bms(const SharedState &s, uint32_t now, OledGrid &g) {
+  using namespace oled_detail;
+  const BmsState &b = s.bms;
+  char title[16], l[48], r[48], a[8], c[8], tail[24];
+  if (b.t_ms != 0 && b.cell_count > 0) snprintf(title, sizeof title, "BMS %uS", (unsigned)b.cell_count);
+  else snprintf(title, sizeof title, "BMS");
+  grid_begin(g, title, SCREEN_BMS);
+
+  if (!bms_streaming(b, now)) {
+    build_bms_status(b, now, g.rows[0]);
+    row2(g.rows[1], "Vbat --", "Ibat --");
+    row2(g.rows[2], "P --", "SOC --");
+    row2(g.rows[3], "Ah --", "cyc --");
+    row2(g.rows[4], "T --", "MOS --");
+    row2(g.rows[5], "lo --", "hi --");
+    return;
+  }
+
+  labeled(l, sizeof l, "Vbat", true, (float)b.pack_mv / 1000.0f, 2, 5);
+  labeled(r, sizeof r, "Ibat", true, bms_signed(b.current_ma) / 1000.0f, 1, 5);
+  row2(g.rows[0], l, r);
+
+  fmt_power(a, sizeof a, bms_signed(b.power_mw) / 1000.0f, 6);
+  snprintf(l, sizeof l, "P %s", a);
+  snprintf(r, sizeof r, "SOC %u%%", (unsigned)b.soc_pct);
+  row2(g.rows[1], l, r);
+
+  // "Ah 269.4/310" is <= 13 chars ("Ah " + 5 + "/" + 4); the cycle count takes what is left after one blank and "cyc "
+  fmt_num(a, sizeof a, (float)b.remaining_mah / 1000.0f, 1, 5);
+  fmt_num(c, sizeof c, (float)b.nominal_mah / 1000.0f, 0, 4);
+  snprintf(l, sizeof l, "Ah %s/%s", a, c);
+  const size_t used = strlen(l) + 1u + 4u;
+  size_t cyc_chars = (size_t)kGridChars > used ? (size_t)kGridChars - used : 0u;
+  if (cyc_chars < 3u) cyc_chars = 3u;
+  labeled_count(r, sizeof r, "cyc", b.cycle_count, cyc_chars);
+  row2(g.rows[2], l, r);
+
+  fmt_temp_d(a, sizeof a, b.t1_d, 0);
+  fmt_temp_d(c, sizeof c, b.t2_d, 0);
+  snprintf(l, sizeof l, "T %s/%s", a, c);
+  fmt_temp_d(a, sizeof a, b.mos_d, 1);
+  snprintf(r, sizeof r, "MOS %s", a);
+  row2(g.rows[3], l, r);
+
+  fmt_cell_ref(l, sizeof l, "lo", b.cell_min_idx, b.cell_min_mv);
+  fmt_cell_ref(r, sizeof r, "hi", b.cell_max_idx, b.cell_max_mv);
+  row2(g.rows[4], l, r);
+
+  // last row (no descenders): delta, MOSFET flags, then the balance current or the active alarm
+  fmt_count(a, sizeof a, b.cell_delta_mv, 4);
+  const char chg = b.chg_mos_on ? 'C' : '-';
+  const char dis = b.dis_mos_on ? 'D' : '-';
+  if (b.errors != 0) {
+    unsigned first = 0, count = 0;
+    for (unsigned bit = 0; bit < 32u; ++bit) {
+      if (b.errors & (1u << bit)) {
+        if (count == 0) first = bit;
+        ++count;
+      }
+    }
+    snprintf(tail, sizeof tail, "ALM %s%s", oled_bms_error_name(first), count > 1u ? "+" : "");
+  } else {
+    fmt_num(c, sizeof c, (float)b.balance_ma / 1000.0f, 2, 4);
+    snprintf(tail, sizeof tail, "bal %sA", c);
+  }
+  snprintf(l, sizeof l, "d %smV %c%c %s", a, chg, dis, tail);
+  if (strlen(l) > (size_t)kGridChars) snprintf(l, sizeof l, "d %s %c%c %s", a, chg, dis, tail);
+  row1(g.rows[5], l);
+}
+
+// CELLS page `page` (0-based): 12 cells in two columns, column-major (rows 0..5 left =
+// cells 12p+1..12p+6, right = 12p+7..12p+12), slots as fmt_cell_slot builds them. The
+// title is the screen name ("CELLS 1/2", so the log and the bar agree) plus the last
+// reported cell count ("CELLS 1/2 16S") once a frame was decoded.
+inline void oled_build_cells(const SharedState &s, uint32_t now, uint8_t page, OledGrid &g) {
+  using namespace oled_detail;
+  const BmsState &b = s.bms;
+  if (page >= (uint8_t)BMS_CELL_PAGES) page = (uint8_t)(BMS_CELL_PAGES - 1);
+  char title[24], l[24], r[24];
+  if (b.t_ms != 0 && b.cell_count > 0) snprintf(title, sizeof title, "%s %uS", oled_cells_name(page), (unsigned)b.cell_count);
+  else snprintf(title, sizeof title, "%s", oled_cells_name(page));
+  grid_begin(g, title, (uint8_t)(SCREEN_CELLS_0 + page));
+  const bool live = bms_streaming(b, now);
+  for (int row = 0; row < kGridRows; ++row) {
+    const unsigned first = (unsigned)page * 12u + (unsigned)row + 1u;
+    fmt_cell_slot(l, sizeof l, b, live, first);
+    fmt_cell_slot(r, sizeof r, b, live, first + 6u);
+    row2(g.rows[row], l, r);
+  }
+}
+#endif  // BMS_UI_ENABLE
+
 // Builds the frame for `screen` (unknown indices fall back to the main screen).
 inline void oled_build_frame(const SharedState &s, uint32_t now, uint8_t screen, const OledSysInfo &info,
                              OledFrame &out) {
   memset(&out, 0, sizeof out);
   out.screen = screen < SCREEN_COUNT ? screen : (uint8_t)SCREEN_MAIN;
+#if BMS_UI_ENABLE
+  if (out.screen >= SCREEN_CELLS_0 && out.screen <= SCREEN_CELLS_LAST) {  // a range: one page per 12 cells
+    oled_build_cells(s, now, (uint8_t)(out.screen - SCREEN_CELLS_0), out.grid);
+    return;
+  }
+#endif
   switch (out.screen) {
     case SCREEN_EFF: oled_build_eff(s, now, out.grid); break;
     case SCREEN_VESC_A: oled_build_vesc_a(s, now, out.grid); break;
     case SCREEN_VESC_B: oled_build_vesc_b(s, now, out.grid); break;
     case SCREEN_VESC_C: oled_build_vesc_c(s, now, out.grid); break;
+#if BMS_UI_ENABLE
+    case SCREEN_BMS: oled_build_bms(s, now, out.grid); break;
+#endif
     case SCREEN_GNSS: oled_build_gnss(s, now, out.grid); break;
     case SCREEN_SYS: oled_build_sys(s, now, info, out.grid); break;
     default: oled_build_main(s, now, out.main); break;

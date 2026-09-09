@@ -11,6 +11,7 @@ SharedState g_state{};
 volatile uint32_t hb_can = 0;
 volatile uint32_t hb_gnss = 0;
 volatile uint32_t hb_disp = 0;
+volatile uint32_t hb_bms = 0;
 
 static SemaphoreHandle_t s_mutex = nullptr;
 static SharedState s_last_snapshot{};

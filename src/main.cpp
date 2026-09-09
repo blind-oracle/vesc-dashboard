@@ -16,6 +16,7 @@
 #include "display.h"
 #include "gnss_ubx.h"
 #include "shared_state.h"
+#include "bms_ble.h"
 #include "trip.h"
 
 static const char *TAG = "main";
@@ -23,7 +24,7 @@ static const char *TAG = "main";
 // Log tags of this project. Their runtime level is raised to the compile-time level of the
 // project sources (LOG_LOCAL_LEVEL; platformio.ini may set -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG),
 // so the debug lines can be switched on without touching the IDF components' own tags.
-static const char *const kLogTags[] = {"main", "can", "gnss", "oled", "trip"};
+static const char *const kLogTags[] = {"main", "can", "gnss", "oled", "trip", "bms"};
 
 [[maybe_unused]] static const char *resetReasonStr(esp_reset_reason_t r) {  // log-only
   switch (r) {
@@ -51,6 +52,12 @@ static void logConfig() {
            OLED_HEIGHT, OLED_ROTATION, OLED_PERIOD_MS, (unsigned long)OLED_IDLE_DIM_MS);
   ESP_LOGI(TAG, "cfg GNSS: rx=%d tx=%d rate=%d ms unit=%s rxbuf=%d", PIN_GNSS_RX, PIN_GNSS_TX, GNSS_RATE_MS,
            SPEED_UNIT_STR, GNSS_RX_BUFFER);
+#if BMS_BLE_ENABLE
+  ESP_LOGI(TAG, "cfg BMS : ble=1 addr=%s name=%s* proto=%d cells<=%d sign=%s stale=%d ms prio=%d", BMS_BLE_ADDR[0] ? BMS_BLE_ADDR : "(scan)",
+           BMS_BLE_NAME_PREFIX, BMS_PROTOCOL, BMS_CELLS_MAX, BMS_CURRENT_SIGN ? "dis+" : "chg+", BMS_STALE_MS, BMS_TASK_PRIO);
+#else
+  ESP_LOGI(TAG, "cfg BMS : ble=0 (build -e bms to enable)");
+#endif
 }
 
 static inline void led_set(bool on) { gpio_set_level((gpio_num_t)PIN_LED, on ? 1 : 0); }
@@ -88,11 +95,14 @@ static void setup() {
   err = esp_task_wdt_add(NULL);
   if (err != ESP_OK) ESP_LOGE(TAG, "task WDT add failed: %s", esp_err_to_name(err));
 
+  // BLE first: the first controller enable may store the PHY calibration blob in NVS, and the TWAI
+  // ISR is not cache-safe, so the CAN node must not exist yet while that flash write happens.
+  [[maybe_unused]] const bool bmsOk = bms_ble_start();
   [[maybe_unused]] const bool canOk = can_vesc_start();  // log-only
   [[maybe_unused]] const bool gnssOk = gnss_start();
   [[maybe_unused]] const bool dispOk = display_start();
   [[maybe_unused]] const bool tripOk = trip_start();
-  ESP_LOGI(TAG, "started: can=%d gnss=%d display=%d trip=%d", canOk, gnssOk, dispOk, tripOk);
+  ESP_LOGI(TAG, "started: can=%d gnss=%d display=%d trip=%d bms=%d", canOk, gnssOk, dispOk, tripOk, bmsOk);
 }
 
 // A heartbeat that was never touched counts as fresh during the first max_age ms
@@ -107,7 +117,7 @@ static bool hbOk(uint32_t hb, uint32_t now, uint32_t max_age) {
 }
 
 static void loop() {
-  static uint32_t nextVescLog = 0, nextGnssLog = 0, nextTripLog = 0, nextSysLog = 0, nextStaleLog = 0, nextBlink = 0;
+  static uint32_t nextVescLog = 0, nextGnssLog = 0, nextTripLog = 0, nextBmsLog = 0, nextSysLog = 0, nextStaleLog = 0, nextBlink = 0;
   static bool led = false;
 
   // Snapshot BEFORE reading the clock: every timestamp inside s must be <= now,
@@ -120,7 +130,8 @@ static void loop() {
   const bool canAlive = hbOk(hb_can, now, HB_MAX_CAN_MS);
   const bool gnssAlive = hbOk(hb_gnss, now, HB_MAX_GNSS_MS);
   const bool dispAlive = hbOk(hb_disp, now, HB_MAX_DISP_MS);
-  if (canAlive && gnssAlive && dispAlive) {
+  const bool bmsAlive = (HB_MAX_BMS_MS > 0) ? hbOk(hb_bms, now, HB_MAX_BMS_MS) : true;  // 0 = not gated
+  if (canAlive && gnssAlive && dispAlive && bmsAlive) {
     esp_task_wdt_reset();
   } else if ((int32_t)(now - nextStaleLog) >= 0) {
     nextStaleLog = now + 1000;
@@ -151,12 +162,23 @@ static void loop() {
     nextTripLog = now + LOG_TRIP_MS;
     trip_log_summary(s, now);
   }
+  if (LOG_BMS_MS && BMS_BLE_ENABLE && (int32_t)(now - nextBmsLog) >= 0) {
+    nextBmsLog = now + LOG_BMS_MS;
+    bms_log_summary(s, now);
+  }
   if (LOG_SYS_MS && (int32_t)(now - nextSysLog) >= 0) {
     nextSysLog = now + LOG_SYS_MS;
+#if BMS_BLE_ENABLE
+    const char *bmsLink = bms_link_str(s.bms.link);
+    const uint32_t bmsFrames = s.bms.frames_ok;
+#else
+    const char *bmsLink = "OFF";
+    const uint32_t bmsFrames = 0;
+#endif
     ESP_LOGI(TAG,
              "SYS up=%lus reset=%s heap=%lu minheap=%lu lockfail=%lu | can=%s tec=%lu rec=%lu busoff=%lu | disp ok=%d "
              "refreshes=%lu skipped=%lu dim=%d scr=%u btn=%lu | poll sent=%lu ok=%lu bad=%lu to=%lu | hb can=%lu "
-             "gnss=%lu disp=%lu",
+             "gnss=%lu disp=%lu | bms=%s frm=%lu hb=%lu",
              (unsigned long)(now / 1000), resetReasonStr(esp_reset_reason()), (unsigned long)esp_get_free_heap_size(),
              (unsigned long)esp_get_minimum_free_heap_size(), (unsigned long)s.lock_failures, can_state_str(s.can.state),
              (unsigned long)s.can.tec, (unsigned long)s.can.rec, (unsigned long)s.can.bus_off_count, s.disp.init_ok,
@@ -164,7 +186,8 @@ static void loop() {
              (unsigned)s.disp.screen, (unsigned long)s.disp.button_presses, (unsigned long)s.vesc_ext.polls_sent,
              (unsigned long)s.vesc_ext.replies_ok, (unsigned long)s.vesc_ext.replies_bad,
              (unsigned long)s.vesc_ext.timeouts, (unsigned long)age_ms(hb_can, now),
-             (unsigned long)age_ms(hb_gnss, now), (unsigned long)age_ms(hb_disp, now));
+             (unsigned long)age_ms(hb_gnss, now), (unsigned long)age_ms(hb_disp, now), bmsLink, (unsigned long)bmsFrames,
+             (unsigned long)(BMS_BLE_ENABLE ? age_ms(hb_bms, now) : 0));  // 0 = no BMS task in this build
   }
 
   vTaskDelay(pdMS_TO_TICKS(100));

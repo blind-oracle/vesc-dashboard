@@ -1,8 +1,9 @@
 // Unity tests (pio test -e native) for the pure OLED screen builders in
-// include/display_strings_oled.h: main screen cells, clock arithmetic, the six
-// grid screens (efficiency, VESC 1-3, GNSS, SYS), the live/latched fault row,
-// freshness rules, character budgets, determinism. Fault names come from
-// vesc_getvalues.h (checked here as used).
+// include/display_strings_oled.h: main screen cells, clock arithmetic, the grid
+// screens (efficiency, VESC 1-3, BMS and CELLS pages when BMS_UI_ENABLE, GNSS,
+// SYS), the live/latched fault row, freshness rules, character budgets,
+// determinism. Fault names come from vesc_getvalues.h (checked here as used).
+// The native env builds with -DBMS_BLE_ENABLE=1, so the BMS screens are in.
 // Compiles with: -std=c++17 -DUNIT_TEST -Iinclude ; includes only Arduino-free headers.
 #include <unity.h>
 
@@ -142,6 +143,72 @@ static void fill_trip(SharedState &s, uint32_t t) {
   s.trip.counter_resets = 0;
 }
 
+#if BMS_UI_ENABLE
+// JK BMS streaming: 16S pack, every cell 3.348 V except cell 9 (3.347, the lowest) and cell 14 (3.352, the highest),
+// pack 53.56 V, 12.4 A discharging (JK sign: -12400 mA), 664 W, SOC 87 %, 269.4 of 310 Ah, 17 cycles, T1/T2 6.0/6.1 C,
+// MOS 2.5 C, both MOSFETs on, no balancing, no alarm; the link was entered 30 s before the frame.
+static void fill_bms(SharedState &s, uint32_t t) {
+  BmsState &b = s.bms;
+  b.t_ms = t;
+  b.link = BMS_LINK_STREAM;
+  b.proto = BMS_PROTO_JK02_32S;
+  b.cell_count = 16;
+  for (int i = 0; i < BMS_CELLS_MAX; ++i) b.cell_mv[i] = i < 16 ? 3348 : 0;
+  if (BMS_CELLS_MAX > 8) b.cell_mv[8] = 3347;
+  if (BMS_CELLS_MAX > 13) b.cell_mv[13] = 3352;
+  b.cell_min_mv = 3347;
+  b.cell_max_mv = 3352;
+  b.cell_avg_mv = 3348;
+  b.cell_delta_mv = 5;
+  b.cell_min_idx = 9;
+  b.cell_max_idx = 14;
+  b.pack_mv = 53560;
+  b.current_ma = -12400;
+  b.power_mw = -664144;  // 53.56 V x -12.4 A
+  b.t1_d = 60;
+  b.t2_d = 61;
+  b.mos_d = 25;
+  b.soc_pct = 87;
+  b.soh_pct = 100;
+  b.remaining_mah = 269400;
+  b.nominal_mah = 310000;
+  b.cycle_count = 17;
+  b.balance_ma = 0;
+  b.balance_action = 0;
+  b.chg_mos_on = true;
+  b.dis_mos_on = true;
+  b.errors = 0;
+  snprintf(b.model, sizeof b.model, "JK_PB2A16S20P");
+  snprintf(b.sw, sizeof b.sw, "14.20");
+  snprintf(b.addr, sizeof b.addr, "c8:47:8c:12:34:56");
+  b.rssi = -67;
+  b.mtu = 247;
+  b.link_since_ms = t - 30000;
+  b.frames_ok = 1234;
+  b.connects = 1;
+}
+
+// The pack current rows depend on the configured sign (config.h BMS_CURRENT_SIGN, overridable with -D).
+#if BMS_CURRENT_SIGN
+static const char *const kBmsRow0 = "Vbat 53.56 Ibat 12.4";      // JK -12400 mA (discharging) reads positive
+static const char *const kBmsRow1 = "P 664W     SOC 87%";
+static const char *const kBmsRow0Chg = "Vbat 53.56 Ibat -12.4";  // JK +12400 mA (charging) reads negative
+static const char *const kBmsRow1Chg = "P -664W    SOC 87%";
+#else
+static const char *const kBmsRow0 = "Vbat 53.56 Ibat -12.4";     // JK app convention: charge positive
+static const char *const kBmsRow1 = "P -664W    SOC 87%";
+static const char *const kBmsRow0Chg = "Vbat 53.56 Ibat 12.4";
+static const char *const kBmsRow1Chg = "P 664W     SOC 87%";
+#endif
+
+// Title of CELLS page `page`: the screen name, plus " <n>S" once a cell count is known.
+static const char *cells_title(char *buf, size_t n, uint8_t page, unsigned cells) {
+  if (cells) snprintf(buf, n, "%s %uS", oled_screen_name((uint8_t)(SCREEN_CELLS_0 + page)), cells);
+  else snprintf(buf, n, "%s", oled_screen_name((uint8_t)(SCREEN_CELLS_0 + page)));
+  return buf;
+}
+#endif  // BMS_UI_ENABLE
+
 static SharedState make_state(uint32_t t) {
   SharedState s;
   memset(&s, 0, sizeof s);
@@ -151,6 +218,9 @@ static SharedState make_state(uint32_t t) {
   fill_vesc(s, t);
   fill_gnss(s, t);
   fill_trip(s, t);
+#if BMS_UI_ENABLE
+  fill_bms(s, t);
+#endif
   s.disp.button_presses = 12;
   return s;
 }
@@ -158,6 +228,12 @@ static SharedState make_state(uint32_t t) {
 // "<label> <number> <EFF_UNIT_STR>" as the efficiency rows print it ("now 123 Wh/NM" / "now 123 Wh/km").
 static const char *eff_row(char *buf, size_t n, const char *label, const char *num) {
   snprintf(buf, n, "%s %s %s", label, num, EFF_UNIT_STR);
+  return buf;
+}
+
+// "n/N" as grid_begin prints it: N = SCREEN_COUNT, which grows with the BMS screens (BMS_UI_ENABLE / BMS_CELL_PAGES).
+static const char *expect_page(char *buf, size_t n, uint8_t screen) {
+  snprintf(buf, n, "%u/%u", (unsigned)screen + 1u, (unsigned)SCREEN_COUNT);
   return buf;
 }
 
@@ -705,11 +781,34 @@ static void test_fmt_age_short() {
 }
 
 static void test_screen_names_and_count() {
+#if BMS_UI_ENABLE
+  TEST_ASSERT_EQUAL_INT(8 + BMS_CELL_PAGES, (int)SCREEN_COUNT);  // the 7 base screens + BMS + one CELLS page per 12 cells
+  TEST_ASSERT_EQUAL_INT(5, (int)SCREEN_BMS);                      // right after VESC 3/3
+  TEST_ASSERT_EQUAL_INT(6, (int)SCREEN_CELLS_0);
+  TEST_ASSERT_EQUAL_INT(6 + BMS_CELL_PAGES - 1, (int)SCREEN_CELLS_LAST);
+  TEST_ASSERT_EQUAL_INT((int)SCREEN_CELLS_LAST + 1, (int)SCREEN_GNSS);  // GNSS / SYS stay the last two
+  TEST_ASSERT_EQUAL_STRING("BMS", oled_screen_name(SCREEN_BMS));
+  for (unsigned p = 0; p < (unsigned)BMS_CELL_PAGES; ++p) {
+    char exp[16];
+    if (BMS_CELL_PAGES == 1) snprintf(exp, sizeof exp, "CELLS");
+    else snprintf(exp, sizeof exp, "CELLS %u/%u", p + 1u, (unsigned)BMS_CELL_PAGES);
+    TEST_ASSERT_EQUAL_STRING(exp, oled_screen_name((uint8_t)(SCREEN_CELLS_0 + p)));
+  }
+#if BMS_CELLS_MAX == 24
+  TEST_ASSERT_EQUAL_INT(10, (int)SCREEN_COUNT);
+  TEST_ASSERT_EQUAL_STRING("CELLS 1/2", oled_screen_name(SCREEN_CELLS_0));
+  TEST_ASSERT_EQUAL_STRING("CELLS 2/2", oled_screen_name(SCREEN_CELLS_LAST));
+#endif
+#else
   TEST_ASSERT_EQUAL_INT(7, (int)SCREEN_COUNT);
+#endif
   TEST_ASSERT_EQUAL_INT(0, (int)SCREEN_MAIN);
   TEST_ASSERT_EQUAL_INT(1, (int)SCREEN_EFF);  // right after MAIN: one short press from the dashboard
   TEST_ASSERT_EQUAL_INT(2, (int)SCREEN_VESC_A);
-  TEST_ASSERT_EQUAL_INT(6, (int)SCREEN_SYS);
+  TEST_ASSERT_EQUAL_INT(3, (int)SCREEN_VESC_B);
+  TEST_ASSERT_EQUAL_INT(4, (int)SCREEN_VESC_C);
+  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 2, (int)SCREEN_GNSS);
+  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 1, (int)SCREEN_SYS);
   TEST_ASSERT_EQUAL_STRING("MAIN", oled_screen_name(SCREEN_MAIN));
   TEST_ASSERT_EQUAL_STRING("EFF", oled_screen_name(SCREEN_EFF));
   TEST_ASSERT_EQUAL_STRING("VESC 1/3", oled_screen_name(SCREEN_VESC_A));
@@ -718,6 +817,14 @@ static void test_screen_names_and_count() {
   TEST_ASSERT_EQUAL_STRING("GNSS", oled_screen_name(SCREEN_GNSS));
   TEST_ASSERT_EQUAL_STRING("SYS", oled_screen_name(SCREEN_SYS));
   TEST_ASSERT_EQUAL_STRING("?", oled_screen_name(SCREEN_COUNT));
+  TEST_ASSERT_EQUAL_STRING("?", oled_screen_name(255));
+  // every real screen has a name (the log line prints it) and no two screens share one
+  for (unsigned i = 0; i < (unsigned)SCREEN_COUNT; ++i) {
+    TEST_ASSERT_TRUE(strcmp("?", oled_screen_name((uint8_t)i)) != 0);
+    TEST_ASSERT_TRUE(strlen(oled_screen_name((uint8_t)i)) >= 3);
+    for (unsigned j = i + 1; j < (unsigned)SCREEN_COUNT; ++j)
+      TEST_ASSERT_TRUE(strcmp(oled_screen_name((uint8_t)i), oled_screen_name((uint8_t)j)) != 0);
+  }
 }
 
 // ---------------------------------------------------------------- number formatting helpers
@@ -787,7 +894,7 @@ static void test_eff_rows_sample_trip() {
   OledGrid g = build_grid(SCREEN_EFF, make_state(NOW), NOW);
   char exp[32];
   TEST_ASSERT_EQUAL_STRING("EFFICIENCY", g.title);
-  TEST_ASSERT_EQUAL_STRING("2/7", g.page);
+  TEST_ASSERT_EQUAL_STRING(expect_page(exp, sizeof exp, SCREEN_EFF), g.page);
   TEST_ASSERT_EQUAL_STRING(eff_row(exp, sizeof exp, "now", "123"), g.rows[0]);   // >= 100: whole Wh per unit
   TEST_ASSERT_EQUAL_STRING(eff_row(exp, sizeof exp, "avg", "98.5"), g.rows[1]);  // < 100: one decimal
   TEST_ASSERT_EQUAL_STRING("dist 12.34 1.23kWh", g.rows[2]);  // 1234.5 - 4.5 = 1230 Wh net
@@ -1030,8 +1137,9 @@ static void test_fmt_wh_and_energy_helpers() {
 // ---------------------------------------------------------------- grid: VESC 1/3
 static void test_vesc_a_rows() {
   OledGrid g = build_grid(SCREEN_VESC_A, make_state(NOW), NOW);
+  char pg[8];
   TEST_ASSERT_EQUAL_STRING("VESC 1/3", g.title);
-  TEST_ASSERT_EQUAL_STRING("3/7", g.page);
+  TEST_ASSERT_EQUAL_STRING(expect_page(pg, sizeof pg, SCREEN_VESC_A), g.page);
   TEST_ASSERT_EQUAL_STRING("FAULT none", g.rows[0]);  // fresh reply, no fault, nothing latched
   TEST_ASSERT_EQUAL_STRING("Vin 48.2   Ibat 12.4", g.rows[1]);
   TEST_ASSERT_EQUAL_STRING("Imot 35    Duty 45%", g.rows[2]);
@@ -1133,8 +1241,9 @@ static void test_vesc_a_latched_fault_with_age() {
 static void test_vesc_b_rows() {
   SharedState s = make_state(NOW);
   OledGrid g = build_grid(SCREEN_VESC_B, s, NOW);
+  char pg[8];
   TEST_ASSERT_EQUAL_STRING("VESC 2/3", g.title);
-  TEST_ASSERT_EQUAL_STRING("4/7", g.page);
+  TEST_ASSERT_EQUAL_STRING(expect_page(pg, sizeof pg, SCREEN_VESC_B), g.page);
   TEST_ASSERT_EQUAL_STRING("Tmos 45.1  Iin 12.4", g.rows[0]);  // first MOSFET sensor + the VESC's averaged input current
   TEST_ASSERT_EQUAL_STRING("Id 0.3     Iq 34.9", g.rows[1]);
   TEST_ASSERT_EQUAL_STRING("Vd 1.23    Vq 23.45", g.rows[2]);
@@ -1191,8 +1300,9 @@ static void test_vesc_b_rows() {
 static void test_vesc_c_rows() {
   SharedState s = make_state(NOW);
   OledGrid g = build_grid(SCREEN_VESC_C, s, NOW);
+  char pg[8];
   TEST_ASSERT_EQUAL_STRING("VESC 3/3", g.title);
-  TEST_ASSERT_EQUAL_STRING("5/7", g.page);
+  TEST_ASSERT_EQUAL_STRING(expect_page(pg, sizeof pg, SCREEN_VESC_C), g.page);
   TEST_ASSERT_EQUAL_STRING("PPM 0.52   PID 12.3", g.rows[0]);
   TEST_ASSERT_EQUAL_STRING("ADC 1.23 2.10 0.00", g.rows[1]);
 #if VESC_POLL_MS > 0
@@ -1231,8 +1341,9 @@ static void test_vesc_c_rows() {
 // ---------------------------------------------------------------- grid: GNSS
 static void test_gnss_rows() {
   OledGrid g = build_grid(SCREEN_GNSS, make_state(NOW), NOW);
+  char pg[8];
   TEST_ASSERT_EQUAL_STRING("GNSS", g.title);
-  TEST_ASSERT_EQUAL_STRING("6/7", g.page);
+  TEST_ASSERT_EQUAL_STRING(expect_page(pg, sizeof pg, SCREEN_GNSS), g.page);
   TEST_ASSERT_EQUAL_STRING("3D 9sv     pDOP 1.5", g.rows[0]);
   TEST_ASSERT_EQUAL_STRING("59.43701N 24.75368W", g.rows[1]);  // 5 decimals, rounded, hemisphere letters
   TEST_ASSERT_EQUAL_STRING("Alt 12.3m  hAcc 2.1m", g.rows[2]);
@@ -1343,7 +1454,7 @@ static void test_sys_rows() {
   char title[24];
   snprintf(title, sizeof title, "SYS %s", FW_VERSION);
   TEST_ASSERT_EQUAL_STRING(title, g.title);
-  TEST_ASSERT_EQUAL_STRING("7/7", g.page);
+  TEST_ASSERT_EQUAL_STRING(expect_page(title, sizeof title, SCREEN_SYS), g.page);
   TEST_ASSERT_EQUAL_STRING("up 1h23m   btn 12", g.rows[0]);
   TEST_ASSERT_EQUAL_STRING("heap 250k  min 240k", g.rows[1]);
   TEST_ASSERT_EQUAL_STRING("CAN RUN    T0 R0", g.rows[2]);
@@ -1407,6 +1518,422 @@ static void test_sys_variants() {
   assert_grid_lengths(g);
 }
 
+#if BMS_UI_ENABLE
+// ---------------------------------------------------------------- grid: BMS
+static void test_bms_rows_streaming() {
+  OledGrid g = build_grid(SCREEN_BMS, make_state(NOW), NOW);
+  char pg[8];
+  TEST_ASSERT_EQUAL_STRING("BMS 16S", g.title);
+  TEST_ASSERT_EQUAL_STRING(expect_page(pg, sizeof pg, SCREEN_BMS), g.page);
+  TEST_ASSERT_EQUAL_STRING(kBmsRow0, g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING(kBmsRow1, g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("Ah 269.4/310 cyc 17", g.rows[2]);  // 12-char left text pushes the second column to 13
+  TEST_ASSERT_EQUAL_STRING("T 6/6      MOS 2.5", g.rows[3]);   // 6.0 / 6.1 C whole degrees, MOS with a decimal
+  TEST_ASSERT_EQUAL_STRING("lo 9:3.347 hi14:3.352", g.rows[4]);  // exactly 21 chars
+  TEST_ASSERT_EQUAL_STRING("d 5mV CD bal 0.00A", g.rows[5]);
+  assert_grid_lengths(g);
+#if BMS_CURRENT_SIGN
+  TEST_ASSERT_EQUAL_STRING("Vbat 53.56 Ibat 12.4", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("P 664W     SOC 87%", g.rows[1]);
+#endif
+}
+
+static void test_bms_sign_convention_and_wide_values() {
+  SharedState s = make_state(NOW);
+  // JK reports charging as positive: with BMS_CURRENT_SIGN 1 the screen shows it negative (like the BA/PW cells)
+  s.bms.current_ma = 12400;
+  s.bms.power_mw = 664144;
+  OledGrid g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING(kBmsRow0Chg, g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING(kBmsRow1Chg, g.rows[1]);
+  // a wide current keeps the row within 21 by dropping its decimal; power switches to kW from 10 kW
+  s.bms.current_ma = -123400;
+  s.bms.power_mw = -6609304;  // 53.56 V x -123.4 A
+  g = build_grid(SCREEN_BMS, s, NOW);
+#if BMS_CURRENT_SIGN
+  TEST_ASSERT_EQUAL_STRING("Vbat 53.56 Ibat 123.4", g.rows[0]);  // exactly 21 chars
+  TEST_ASSERT_EQUAL_STRING("P 6609W    SOC 87%", g.rows[1]);
+#else
+  TEST_ASSERT_EQUAL_STRING("Vbat 53.56 Ibat -123", g.rows[0]);  // "-123.4" would be 6 + the label
+  TEST_ASSERT_EQUAL_STRING("P -6609W   SOC 87%", g.rows[1]);
+#endif
+  s.bms.current_ma = -250000;
+  s.bms.power_mw = -13390000;
+  s.bms.pack_mv = 100400;
+  s.bms.soc_pct = 100;
+  g = build_grid(SCREEN_BMS, s, NOW);
+#if BMS_CURRENT_SIGN
+  TEST_ASSERT_EQUAL_STRING("Vbat 100.4 Ibat 250.0", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("P 13.4kW   SOC 100%", g.rows[1]);
+#else
+  TEST_ASSERT_EQUAL_STRING("Vbat 100.4 Ibat -250", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("P -13kW    SOC 100%", g.rows[1]);
+#endif
+  assert_grid_lengths(g);
+  // capacities: the remaining Ah keep a decimal while it fits, the cycle count takes the room that is left
+  s = make_state(NOW);
+  s.bms.remaining_mah = 1234600;
+  s.bms.nominal_mah = 1500000;
+  s.bms.cycle_count = 1234;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("Ah 1235/1500 cyc 1234", g.rows[2]);  // exactly 21: "1234.6" would need 6 numeric chars
+  s.bms.remaining_mah = 12345600;
+  s.bms.cycle_count = 12345;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("Ah 12346/1500 cyc 12k", g.rows[2]);  // 13-char left text: the count shrinks to 3 chars
+  s.bms.remaining_mah = 4294967295u;
+  s.bms.nominal_mah = 4294967295u;
+  s.bms.cycle_count = 4294967295u;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("Ah 4295k/4M cyc 4295M", g.rows[2]);  // exactly 21: "4295k" needs 5 numeric chars, the nominal gets 4; bounded, never clipped
+  s.bms.remaining_mah = 0;
+  s.bms.nominal_mah = 0;
+  s.bms.cycle_count = 0;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("Ah 0.0/0   cyc 0", g.rows[2]);  // a short left text keeps the second column at 11
+  assert_grid_lengths(g);
+  // lowest / highest cell: index 0 = none; an index beyond 32 is a decode error; 10 V+ is no cell
+  s = make_state(NOW);
+  s.bms.cell_min_idx = 0;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("lo --      hi14:3.352", g.rows[4]);
+  s.bms.cell_min_idx = 32;
+  s.bms.cell_max_idx = 33;
+  s.bms.cell_min_mv = 9999;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("lo32:9.999 hi --", g.rows[4]);
+  s.bms.cell_min_mv = 10000;
+  s.bms.cell_max_idx = 1;
+  s.bms.cell_max_mv = 65535;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("lo32:--    hi 1:--", g.rows[4]);
+  s.bms.cell_max_mv = 0;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("lo32:--    hi 1:0.000", g.rows[4]);
+  assert_grid_lengths(g);
+  // delta / balance current budgets: 4 chars each, so the row never exceeds 21
+  s = make_state(NOW);
+  s.bms.cell_delta_mv = 1234;
+  s.bms.balance_ma = -1230;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 1234mV CD bal -1.2A", g.rows[5]);  // exactly 21: the sign costs a decimal
+  s.bms.cell_delta_mv = 65535;
+  s.bms.balance_ma = 32767;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 66kmV CD bal 32.8A", g.rows[5]);
+  s.bms.cell_delta_mv = 0;
+  s.bms.balance_ma = -32768;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 0mV CD bal -33A", g.rows[5]);
+  s.bms.balance_ma = 1230;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 0mV CD bal 1.23A", g.rows[5]);
+  s.bms.balance_ma = -4;  // never "-0.00"
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 0mV CD bal 0.00A", g.rows[5]);
+  assert_grid_lengths(g);
+}
+
+static void test_bms_mos_flags_and_alarm_row() {
+  SharedState s = make_state(NOW);
+  s.bms.chg_mos_on = false;
+  OledGrid g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 5mV -D bal 0.00A", g.rows[5]);
+  s.bms.chg_mos_on = true;
+  s.bms.dis_mos_on = false;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 5mV C- bal 0.00A", g.rows[5]);
+  s.bms.chg_mos_on = false;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 5mV -- bal 0.00A", g.rows[5]);
+  // an alarm replaces the balance current by the first set bit's name, '+' when more bits are set
+  s.bms.chg_mos_on = true;
+  s.bms.dis_mos_on = true;
+  s.bms.errors = 1u << 11;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 5mV CD ALM CELLUV", g.rows[5]);
+  s.bms.errors = (1u << 11) | (1u << 12);
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 5mV CD ALM CELLUV+", g.rows[5]);
+  s.bms.errors = 1u << 0;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 5mV CD ALM WIRE_R", g.rows[5]);
+  s.bms.errors = 1u << 31;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 5mV CD ALM BIT31", g.rows[5]);
+  s.bms.errors = 0xFFFFFFFFu;
+  s.bms.dis_mos_on = false;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 5mV C- ALM WIRE_R+", g.rows[5]);
+  assert_grid_lengths(g);
+  // a 6-char name with '+' and a 3-digit delta would be 22 chars: the "mV" goes, the digits stay
+  s.bms.dis_mos_on = true;
+  s.bms.errors = (1u << 11) | (1u << 12);
+  s.bms.cell_delta_mv = 12;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 12mV CD ALM CELLUV+", g.rows[5]);  // exactly 21: unit kept
+  s.bms.cell_delta_mv = 123;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 123 CD ALM CELLUV+", g.rows[5]);
+  s.bms.errors = 1u << 11;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 123mV CD ALM CELLUV", g.rows[5]);  // exactly 21 without the '+'
+  s.bms.cell_delta_mv = 1234;
+  s.bms.errors = 0xFFFFFFFFu;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("d 1234 CD ALM WIRE_R+", g.rows[5]);  // exactly 21
+  assert_grid_lengths(g);
+  // the name table: 32 entries, bit 0 first, <= 6 chars, distinct, "?" beyond
+  TEST_ASSERT_EQUAL_STRING("WIRE_R", oled_bms_error_name(0));
+  TEST_ASSERT_EQUAL_STRING("CELLUV", oled_bms_error_name(11));
+  TEST_ASSERT_EQUAL_STRING("PACKUV", oled_bms_error_name(12));
+  TEST_ASSERT_EQUAL_STRING("GPSLCK", oled_bms_error_name(28));
+  TEST_ASSERT_EQUAL_STRING("BIT31", oled_bms_error_name(31));
+  TEST_ASSERT_EQUAL_STRING("?", oled_bms_error_name(32));
+  for (unsigned i = 0; i < 32; ++i) {
+    TEST_ASSERT_TRUE(strlen(oled_bms_error_name(i)) >= 3 && strlen(oled_bms_error_name(i)) <= 6);
+    for (unsigned j = i + 1; j < 32; ++j) TEST_ASSERT_TRUE(strcmp(oled_bms_error_name(i), oled_bms_error_name(j)) != 0);
+  }
+}
+
+static void test_bms_temperatures() {
+  SharedState s = make_state(NOW);
+  s.bms.t1_d = -30;
+  s.bms.t2_d = -20;
+  OledGrid g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("T -3/-2    MOS 2.5", g.rows[3]);
+  s.bms.t1_d = -400;  // the plausibility limits are inclusive
+  s.bms.t2_d = 2000;
+  s.bms.mos_d = -400;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("T -40/200  MOS -40.0", g.rows[3]);
+  s.bms.t1_d = 2010;  // 201 C: no sensor / decode error
+  s.bms.mos_d = 1234;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("T --/200   MOS 123.4", g.rows[3]);
+  s.bms.t2_d = -410;
+  s.bms.mos_d = 2005;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("T --/--    MOS --", g.rows[3]);
+  s.bms.t1_d = 32767;
+  s.bms.t2_d = -32768;
+  s.bms.mos_d = -32768;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("T --/--    MOS --", g.rows[3]);
+  s.bms.t1_d = 236;  // 23.6 -> "24"
+  s.bms.t2_d = 4;    // 0.4 -> "0"
+  s.bms.mos_d = -4;  // never "-0.4"? it is a real -0.4: shown; -0.04 would be "0.0"
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("T 24/0     MOS -0.4", g.rows[3]);
+  assert_grid_lengths(g);
+}
+
+static void assert_bms_dashes(const OledGrid &g) {
+  TEST_ASSERT_EQUAL_STRING("Vbat --    Ibat --", g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("P --       SOC --", g.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("Ah --      cyc --", g.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("T --       MOS --", g.rows[4]);
+  TEST_ASSERT_EQUAL_STRING("lo --      hi --", g.rows[5]);
+  assert_grid_lengths(g);
+}
+
+static void test_bms_status_rows_per_link_state() {
+  SharedState s = make_state(NOW);
+  // BLE off (init failed / not started); the title keeps the last known cell count, "BMS" before any frame
+  s.bms.link = BMS_LINK_OFF;
+  OledGrid g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("BMS 16S", g.title);
+  TEST_ASSERT_EQUAL_STRING("BLE OFF    no BMS", g.rows[0]);
+  assert_bms_dashes(g);
+  s.bms.t_ms = 0;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("BMS", g.title);
+  TEST_ASSERT_EQUAL_STRING("BLE OFF    no BMS", g.rows[0]);
+  assert_bms_dashes(g);
+  // scanning: how long, and the age of the last frame when there was one
+  s.bms.link = BMS_LINK_SCANNING;
+  s.bms.link_since_ms = NOW - 34000;
+  s.bms.t_ms = NOW - 120000;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("SCAN 34s   last 2m", g.rows[0]);
+  assert_bms_dashes(g);
+  s.bms.t_ms = 0;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("SCAN 34s", g.rows[0]);
+  s.bms.link_since_ms = NOW - (uint32_t)BMS_APP_HINT_S * 1000u + 1u;  // one ms short of the hint
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("SCAN 59s", g.rows[0]);
+  s.bms.link_since_ms = NOW - (uint32_t)BMS_APP_HINT_S * 1000u;  // no frame ever after BMS_APP_HINT_S: the phone app probably holds the link
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("SCAN 1m    app open?", g.rows[0]);
+  s.bms.t_ms = NOW - 120000;  // a frame was seen once: no hint, the age of the last frame instead
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("SCAN 1m    last 2m", g.rows[0]);
+  s.bms.link_since_ms = 0;  // scan start never stamped
+  s.bms.t_ms = NOW - 5000;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("SCAN       last 5s", g.rows[0]);
+  assert_bms_dashes(g);  // a fresh frame does not count while the link is not streaming
+  s.bms.link_since_ms = NOW + 10;  // stamped after our "now": 0 s, never 49 d
+  s.bms.t_ms = NOW + 10;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("SCAN 0s    last 0s", g.rows[0]);
+  s.bms.link_since_ms = 1;  // scanning since boot, 27 h ago
+  s.bms.t_ms = 0;
+  g = build_grid(SCREEN_BMS, s, 3600000u * 27u + 1u);
+  TEST_ASSERT_EQUAL_STRING("SCAN 1d    app open?", g.rows[0]);
+  // connecting / setup
+  s.bms.link = BMS_LINK_CONNECTING;
+  s.bms.t_ms = NOW - 120000;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("CONNECTING last 2m", g.rows[0]);  // 10-char left text: second column still at 11
+  assert_bms_dashes(g);
+  s.bms.t_ms = 0;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("CONNECTING", g.rows[0]);
+  s.bms.link = BMS_LINK_SETUP;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("SETUP", g.rows[0]);
+  s.bms.t_ms = NOW - 120000;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("SETUP      last 2m", g.rows[0]);
+  assert_bms_dashes(g);
+  s.bms.proto = BMS_PROTO_UNKNOWN;  // frames arrive but neither layout is plausible
+  s.bms.frames_ok = 3;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("CONNECTED  layout ?", g.rows[0]);
+  s.bms.frames_ok = 0;  // unknown layout with no frame yet is plain setup
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("SETUP      last 2m", g.rows[0]);
+  // streaming: live exactly at the stale limit, "NO DATA" beyond it, "WAIT DATA" before the first frame
+  s = make_state(NOW);
+  s.bms.t_ms = NOW - BMS_STALE_MS;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING(kBmsRow0, g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("d 5mV CD bal 0.00A", g.rows[5]);
+  s.bms.t_ms = NOW - BMS_STALE_MS - 1;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("BMS 16S", g.title);
+  TEST_ASSERT_EQUAL_STRING("NO DATA    last 10s", g.rows[0]);
+  assert_bms_dashes(g);
+  s.bms.t_ms = NOW - 7200000u;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("NO DATA    last 2h", g.rows[0]);
+  s.bms.t_ms = NOW + 10;  // producer ahead of our "now": stale, never a lie
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("NO DATA    last 0s", g.rows[0]);
+  assert_bms_dashes(g);
+  s.bms.t_ms = 0;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("BMS", g.title);
+  TEST_ASSERT_EQUAL_STRING("WAIT DATA", g.rows[0]);
+  assert_bms_dashes(g);
+  // the millis() wrap: frame stamped just before, viewed just after
+  s.bms.t_ms = 0xFFFFFF00u;
+  g = build_grid(SCREEN_BMS, s, 0x00000100u);
+  TEST_ASSERT_EQUAL_STRING(kBmsRow0, g.rows[0]);
+  // an unknown link value stays defined
+  s = make_state(NOW);
+  s.bms.link = 200;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("BLE ?      last 0s", g.rows[0]);
+  assert_bms_dashes(g);
+}
+
+// ---------------------------------------------------------------- grid: CELLS
+static void test_cells_pages() {
+  SharedState s = make_state(NOW);
+  char exp[32];
+  OledGrid g = build_grid(SCREEN_CELLS_0, s, NOW);
+  TEST_ASSERT_EQUAL_STRING(cells_title(exp, sizeof exp, 0, 16), g.title);
+  TEST_ASSERT_EQUAL_STRING(expect_page(exp, sizeof exp, SCREEN_CELLS_0), g.page);
+#if BMS_CELLS_MAX >= 16
+  // page 0: cells 1..6 left, 7..12 right (column-major), 'L' on the lowest cell
+  TEST_ASSERT_EQUAL_STRING(" 1 3.348    7 3.348", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING(" 2 3.348    8 3.348", g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING(" 3 3.348    9 3.347L", g.rows[2]);
+  TEST_ASSERT_EQUAL_STRING(" 4 3.348   10 3.348", g.rows[3]);
+  TEST_ASSERT_EQUAL_STRING(" 5 3.348   11 3.348", g.rows[4]);
+  TEST_ASSERT_EQUAL_STRING(" 6 3.348   12 3.348", g.rows[5]);
+  assert_grid_lengths(g);
+#if BMS_CELL_PAGES >= 2
+  // page 1: cells 13..16 exist, 17..24 do not ("--"), 'H' on the highest cell
+  g = build_grid(SCREEN_CELLS_0 + 1, s, NOW);
+  TEST_ASSERT_EQUAL_STRING(cells_title(exp, sizeof exp, 1, 16), g.title);
+  TEST_ASSERT_EQUAL_STRING(expect_page(exp, sizeof exp, SCREEN_CELLS_0 + 1), g.page);
+  TEST_ASSERT_EQUAL_STRING("13 3.348   19 --", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("14 3.352H  20 --", g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("15 3.348   21 --", g.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("16 3.348   22 --", g.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("17 --      23 --", g.rows[4]);
+  TEST_ASSERT_EQUAL_STRING("18 --      24 --", g.rows[5]);
+  assert_grid_lengths(g);
+#if BMS_CELLS_MAX == 24
+  TEST_ASSERT_EQUAL_STRING("CELLS 2/2 16S", g.title);
+  TEST_ASSERT_EQUAL_STRING("8/10", g.page);
+  // a pack with more cells than BMS_CELLS_MAX stores: the stored ones show, the rest read "--"
+  s.bms.cell_count = 32;
+  for (int i = 0; i < BMS_CELLS_MAX; ++i) s.bms.cell_mv[i] = (uint16_t)(3300 + i);
+  s.bms.cell_min_idx = 1;
+  s.bms.cell_max_idx = 32;  // beyond the stored cells: no 'H' anywhere
+  g = build_grid(SCREEN_CELLS_0 + 1, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("CELLS 2/2 32S", g.title);
+  TEST_ASSERT_EQUAL_STRING("13 3.312   19 3.318", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("18 3.317   24 3.323", g.rows[5]);
+  g = build_grid(SCREEN_CELLS_0, s, NOW);
+  TEST_ASSERT_EQUAL_STRING(" 1 3.300L   7 3.306", g.rows[0]);
+  for (int r = 0; r < kGridRows; ++r) TEST_ASSERT_NULL(strchr(g.rows[r], 'H'));
+  assert_grid_lengths(g);
+  s = make_state(NOW);
+#endif
+#endif
+  // the same cell as lowest and highest (a one-cell delta of 0): 'L' wins
+  s.bms.cell_max_idx = 9;
+  g = build_grid(SCREEN_CELLS_0, s, NOW);
+  TEST_ASSERT_EQUAL_STRING(" 3 3.348    9 3.347L", g.rows[2]);
+  s.bms.cell_max_idx = 14;
+  // a 10 V+ "cell" is a decode error: dashes, the marker still tells which cell the producer meant
+  s.bms.cell_mv[0] = 65535;
+  s.bms.cell_max_idx = 1;
+  s.bms.cell_mv[8] = 0;  // a 0 mV cell is printed as such (the producer excludes zeros from min/max itself)
+  g = build_grid(SCREEN_CELLS_0, s, NOW);
+  TEST_ASSERT_EQUAL_STRING(" 1 --H      7 3.348", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING(" 3 3.348    9 0.000L", g.rows[2]);
+  assert_grid_lengths(g);
+  s = make_state(NOW);
+#endif
+  // not streaming: every slot "--", the title keeps the last known count, then loses it with the stamp
+  s.bms.t_ms = NOW - BMS_STALE_MS - 1;
+  for (uint8_t p = 0; p < (uint8_t)BMS_CELL_PAGES; ++p) {
+    g = build_grid((uint8_t)(SCREEN_CELLS_0 + p), s, NOW);
+    TEST_ASSERT_EQUAL_STRING(cells_title(exp, sizeof exp, p, 16), g.title);
+    for (int r = 0; r < kGridRows; ++r) {
+      snprintf(exp, sizeof exp, "%2u --      %2u --", (unsigned)p * 12u + (unsigned)r + 1u, (unsigned)p * 12u + (unsigned)r + 7u);
+      TEST_ASSERT_EQUAL_STRING(exp, g.rows[r]);
+    }
+    assert_grid_lengths(g);
+  }
+  s.bms.t_ms = NOW;
+  s.bms.link = BMS_LINK_SCANNING;  // a fresh frame from a link that dropped: not live either
+  g = build_grid(SCREEN_CELLS_0, s, NOW);
+  TEST_ASSERT_EQUAL_STRING(" 1 --       7 --", g.rows[0]);
+  s.bms.t_ms = 0;
+  g = build_grid(SCREEN_CELLS_0, s, NOW);
+  TEST_ASSERT_EQUAL_STRING(cells_title(exp, sizeof exp, 0, 0), g.title);
+  TEST_ASSERT_EQUAL_STRING(oled_screen_name(SCREEN_CELLS_0), g.title);
+  TEST_ASSERT_EQUAL_STRING(" 1 --       7 --", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING(" 6 --      12 --", g.rows[5]);
+  assert_grid_lengths(g);
+  // every CELLS page has its own name in the bar and differs from its neighbours
+  for (uint8_t p = 0; p < (uint8_t)BMS_CELL_PAGES; ++p) {
+    OledFrame f;
+    oled_build_frame(make_state(NOW), NOW, (uint8_t)(SCREEN_CELLS_0 + p), kInfo, f);
+    TEST_ASSERT_EQUAL_UINT8(SCREEN_CELLS_0 + p, f.screen);
+    TEST_ASSERT_TRUE(strncmp(f.grid.title, oled_screen_name((uint8_t)(SCREEN_CELLS_0 + p)), strlen(oled_screen_name((uint8_t)(SCREEN_CELLS_0 + p)))) == 0);
+  }
+}
+#endif  // BMS_UI_ENABLE
+
 // ---------------------------------------------------------------- frames: dispatch, determinism, boot
 static void test_frame_dispatch_and_determinism() {
   SharedState s = make_state(NOW);
@@ -1429,6 +1956,8 @@ static void test_frame_dispatch_and_determinism() {
       assert_grid_lengths(a.grid);
       // the title starts with the screen name ("SYS" is followed by the firmware version)
       TEST_ASSERT_TRUE(strncmp(a.grid.title, oled_screen_name(sc), strlen(oled_screen_name(sc))) == 0);
+      char pg[8];
+      TEST_ASSERT_EQUAL_STRING(expect_page(pg, sizeof pg, sc), a.grid.page);
       for (int r = 0; r < kGridRows; ++r) assert_zero_tail(a.grid.rows[r], sizeof a.grid.rows[r]);
       for (size_t i = 0; i < sizeof a.main; ++i) TEST_ASSERT_EQUAL_HEX8(0, ((const uint8_t *)&a.main)[i]);
     }
@@ -1500,6 +2029,22 @@ static void test_extreme_values_respect_budgets_and_buffers() {
   s.trip.eff_avg = 3.0e9f;
   s.trip.win_fill_s = 255;
   s.trip.counter_resets = 4294967295u;
+#if BMS_UI_ENABLE
+  s.bms.cell_count = 255;
+  for (int i = 0; i < BMS_CELLS_MAX; ++i) s.bms.cell_mv[i] = 65535;
+  s.bms.cell_min_mv = s.bms.cell_max_mv = s.bms.cell_avg_mv = s.bms.cell_delta_mv = 65535;
+  s.bms.cell_min_idx = s.bms.cell_max_idx = 255;
+  s.bms.pack_mv = 4294967295u;
+  s.bms.current_ma = -2147483647 - 1;
+  s.bms.power_mw = -2147483647 - 1;
+  s.bms.t1_d = s.bms.t2_d = s.bms.mos_d = -32768;
+  s.bms.soc_pct = s.bms.soh_pct = 255;
+  s.bms.remaining_mah = s.bms.nominal_mah = s.bms.cycle_count = 4294967295u;
+  s.bms.balance_ma = -32768;
+  s.bms.errors = 0xFFFFFFFFu;
+  s.bms.frames_ok = 4294967295u;
+  s.bms.link_since_ms = 1;
+#endif
   OledSysInfo info = {4294967295u, 4294967295u, 4294967295u, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"};
 
   for (uint8_t sc = 0; sc < SCREEN_COUNT; ++sc) {
@@ -1561,6 +2106,17 @@ static void test_never_received_state() {
   TEST_ASSERT_EQUAL_STRING("CAN UNINST T0 R0", g.rows[2]);
   TEST_ASSERT_EQUAL_STRING("GNSS AUTOBAUD", g.rows[3]);
   TEST_ASSERT_EQUAL_STRING("ubx 0/0 rd 0", g.rows[4]);
+#if BMS_UI_ENABLE
+  g = build_grid(SCREEN_BMS, z, NOW);  // BLE never started: link OFF, no frame
+  TEST_ASSERT_EQUAL_STRING("BMS", g.title);
+  TEST_ASSERT_EQUAL_STRING("BLE OFF    no BMS", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("Vbat --    Ibat --", g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("lo --      hi --", g.rows[5]);
+  g = build_grid(SCREEN_CELLS_0, z, NOW);
+  TEST_ASSERT_EQUAL_STRING(oled_screen_name(SCREEN_CELLS_0), g.title);
+  TEST_ASSERT_EQUAL_STRING(" 1 --       7 --", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING(" 6 --      12 --", g.rows[5]);
+#endif
 }
 
 static void test_boot_frame() {
@@ -1672,6 +2228,14 @@ int main(int, char **) {
   RUN_TEST(test_gnss_extreme_values);
   RUN_TEST(test_sys_rows);
   RUN_TEST(test_sys_variants);
+#if BMS_UI_ENABLE
+  RUN_TEST(test_bms_rows_streaming);
+  RUN_TEST(test_bms_sign_convention_and_wide_values);
+  RUN_TEST(test_bms_mos_flags_and_alarm_row);
+  RUN_TEST(test_bms_temperatures);
+  RUN_TEST(test_bms_status_rows_per_link_state);
+  RUN_TEST(test_cells_pages);
+#endif
   RUN_TEST(test_frame_dispatch_and_determinism);
   RUN_TEST(test_extreme_values_respect_budgets_and_buffers);
   RUN_TEST(test_never_received_state);
