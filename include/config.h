@@ -1,4 +1,4 @@
-// boat-motor configuration
+// vesc-dashboard configuration
 // ----------------------------------------------------------------------------
 // THE one header you edit to match your wiring and preferences. Nothing else in
 // the project hard-codes a pin. Every value is wrapped in #ifndef so it can also
@@ -126,19 +126,19 @@
 // counters (STATUS_3), falling back to v_in x current_in integration while
 // STATUS_3 is not being received. Efficiency = Wh per distance unit.
 #ifndef TRIP_PERIOD_MS
-#define TRIP_PERIOD_MS 200      // integrator tick (matches the 5 Hz GNSS rate)
+#define TRIP_PERIOD_MS 200 // integrator tick (matches the 5 Hz GNSS rate)
 #endif
 #ifndef EFF_WINDOW_S
-#define EFF_WINDOW_S 10         // "now" efficiency = last this many seconds
+#define EFF_WINDOW_S 10 // "now" efficiency = last this many seconds
 #endif
 #ifndef EFF_MIN_SPEED_MM_S
-#define EFF_MIN_SPEED_MM_S 500  // below this ground speed no distance is integrated (GNSS drift at the mooring); 500 mm/s ~ 1 kn
+#define EFF_MIN_SPEED_MM_S 500 // below this ground speed no distance is integrated (GNSS drift at the mooring); 500 mm/s ~ 1 kn
 #endif
 #ifndef EFF_MIN_DIST_M
-#define EFF_MIN_DIST_M 10       // a window / trip shorter than this shows "--" instead of a meaningless ratio
+#define EFF_MIN_DIST_M 10 // a window / trip shorter than this shows "--" instead of a meaningless ratio
 #endif
 #ifndef EFF_UNIT_KM
-#define EFF_UNIT_KM 0           // 0 = follow the speed unit (knots -> Wh/NM, km/h -> Wh/km); 1 = always Wh/km
+#define EFF_UNIT_KM 0 // 0 = follow the speed unit (knots -> Wh/NM, km/h -> Wh/km); 1 = always Wh/km
 #endif
 
 // ============================================================================
@@ -149,40 +149,40 @@
 // environment (sdkconfig.defaults.bms enables the NimBLE host). A JK BMS accepts ONE
 // BLE central: the phone app cannot be connected at the same time.
 #ifndef BMS_BLE_ENABLE
-#define BMS_BLE_ENABLE 0          // 1 = build the NimBLE client + bmsTask (needs 'pio run -e bms'); 0 = no BLE code at all
+#define BMS_BLE_ENABLE 0 // 1 = build the NimBLE client + bmsTask (needs 'pio run -e bms'); 0 = no BLE code at all
 #endif
 #ifndef BMS_BLE_ADDR
-#define BMS_BLE_ADDR ""           // BMS Bluetooth MAC "C8:47:8C:12:34:56" = connect by address (passive scan); "" = match by name prefix / 0xFFE0 (active scan)
+#define BMS_BLE_ADDR "" // BMS Bluetooth MAC "C8:47:8C:12:34:56" = connect by address (passive scan); "" = match by name prefix / 0xFFE0 (active scan)
 #endif
 #ifndef BMS_BLE_NAME_PREFIX
-#define BMS_BLE_NAME_PREFIX "JK"  // advertised name prefix ("JK-..." / "JK_..."); the name is user-editable in the JK app
+#define BMS_BLE_NAME_PREFIX "JK" // advertised name prefix ("JK-..." / "JK_..."); the name is user-editable in the JK app
 #endif
 #ifndef BMS_PROTOCOL
-#define BMS_PROTOCOL 0            // 0 = auto (device-info sw >= 11 or JK-PB -> 32S layout, else 24S; confirmed by a cell-sum check), 1 = force JK02_24S, 2 = force JK02_32S
+#define BMS_PROTOCOL 0 // 0 = auto (device-info sw >= 11 or JK-PB -> 32S layout, else 24S; confirmed by a cell-sum check), 1 = force JK02_24S, 2 = force JK02_32S
 #endif
 #ifndef BMS_CELLS_MAX
-#define BMS_CELLS_MAX 24          // 1..32 cells kept in the shared state and shown on ceil(n/12) CELLS pages
+#define BMS_CELLS_MAX 24 // 1..32 cells kept in the shared state and shown on ceil(n/12) CELLS pages
 #endif
 #ifndef BMS_CURRENT_SIGN
-#define BMS_CURRENT_SIGN 1        // 1 = discharge-positive on screen (same sign as the BA/PW cells); 0 = JK app convention (charge-positive)
+#define BMS_CURRENT_SIGN 1 // 1 = discharge-positive on screen (same sign as the BA/PW cells); 0 = JK app convention (charge-positive)
 #endif
 #ifndef BMS_STALE_MS
-#define BMS_STALE_MS 10000        // no decoded cell-info frame for this long -> every BMS value shows "--" (frames arrive every ~0.5 s)
+#define BMS_STALE_MS 10000 // no decoded cell-info frame for this long -> every BMS value shows "--" (frames arrive every ~0.5 s)
 #endif
 #ifndef BMS_RECONNECT_MS
-#define BMS_RECONNECT_MS 2000     // first back-off after a disconnect / failed connect ...
+#define BMS_RECONNECT_MS 2000 // first back-off after a disconnect / failed connect ...
 #endif
 #ifndef BMS_RECONNECT_MAX_MS
 #define BMS_RECONNECT_MAX_MS 30000 // ... doubling up to this
 #endif
 #ifndef BMS_RECONNECT_FAILS
-#define BMS_RECONNECT_FAILS 3     // direct reconnects to the last known address before falling back to scanning
+#define BMS_RECONNECT_FAILS 3 // direct reconnects to the last known address before falling back to scanning
 #endif
 #ifndef HB_MAX_BMS_MS
-#define HB_MAX_BMS_MS 0           // 0 = never gate the task watchdog on the BMS task (its heartbeat age is only logged); > 0 = gate like the other tasks
+#define HB_MAX_BMS_MS 0 // 0 = never gate the task watchdog on the BMS task (its heartbeat age is only logged); > 0 = gate like the other tasks
 #endif
 #ifndef LOG_BMS_MS
-#define LOG_BMS_MS 5000           // period of the BMS log line (0 = off)
+#define LOG_BMS_MS 5000 // period of the BMS log line (0 = off)
 #endif
 
 // ============================================================================
@@ -254,7 +254,7 @@
 #define GNSS_TARGET_BAUD 115200 // after detection the receiver's UART1 is switched to this baud (RAM+BBR); 0 = keep the detected baud. Must be in GNSS_BAUDS.
 #endif
 #ifndef GNSS_RATE_MS
-#define GNSS_RATE_MS 200    // navigation rate: 200 = 5 Hz (safe on every M8/M9/M10 with all constellations); 100 = 10 Hz needs a fast module and GNSS_TARGET_BAUD >= 38400
+#define GNSS_RATE_MS 200 // navigation rate: 200 = 5 Hz (safe on every M8/M9/M10 with all constellations); 100 = 10 Hz needs a fast module and GNSS_TARGET_BAUD >= 38400
 #endif
 #ifndef GNSS_DYNMODEL_SEA
 #define GNSS_DYNMODEL_SEA 1 // 1 = set the receiver dynamic model to SEA (5); 0 = leave the receiver default
@@ -275,7 +275,7 @@
 #define SPEED_MIN_SHOW 0.3f // speeds below this (in the display unit) are shown as 0.0 to hide GNSS drift at rest
 #endif
 #ifndef SPEED_UNIT_KNOTS
-#define SPEED_UNIT_KNOTS 0  // 1 = knots (mm/s * 0.00194384), 0 = km/h (mm/s * 0.0036)
+#define SPEED_UNIT_KNOTS 0 // 1 = knots (mm/s * 0.00194384), 0 = km/h (mm/s * 0.0036)
 #endif
 
 // ============================================================================
@@ -312,7 +312,7 @@
 #define LOG_SYS_MS 10000 // uptime / heap / reset reason / CAN health / display counters (0 = off)
 #endif
 #ifndef LOG_TRIP_MS
-#define LOG_TRIP_MS 5000    // period of the trip / efficiency log line (0 = off)
+#define LOG_TRIP_MS 5000 // period of the trip / efficiency log line (0 = off)
 #endif
 #ifndef SERIAL_BOOT_DELAY_MS
 #define SERIAL_BOOT_DELAY_MS 1500 // give the USB-Serial/JTAG host time to re-enumerate so the boot banner is visible
@@ -382,35 +382,35 @@
 #endif
 
 #ifndef GNSS_BAUD_SWITCH_ATTEMPTS
-#define GNSS_BAUD_SWITCH_ATTEMPTS 2    // unconfirmed baud switches in a row before the detected baud is kept
+#define GNSS_BAUD_SWITCH_ATTEMPTS 2 // unconfirmed baud switches in a row before the detected baud is kept
 #endif
 #ifndef GNSS_BAUD_SWITCH_SETTLE_MS
 #define GNSS_BAUD_SWITCH_SETTLE_MS 100 // u-blox: "typically 100 ms" between the baud-change message and data at the new rate
 #endif
 #ifndef TASK_PRIO_TRIP
-#define TASK_PRIO_TRIP 3          // trip integrator task: between the display (2) and the data producers (GNSS 5, CAN 6)
+#define TASK_PRIO_TRIP 3 // trip integrator task: between the display (2) and the data producers (GNSS 5, CAN 6)
 #endif
 #ifndef TRIP_TASK_STACK
-#define TRIP_TASK_STACK 4096      // bytes
+#define TRIP_TASK_STACK 4096 // bytes
 #endif
 #ifndef TRIP_DT_MAX_MS
-#define TRIP_DT_MAX_MS 5000       // longest step integrated after a stall; beyond it time is dropped, not integrated
+#define TRIP_DT_MAX_MS 5000 // longest step integrated after a stall; beyond it time is dropped, not integrated
 #endif
 #ifndef TRIP_COUNTER_RESET_WH
 #define TRIP_COUNTER_RESET_WH 0.5f // a watt-hour counter delta below -this means the VESC rebooted (counters restarted)
 #endif
 #ifndef TRIP_EFF_MIN_FILL_S
-#define TRIP_EFF_MIN_FILL_S 3     // closed one-second window buckets needed before the "now" efficiency is shown
+#define TRIP_EFF_MIN_FILL_S 3 // closed one-second window buckets needed before the "now" efficiency is shown
 #endif
 #ifndef TRIP_STALE_MS
-#define TRIP_STALE_MS 5000        // TripState older than this -> the EFFICIENCY screen shows "--"
+#define TRIP_STALE_MS 5000 // TripState older than this -> the EFFICIENCY screen shows "--"
 #endif
 
 #ifndef BMS_TASK_PRIO
-#define BMS_TASK_PRIO 4           // bmsTask: between tripTask (3) and gnssTask (5); the NimBLE host/controller tasks run at 21/23 regardless
+#define BMS_TASK_PRIO 4 // bmsTask: between tripTask (3) and gnssTask (5); the NimBLE host/controller tasks run at 21/23 regardless
 #endif
 #ifndef BMS_TASK_STACK
-#define BMS_TASK_STACK 4096       // bytes
+#define BMS_TASK_STACK 4096 // bytes
 #endif
 #ifndef BMS_CONNECT_TIMEOUT_MS
 #define BMS_CONNECT_TIMEOUT_MS 10000 // ble_gap_connect() duration; a peer that does not answer (phone app connected) costs this per attempt
@@ -422,13 +422,13 @@
 #define BMS_FIRST_FRAME_TIMEOUT_MS 15000 // first CRC-valid, plausible cell-info frame after subscribing, else terminate + back-off
 #endif
 #ifndef BMS_POLL_MS
-#define BMS_POLL_MS 5000          // 0x96 re-send period until the unsolicited cell-info stream starts
+#define BMS_POLL_MS 5000 // 0x96 re-send period until the unsolicited cell-info stream starts
 #endif
 #ifndef BMS_SCAN_FAST_MS
-#define BMS_SCAN_FAST_MS 30000    // fast scan preset duration after boot / after a disconnect ...
+#define BMS_SCAN_FAST_MS 30000 // fast scan preset duration after boot / after a disconnect ...
 #endif
 #ifndef BMS_SCAN_FAST_ITVL_MS
-#define BMS_SCAN_FAST_ITVL_MS 60  // ... interval / window of the fast preset (~50 % RX duty)
+#define BMS_SCAN_FAST_ITVL_MS 60 // ... interval / window of the fast preset (~50 % RX duty)
 #endif
 #ifndef BMS_SCAN_FAST_WINDOW_MS
 #define BMS_SCAN_FAST_WINDOW_MS 30
@@ -440,10 +440,10 @@
 #define BMS_SCAN_SLOW_WINDOW_MS 30
 #endif
 #ifndef BMS_MSG_BUF_BYTES
-#define BMS_MSG_BUF_BYTES 2048    // NimBLE host -> bmsTask message buffer (a 300-byte frame arrives as 2..15 notifications)
+#define BMS_MSG_BUF_BYTES 2048 // NimBLE host -> bmsTask message buffer (a 300-byte frame arrives as 2..15 notifications)
 #endif
 #ifndef BMS_APP_HINT_S
-#define BMS_APP_HINT_S 60         // after this long without a link the BMS screen adds the "app open?" hint
+#define BMS_APP_HINT_S 60 // after this long without a link the BMS screen adds the "app open?" hint
 #endif
 
 // ============================================================================
@@ -521,9 +521,16 @@
 namespace cfg_check
 {
   // Every GPIO in use must be unique and off the USB pair (12/13).
-  constexpr int kPins[] = {PIN_CAN_TX, PIN_CAN_RX, PIN_GNSS_RX, PIN_GNSS_TX, PIN_LED, PIN_OLED_SCL, PIN_OLED_SDA,
+  constexpr int kPins[] = {
+      PIN_CAN_TX,
+      PIN_CAN_RX,
+      PIN_GNSS_RX,
+      PIN_GNSS_TX,
+      PIN_LED,
+      PIN_OLED_SCL,
+      PIN_OLED_SDA,
 #if PIN_BUTTON >= 0
-                           PIN_BUTTON,
+      PIN_BUTTON,
 #endif
   };
 // PIN_OLED_RST is optional (-1); guard it separately.

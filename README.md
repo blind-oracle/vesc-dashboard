@@ -1,4 +1,8 @@
-# boat-motor
+# AI-warning
+
+Be advised that this whole repo is AI-generated, so take it with a grain of salt. But the code generally works very well for me.
+
+# vesc-dashboard
 
 ESP32-C6 firmware that listens to a VESC motor controller on CAN, polls it once a second for the few values its broadcasts lack (fault code, per-MOSFET temperatures, id/iq, vd/vq, absolute tachometer), reads ground speed and time from a u-blox GNSS receiver at 5 Hz, shows everything on a 128x64 monochrome OLED (SSD1309 controller, I2C) as seven screens cycled by a push button, and integrates speed and energy into a trip log with the boat's efficiency in Wh per nautical mile (or km). Built for the DFRobot FireBeetle 2 ESP32-C6 (DFR1075) with an MCP2551-class CAN transceiver, any 2.42" or 1.54" SSD1309 module switched to I2C mode and any receiver that speaks UBX (u-blox 6/7, M8, M9, M10 or a compatible clone). On the CAN bus the firmware acknowledges frames and transmits exactly one thing: a 7-byte `COMM_GET_VALUES_SELECTIVE` request every `VESC_POLL_MS` (1 s). It never sends a command or a setting; `-DVESC_POLL_MS=0` makes it strictly passive (ACK only). Optionally (`pio run -e bms`) it also reads a JK (Jikong) BMS over Bluetooth LE with the C6's own radio and adds a BMS page and two CELLS pages (ten screens); the default build contains no BLE code.
 
@@ -348,7 +352,7 @@ Prerequisites: PlatformIO Core (`pio` on the PATH, e.g. `~/.platformio/penv/bin/
 A healthy boot (ESP-IDF log format `L (ms) tag: message`; numbers and the `...` parts vary, the phrases are the ones the code prints) looks like:
 
 ```
-I (1512) main: boat-motor 0.1.0 (built Sep  7 2026 19:35:02) reset=POWERON
+I (1512) main: vesc-dashboard 0.1.0 (built Sep  7 2026 19:35:02) reset=POWERON
 I (1513) main: cfg CAN : tx=3 rx=2 500 kbit/s mode=NORMAL(ack+poll) rxq=64 vesc_id=-1 poles=10 poll=1000 ms own_id=120
 I (1514) main: cfg OLED: sda=22 scl=23 rst=14 addr=0x3C i2c=400000 Hz 128x64 rot=0 period=250 ms dim_after=600000 ms
 I (1515) main: cfg GNSS: rx=4 tx=5 rate=200 ms unit=km/h rxbuf=2048

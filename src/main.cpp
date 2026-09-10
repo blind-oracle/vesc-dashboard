@@ -1,4 +1,4 @@
-// boat-motor: ESP32-C6 (DFRobot FireBeetle 2) VESC CAN monitor + SSD1309 OLED dashboard + u-blox GNSS speed
+// vesc-dashboard: ESP32-C6 (DFRobot FireBeetle 2) VESC CAN monitor + SSD1309 OLED dashboard + u-blox GNSS speed
 //
 // app_main(): boot banner, shared state, task watchdog, start the worker tasks, then run
 // the supervisor loop forever on the main task (priority 1): it feeds the task watchdog
@@ -26,23 +26,37 @@ static const char *TAG = "main";
 // so the debug lines can be switched on without touching the IDF components' own tags.
 static const char *const kLogTags[] = {"main", "can", "gnss", "oled", "trip", "bms"};
 
-[[maybe_unused]] static const char *resetReasonStr(esp_reset_reason_t r) {  // log-only
-  switch (r) {
-    case ESP_RST_POWERON: return "POWERON";
-    case ESP_RST_EXT: return "EXT";
-    case ESP_RST_SW: return "SW";
-    case ESP_RST_PANIC: return "PANIC";
-    case ESP_RST_INT_WDT: return "INT_WDT";
-    case ESP_RST_TASK_WDT: return "TASK_WDT";
-    case ESP_RST_WDT: return "WDT";
-    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
-    case ESP_RST_BROWNOUT: return "BROWNOUT";
-    case ESP_RST_SDIO: return "SDIO";
-    default: return "UNKNOWN";
+[[maybe_unused]] static const char *resetReasonStr(esp_reset_reason_t r)
+{ // log-only
+  switch (r)
+  {
+  case ESP_RST_POWERON:
+    return "POWERON";
+  case ESP_RST_EXT:
+    return "EXT";
+  case ESP_RST_SW:
+    return "SW";
+  case ESP_RST_PANIC:
+    return "PANIC";
+  case ESP_RST_INT_WDT:
+    return "INT_WDT";
+  case ESP_RST_TASK_WDT:
+    return "TASK_WDT";
+  case ESP_RST_WDT:
+    return "WDT";
+  case ESP_RST_DEEPSLEEP:
+    return "DEEPSLEEP";
+  case ESP_RST_BROWNOUT:
+    return "BROWNOUT";
+  case ESP_RST_SDIO:
+    return "SDIO";
+  default:
+    return "UNKNOWN";
   }
 }
 
-static void logConfig() {
+static void logConfig()
+{
   ESP_LOGI(TAG, "cfg CAN : tx=%d rx=%d %d kbit/s mode=%s rxq=%d vesc_id=%d poles=%d poll=%d ms own_id=%d", PIN_CAN_TX,
            PIN_CAN_RX, CAN_BITRATE_KBPS,
            CAN_LISTEN_ONLY ? "LISTEN_ONLY" : (VESC_POLL_MS > 0 ? "NORMAL(ack+poll)" : "NORMAL(ack-only)"),
@@ -62,12 +76,14 @@ static void logConfig() {
 
 static inline void led_set(bool on) { gpio_set_level((gpio_num_t)PIN_LED, on ? 1 : 0); }
 
-static void setup() {
+static void setup()
+{
   // The console is the USB-Serial/JTAG port (sdkconfig): nothing to open, and its output is
   // dropped rather than blocked while no host is attached. The delay gives a host time to
   // re-enumerate after the reset so the boot banner shows up in the monitor.
   vTaskDelay(pdMS_TO_TICKS(SERIAL_BOOT_DELAY_MS));
-  for (const char *tag : kLogTags) esp_log_level_set(tag, (esp_log_level_t)LOG_LOCAL_LEVEL);
+  for (const char *tag : kLogTags)
+    esp_log_level_set(tag, (esp_log_level_t)LOG_LOCAL_LEVEL);
 
   gpio_config_t led = {};
   led.pin_bit_mask = 1ULL << PIN_LED;
@@ -75,7 +91,7 @@ static void setup() {
   gpio_config(&led);
   led_set(false);
 
-  ESP_LOGI(TAG, "boat-motor %s (built %s %s) reset=%s", FW_VERSION, __DATE__, __TIME__,
+  ESP_LOGI(TAG, "vesc-dashboard %s (built %s %s) reset=%s", FW_VERSION, __DATE__, __TIME__,
            resetReasonStr(esp_reset_reason()));
   logConfig();
 
@@ -90,15 +106,18 @@ static void setup() {
   wdt.idle_core_mask = 0;
   wdt.trigger_panic = true;
   esp_err_t err = esp_task_wdt_reconfigure(&wdt);
-  if (err != ESP_OK) err = esp_task_wdt_init(&wdt);  // in case the TWDT was not initialised at boot
-  if (err != ESP_OK) ESP_LOGE(TAG, "task WDT setup failed: %s", esp_err_to_name(err));
+  if (err != ESP_OK)
+    err = esp_task_wdt_init(&wdt); // in case the TWDT was not initialised at boot
+  if (err != ESP_OK)
+    ESP_LOGE(TAG, "task WDT setup failed: %s", esp_err_to_name(err));
   err = esp_task_wdt_add(NULL);
-  if (err != ESP_OK) ESP_LOGE(TAG, "task WDT add failed: %s", esp_err_to_name(err));
+  if (err != ESP_OK)
+    ESP_LOGE(TAG, "task WDT add failed: %s", esp_err_to_name(err));
 
   // BLE first: the first controller enable may store the PHY calibration blob in NVS, and the TWAI
   // ISR is not cache-safe, so the CAN node must not exist yet while that flash write happens.
   [[maybe_unused]] const bool bmsOk = bms_ble_start();
-  [[maybe_unused]] const bool canOk = can_vesc_start();  // log-only
+  [[maybe_unused]] const bool canOk = can_vesc_start(); // log-only
   [[maybe_unused]] const bool gnssOk = gnss_start();
   [[maybe_unused]] const bool dispOk = display_start();
   [[maybe_unused]] const bool tripOk = trip_start();
@@ -107,8 +126,10 @@ static void setup() {
 
 // A heartbeat that was never touched counts as fresh during the first max_age ms
 // after boot (tasks may still be starting); afterwards it must be alive.
-static bool hbOk(uint32_t hb, uint32_t now, uint32_t max_age) {
-  if (hb == 0) return now < max_age;
+static bool hbOk(uint32_t hb, uint32_t now, uint32_t max_age)
+{
+  if (hb == 0)
+    return now < max_age;
   // Signed age: a worker task can stamp its heartbeat between our clock read and
   // this comparison (every worker outranks the main task and wakes on the same tick
   // that advances the clock), so now - hb can be -1. Unsigned that is ~4e9 ms and
@@ -116,7 +137,8 @@ static bool hbOk(uint32_t hb, uint32_t now, uint32_t max_age) {
   return (int32_t)(now - hb) <= (int32_t)max_age;
 }
 
-static void loop() {
+static void loop()
+{
   static uint32_t nextVescLog = 0, nextGnssLog = 0, nextTripLog = 0, nextBmsLog = 0, nextSysLog = 0, nextStaleLog = 0, nextBlink = 0;
   static bool led = false;
 
@@ -130,10 +152,13 @@ static void loop() {
   const bool canAlive = hbOk(hb_can, now, HB_MAX_CAN_MS);
   const bool gnssAlive = hbOk(hb_gnss, now, HB_MAX_GNSS_MS);
   const bool dispAlive = hbOk(hb_disp, now, HB_MAX_DISP_MS);
-  const bool bmsAlive = (HB_MAX_BMS_MS > 0) ? hbOk(hb_bms, now, HB_MAX_BMS_MS) : true;  // 0 = not gated
-  if (canAlive && gnssAlive && dispAlive && bmsAlive) {
+  const bool bmsAlive = (HB_MAX_BMS_MS > 0) ? hbOk(hb_bms, now, HB_MAX_BMS_MS) : true; // 0 = not gated
+  if (canAlive && gnssAlive && dispAlive && bmsAlive)
+  {
     esp_task_wdt_reset();
-  } else if ((int32_t)(now - nextStaleLog) >= 0) {
+  }
+  else if ((int32_t)(now - nextStaleLog) >= 0)
+  {
     nextStaleLog = now + 1000;
     ESP_LOGE(TAG, "heartbeat stale: can=%lu ms gnss=%lu ms disp=%lu ms (reboot in <= %lu ms)",
              (unsigned long)age_ms(hb_can, now), (unsigned long)age_ms(hb_gnss, now),
@@ -143,30 +168,36 @@ static void loop() {
   // ---- LED: 1 Hz blink when VESC data is fresh, 0.2 Hz otherwise -------------
   const bool vescFresh = vesc_fresh(&s.vesc.t, VESC_IDX_STATUS_1, now, VESC_STALE_R1_MS) ||
                          vesc_fresh(&s.vesc.t, VESC_IDX_STATUS_5, now, VESC_STALE_R1_MS);
-  if ((int32_t)(now - nextBlink) >= 0) {
+  if ((int32_t)(now - nextBlink) >= 0)
+  {
     nextBlink = now + (vescFresh ? 500 : 2500);
     led = !led;
     led_set(led);
   }
 
   // ---- periodic logs (deadline based, never "now % period") ------------------
-  if (LOG_VESC_MS && (int32_t)(now - nextVescLog) >= 0) {
+  if (LOG_VESC_MS && (int32_t)(now - nextVescLog) >= 0)
+  {
     nextVescLog = now + LOG_VESC_MS;
     can_vesc_log_summary(s, now);
   }
-  if (LOG_GNSS_MS && (int32_t)(now - nextGnssLog) >= 0) {
+  if (LOG_GNSS_MS && (int32_t)(now - nextGnssLog) >= 0)
+  {
     nextGnssLog = now + LOG_GNSS_MS;
     gnss_log_summary(s, now);
   }
-  if (LOG_TRIP_MS && (int32_t)(now - nextTripLog) >= 0) {
+  if (LOG_TRIP_MS && (int32_t)(now - nextTripLog) >= 0)
+  {
     nextTripLog = now + LOG_TRIP_MS;
     trip_log_summary(s, now);
   }
-  if (LOG_BMS_MS && BMS_BLE_ENABLE && (int32_t)(now - nextBmsLog) >= 0) {
+  if (LOG_BMS_MS && BMS_BLE_ENABLE && (int32_t)(now - nextBmsLog) >= 0)
+  {
     nextBmsLog = now + LOG_BMS_MS;
     bms_log_summary(s, now);
   }
-  if (LOG_SYS_MS && (int32_t)(now - nextSysLog) >= 0) {
+  if (LOG_SYS_MS && (int32_t)(now - nextSysLog) >= 0)
+  {
     nextSysLog = now + LOG_SYS_MS;
 #if BMS_BLE_ENABLE
     const char *bmsLink = bms_link_str(s.bms.link);
@@ -187,13 +218,15 @@ static void loop() {
              (unsigned long)s.vesc_ext.replies_ok, (unsigned long)s.vesc_ext.replies_bad,
              (unsigned long)s.vesc_ext.timeouts, (unsigned long)age_ms(hb_can, now),
              (unsigned long)age_ms(hb_gnss, now), (unsigned long)age_ms(hb_disp, now), bmsLink, (unsigned long)bmsFrames,
-             (unsigned long)(BMS_BLE_ENABLE ? age_ms(hb_bms, now) : 0));  // 0 = no BMS task in this build
+             (unsigned long)(BMS_BLE_ENABLE ? age_ms(hb_bms, now) : 0)); // 0 = no BMS task in this build
   }
 
   vTaskDelay(pdMS_TO_TICKS(100));
 }
 
-extern "C" void app_main() {
+extern "C" void app_main()
+{
   setup();
-  for (;;) loop();
+  for (;;)
+    loop();
 }

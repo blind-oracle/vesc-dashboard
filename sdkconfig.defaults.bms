@@ -1,4 +1,4 @@
-# boat-motor: second sdkconfig fragment for the 'bms' env (JK BMS over BLE). Applied AFTER
+# vesc-dashboard: second sdkconfig fragment for the 'bms' env (JK BMS over BLE). Applied AFTER
 # sdkconfig.defaults via board_build.cmake_extra_args = -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.bms".
 # The builder only re-runs CMake when sdkconfig.defaults or sdkconfig.<env> changed: after editing
 # this file run `touch sdkconfig.defaults` (or delete sdkconfig.bms). All symbols verified in ESP-IDF 6.1 Kconfig.

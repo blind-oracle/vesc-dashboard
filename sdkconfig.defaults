@@ -1,4 +1,4 @@
-# boat-motor: ESP-IDF 6.1 defaults for the ESP32-C6 (DFRobot FireBeetle 2).
+# vesc-dashboard: ESP-IDF 6.1 defaults for the ESP32-C6 (DFRobot FireBeetle 2).
 # These reproduce what the Arduino core used to set implicitly. The builder derives
 # sdkconfig.<env> from this file; edit here, never in the generated file.
 CONFIG_IDF_TARGET="esp32c6"
