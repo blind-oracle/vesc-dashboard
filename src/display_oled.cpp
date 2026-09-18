@@ -3,8 +3,13 @@
 //
 // Screens (include/display_strings_oled.h, OledScreen): MAIN, EFFICIENCY, VESC 1/3,
 // VESC 2/3, VESC 3/3, GNSS, SYS. A short press of PIN_BUTTON shows the next screen
-// (wrapping), a long press (>= BUTTON_LONG_PRESS_MS) or SCREEN_AUTO_RETURN_MS
-// without a press returns to MAIN. PIN_BUTTON -1 compiles no button code at all.
+// (wrapping), a long press (>= BUTTON_LONG_PRESS_MS) returns to MAIN, and so does
+// SCREEN_AUTO_RETURN_MS without a press when that timer is enabled (it is 0 = off by
+// default). PIN_BUTTON -1 compiles no button code at all.
+//
+// Every screen change also tells the BMS task whether BMS data is on the panel
+// (bms_set_active(oled_screen_needs_bms(screen))): with BMS_LINK_ON_DEMAND the BLE
+// client only holds the link to the BMS while the BMS or a CELLS screen is shown.
 //
 // Loop / refresh policy:
 //   * The task loop runs every OLED_BUTTON_POLL_MS (20 ms): it samples the
@@ -59,6 +64,7 @@
 #include <math.h>
 #include <string.h>
 
+#include "bms_ble.h"
 #include "display_strings_oled.h"
 #include "shared_state.h"
 #include "u8g2_hal_idf.h"
@@ -555,6 +561,7 @@ static void handle_idle(DispCtx &c, uint32_t now) {
   if (next == c.screen) return false;
   c.screen = next;
   c.st.screen = next;
+  bms_set_active(oled_screen_needs_bms(next));  // BMS_LINK_ON_DEMAND: connect / disconnect with the screen
   ESP_LOGI(TAG, "display: screen %u (%s), %s", (unsigned)next, oled_screen_name(next), why);
   return true;
 }
@@ -707,6 +714,7 @@ bool display_start() {
   DispCtx &c = s_ctx;
   c = DispCtx{};  // value-initialised (Button has default member initialisers, so no memset)
   c.screen = SCREEN_MAIN;
+  bms_set_active(oled_screen_needs_bms(c.screen));  // false: the BMS link stays down until a BMS screen is selected
 
 #if PIN_BUTTON >= 0
   gpio_config_t btn = {};

@@ -8,9 +8,17 @@
 //     NimBLE API call, feeds the JK frame assembler (jk_bms.h), publishes g_state.bms as one
 //     struct copy under state_lock(50) and logs every transition at INFO.
 //
+// With BMS_LINK_ON_DEMAND (default) the radio only runs while a BMS screen is on the panel:
+// the display task calls bms_set_active() on every screen change, bmsTask latches that flag
+// once per loop and brings the link up (direct connect to the last known address, else scan)
+// or tears it down (cancel the scan / the pending connect, terminate the connection) and
+// parks in PH_OFF / BMS_LINK_IDLE. Every failure path (begin_backoff) parks there too while
+// the flag is clear, so nothing retries in the background. BMS_LINK_ON_DEMAND 0 sets the flag
+// at start-up and never clears it: the link is held from boot on, as it was before.
+//
 // Link state machine (BmsLink is what the display shows; the internal Phase is finer):
 //   OFF ---bms_ble_start()---> wait for host sync ---SYNC---> SCANNING, or CONNECTING when
-//        BMS_BLE_ADDR is set
+//        BMS_BLE_ADDR is set (IDLE while no BMS screen is shown)
 //   SCANNING: fast preset for BMS_SCAN_FAST_MS, then the slow preset (restarted every 5 min so
 //        the controller's duplicate filter forgets); an advert that matches -> CONNECTING
 //   CONNECTING: ble_gap_connect(BMS_CONNECT_TIMEOUT_MS) -> SETUP, or failure + back-off
@@ -24,6 +32,8 @@
 //        BMS_RECONNECT_MAX_MS, reset when STREAM is reached) -> direct reconnect to the known
 //        address while consecutive failures < BMS_RECONNECT_FAILS, else scan (fast preset).
 //   Host RESET -> everything forgotten, wait for the next SYNC.
+//   BMS screen closed -> scan / connect cancelled, connection terminated, PH_OFF (link IDLE)
+//        until the next bms_set_active(true).
 //
 // GATT facts (syssi/esphome-jk-bms + captures): service 0xFFE0; the old TI module and JK-PB
 // expose ONE 0xFFE1 (write | write-no-rsp | notify), the newer module TWO 0xFFE1 (one write,
@@ -77,6 +87,7 @@ static constexpr uint32_t TERMINATE_GRACE_MS = 3000;      // DISCONNECT event mu
 static constexpr uint32_t STREAM_STALL_MS = BMS_FIRST_FRAME_TIMEOUT_MS;  // no frame in STREAM: re-poll; 2x: drop the link
 static constexpr uint32_t CRC_WARN_PERIOD_MS = 10000;
 static constexpr uint32_t RSSI_POLL_MS = 5000;
+static constexpr uint32_t TASK_POLL_MS = 100;  // message-buffer receive timeout = deadline / bms_set_active() granularity
 
 // Unsigned copies of the tunables so the wrap-safe arithmetic below never mixes signedness.
 static constexpr uint32_t k_reconnect_ms = BMS_RECONNECT_MS;
@@ -344,12 +355,13 @@ static void host_task(void *) {
 }
 
 // ---------------------------------------------------------------- bmsTask state
-enum Phase : uint8_t { PH_IDLE, PH_BACKOFF, PH_SCAN, PH_CONNECT, PH_SETUP, PH_STREAM };
+enum Phase : uint8_t { PH_IDLE, PH_OFF, PH_BACKOFF, PH_SCAN, PH_CONNECT, PH_SETUP, PH_STREAM };
 enum SetupStep : uint8_t { ST_MTU, ST_SVC, ST_CHR, ST_DSC, ST_CCCD, ST_CMD_INFO, ST_CMD_CELL, ST_WAIT_FRAME };
 
 static const char *phase_str(uint8_t p) {
   switch (p) {
     case PH_IDLE: return "idle";
+    case PH_OFF: return "off";
     case PH_BACKOFF: return "backoff";
     case PH_SCAN: return "scan";
     case PH_CONNECT: return "connect";
@@ -391,6 +403,7 @@ struct Ctx {
   Phase phase;
   SetupStep step;
   bool synced;
+  bool wanted;       // latched copy of s_want: a BMS screen is on the panel (always true without BMS_LINK_ON_DEMAND)
   bool connected;    // between CONNECT(status 0) and DISCONNECT
   bool terminating;  // ble_gap_terminate() sent, DISCONNECT pending
   uint8_t own_addr_type;
@@ -443,6 +456,11 @@ static JkDevInfo s_dev;
 static MsgAny s_rx;
 static uint8_t s_frame[JK_FRAME_LEN];
 static uint32_t s_heap_before = 0;
+
+// Written by the display task (bms_set_active), read by bmsTask once per loop. A plain
+// volatile bool is enough: single writer, single reader, no state derived from it outside
+// bmsTask, and a change may be acted on one loop (TASK_POLL_MS) late.
+static volatile bool s_want = BMS_LINK_ON_DEMAND ? false : true;
 
 // ---------------------------------------------------------------- helpers
 static inline bool due(uint32_t now, uint32_t t) { return (int32_t)(now - t) >= 0; }
@@ -525,7 +543,22 @@ static void stop_scan() {
 static void start_scan(bool fast);
 static void start_connect();
 
+// Park the radio: nothing scans, connects or retries until a BMS screen is shown again.
+// The caller has already stopped whatever was running (no connection is left open here).
+static void enter_off(const char *why) {
+  if (s.phase != PH_OFF) ESP_LOGI(TAG, "%s: link off until a BMS screen is shown", why);
+  s.phase = PH_OFF;
+  s.fails = 0;  // the next open starts fresh: direct connect, first back-off again
+  s.backoff_ms = k_reconnect_ms;
+  s.force_scan = false;
+  set_link(BMS_LINK_IDLE);
+}
+
 static void begin_backoff(const char *why) {
+  if (!s.wanted) {  // no BMS screen on the panel: every failure path ends here instead of retrying
+    enter_off(why);
+    return;
+  }
   const uint32_t delay = s.backoff_ms;
   ESP_LOGI(TAG, "%s, retry in %lu ms", why, (unsigned long)delay);
   s.phase = PH_BACKOFF;
@@ -539,6 +572,10 @@ static void after_backoff() {
     s.phase = PH_IDLE;  // a host reset happened meanwhile: SYNC restarts everything
     return;
   }
+  if (!s.wanted) {  // the BMS screen went away during the back-off (apply_want() normally gets here first)
+    enter_off("back-off over");
+    return;
+  }
   if (s.peer_known && !s.force_scan && s.fails < k_reconnect_fails) {
     start_connect();
   } else {
@@ -547,23 +584,30 @@ static void after_backoff() {
   }
 }
 
+// Hangs up on the open connection (caller: s.connected && !s.terminating). true = the request went
+// out, the DISCONNECT event follows within TERMINATE_GRACE_MS and does the accounting; false = the
+// call failed and the caller must forget the connection itself. `lvl` is the level of the normal
+// line: a failure logs at WARN, a screen change at INFO.
+static bool terminate_conn(const char *why, esp_log_level_t lvl) {
+  const int rc = ble_gap_terminate(s.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+  if (rc == 0) {
+    ESP_LOG_LEVEL(lvl, TAG, "%s: terminating", why);
+    s.terminating = true;
+    s.deadline_ms = s.now + TERMINATE_GRACE_MS;
+    return true;
+  }
+  ESP_LOGW(TAG, "%s: ble_gap_terminate rc=%d", why, rc);
+  s_bms.disconnects++;  // the link is already gone; a late DISCONNECT event is ignored
+  return false;
+}
+
 // Gives up on the current attempt. With an open connection: terminate (the DISCONNECT event then
 // runs the back-off); otherwise back off right away.
 static void fail_conn(const char *why, bool count_fail) {
   if (count_fail) s.fails++;
   char buf[128];
   snprintf(buf, sizeof buf, "%s (fails=%lu)", why, (unsigned long)s.fails);
-  if (s.connected && !s.terminating) {
-    const int rc = ble_gap_terminate(s.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-    if (rc == 0) {
-      ESP_LOGW(TAG, "%s: terminating", buf);
-      s.terminating = true;
-      s.deadline_ms = s.now + TERMINATE_GRACE_MS;
-      return;
-    }
-    ESP_LOGW(TAG, "%s: ble_gap_terminate rc=%d", buf, rc);
-    s_bms.disconnects++;  // the link is already gone; a late DISCONNECT event is ignored below
-  }
+  if (s.connected && !s.terminating && terminate_conn(buf, ESP_LOG_WARN)) return;
   forget_connection();
   begin_backoff(buf);
 }
@@ -626,6 +670,47 @@ static void start_connect() {
   ESP_LOGI(TAG, "connecting %s (addr type %u, timeout %lu ms, fails=%lu)", mac, s.peer.type,
            (unsigned long)k_connect_timeout_ms, (unsigned long)s.fails);
   set_link(BMS_LINK_CONNECTING);
+}
+
+// A BMS screen was selected: bring the link up. Nothing to do while the host is not synced
+// (on_sync_msg() starts it) or while a teardown is still in flight (on_disconnect() -> the
+// back-off, which now retries because s.wanted is set again).
+static void go_on() {
+  s.fails = 0;
+  s.backoff_ms = k_reconnect_ms;
+  s.force_scan = false;
+  if (s.phase != PH_OFF) {
+    ESP_LOGI(TAG, "BMS screen shown while %s: the link comes up from there", phase_str(s.phase));
+    return;
+  }
+  if (s.peer_known) start_connect();  // known address: no scan, the fastest way back to STREAM
+  else start_scan(true);
+}
+
+// The last BMS screen was left: stop the radio. With a live connection the terminate is
+// asynchronous - the DISCONNECT event runs into begin_backoff(), which parks in PH_OFF
+// because s.wanted is already clear (as does the terminate-grace timeout in tick()).
+static void go_off() {
+  if (s.connected) {
+    // A terminate already in flight needs nothing: its DISCONNECT event runs into begin_backoff().
+    if (s.terminating || terminate_conn("BMS screen closed", ESP_LOG_INFO)) return;
+    forget_connection();
+    enter_off("BMS screen closed");
+    return;
+  }
+  if (s.phase == PH_SCAN) stop_scan();
+  else if (s.phase == PH_CONNECT) (void)ble_gap_conn_cancel();  // a late CONNECT event is dropped by on_connect()
+  if (s.synced) enter_off("BMS screen closed");
+  else s.phase = PH_IDLE;  // host not up: nothing was running and the link already reads OFF
+}
+
+// Edge detector for the display task's flag; runs once per loop, before the deadlines.
+static void apply_want() {
+  const bool want = s_want;
+  if (want == s.wanted) return;
+  s.wanted = want;
+  if (want) go_on();
+  else go_off();
 }
 
 static void enter_stream() {
@@ -771,7 +856,7 @@ static void on_frame(const uint8_t frame[JK_FRAME_LEN], void *) {
 // ---------------------------------------------------------------- message handlers (bmsTask)
 static void on_sync_msg() {
   s.synced = true;
-  if (s.phase != PH_IDLE) {
+  if (s.phase != PH_IDLE && s.phase != PH_OFF) {
     ESP_LOGW(TAG, "sync while %s: ignored", phase_str(s.phase));
     return;
   }
@@ -794,10 +879,13 @@ static void on_sync_msg() {
   if (s.cfg_addr_valid) {
     s.peer = s.cfg_addr;
     s.peer_known = true;
-    start_connect();
-  } else {
-    start_scan(true);
   }
+  if (!s.wanted) {  // BMS_LINK_ON_DEMAND: wait for the first BMS screen instead of scanning
+    enter_off("host synced, no BMS screen shown");
+    return;
+  }
+  if (s.peer_known) start_connect();
+  else start_scan(true);
 }
 
 static void on_reset_msg(int reason) {
@@ -809,7 +897,7 @@ static void on_reset_msg(int reason) {
   }
   forget_connection();
   s.phase = PH_IDLE;
-  set_link(BMS_LINK_SCANNING);
+  set_link(s.wanted ? BMS_LINK_SCANNING : BMS_LINK_IDLE);
 }
 
 static void on_disc(const MsgDisc &d) {
@@ -1191,6 +1279,7 @@ static void stream_tick() {
 static void tick() {
   switch (s.phase) {
     case PH_IDLE: break;
+    case PH_OFF: break;  // no BMS screen on the panel: no scan, no connection, no deadline
     case PH_BACKOFF:
       if (due(s.now, s.backoff_until_ms)) after_backoff();
       break;
@@ -1247,9 +1336,10 @@ static void bms_task(void *) {
   }
   for (;;) {
     hb_touch(hb_bms);
-    const size_t n = xMessageBufferReceive(s_mb, &s_rx, sizeof s_rx, pdMS_TO_TICKS(100));
+    const size_t n = xMessageBufferReceive(s_mb, &s_rx, sizeof s_rx, pdMS_TO_TICKS(TASK_POLL_MS));
     s.now = state_now_ms();
     if (n > 0) handle_msg(s_rx, n);
+    apply_want();  // before the deadlines: a screen change must not be acted on a tick late
     tick();
   }
 }
@@ -1263,6 +1353,7 @@ bool bms_ble_start() {
   s.phase = PH_IDLE;
   s.backoff_ms = k_reconnect_ms;
   s.cmd_no_rsp = true;
+  s.wanted = s_want;  // BMS_LINK_ON_DEMAND: false until the display selects a BMS screen
   s_mb = xMessageBufferCreate(BMS_MSG_BUF_BYTES);
   if (s_mb == nullptr) {
     ESP_LOGE(TAG, "message buffer (%d bytes) alloc failed", BMS_MSG_BUF_BYTES);
@@ -1293,14 +1384,24 @@ bool bms_ble_start() {
     ESP_LOGE(TAG, "bms task create failed");
     return false;
   }
-  ESP_LOGI(TAG, "BLE init ok, heap %lu -> %lu, msg buf %d B, notify cap %u B", (unsigned long)s_heap_before,
-           (unsigned long)esp_get_free_heap_size(), BMS_MSG_BUF_BYTES, (unsigned)NOTIFY_MAX);
+  ESP_LOGI(TAG, "BLE init ok, heap %lu -> %lu, msg buf %d B, notify cap %u B, link %s", (unsigned long)s_heap_before,
+           (unsigned long)esp_get_free_heap_size(), BMS_MSG_BUF_BYTES, (unsigned)NOTIFY_MAX,
+           BMS_LINK_ON_DEMAND ? "on demand (only while a BMS screen is shown)" : "always on");
   return true;
+}
+
+void bms_set_active(bool active) {
+#if BMS_LINK_ON_DEMAND
+  s_want = active;
+#else
+  (void)active;  // the link is held from boot on
+#endif
 }
 
 const char *bms_link_str(uint8_t link) {
   switch (link) {
     case BMS_LINK_OFF: return "OFF";
+    case BMS_LINK_IDLE: return "IDLE";
     case BMS_LINK_SCANNING: return "SCAN";
     case BMS_LINK_CONNECTING: return "CONN";
     case BMS_LINK_SETUP: return "SETUP";

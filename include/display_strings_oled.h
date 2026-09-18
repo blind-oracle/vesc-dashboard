@@ -50,8 +50,8 @@
 #endif
 
 // ---------------------------------------------------------------- screens
-// Cycled by short presses of PIN_BUTTON (wrapping); a long press or the
-// SCREEN_AUTO_RETURN_MS timer goes back to SCREEN_MAIN. The BMS screens exist
+// Cycled by short presses of PIN_BUTTON (wrapping); a long press (and the
+// SCREEN_AUTO_RETURN_MS timer, off by default) goes back to SCREEN_MAIN. The BMS screens exist
 // only with BMS_UI_ENABLE (BLE client built, or the display demo): SCREEN_BMS
 // and BMS_CELL_PAGES CELLS pages (12 cells each) sit between VESC 3/3 and GNSS,
 // so SCREEN_COUNT is 7 without them and 8 + BMS_CELL_PAGES with them.
@@ -120,6 +120,19 @@ inline const char *oled_screen_name(uint8_t screen) {
     case SCREEN_SYS: return "SYS";
     default: return "?";
   }
+}
+
+// True for the screens that show BMS data (the BMS summary and every CELLS page).
+// With BMS_LINK_ON_DEMAND the display task hands this to bms_set_active() on every
+// screen change: the BLE client only scans, connects and polls while it is true.
+// Always false in a build without the BMS screens.
+inline bool oled_screen_needs_bms(uint8_t screen) {
+#if BMS_UI_ENABLE
+  return screen == (uint8_t)SCREEN_BMS || (screen >= (uint8_t)SCREEN_CELLS_0 && screen <= (uint8_t)SCREEN_CELLS_LAST);
+#else
+  (void)screen;
+  return false;
+#endif
 }
 
 // ---------------------------------------------------------------- layout
@@ -767,6 +780,8 @@ inline void fmt_cell_slot(char *buf, size_t n, const BmsState &b, bool live, uns
 // Status row of the BMS screen while nothing live is shown (<= 21 chars; "last" = age
 // of the last decoded frame, omitted before the first one):
 //   "BLE OFF    no BMS"      BLE not started / init failed
+//   "STARTING   last 2m"     BMS_LINK_ON_DEMAND: the radio is idle because no BMS screen was shown;
+//                           the screen just opened, the task brings the link up within its next tick
 //   "SCAN 34s   last 2m"     scanning for 34 s ("SCAN 34s" alone before any frame; "SCAN" if the
 //                           scan start was never stamped)
 //   "SCAN 1m    app open?"   scanning for BMS_APP_HINT_S+ with no frame ever: a JK BMS takes one
@@ -787,6 +802,8 @@ inline void build_bms_status(const BmsState &b, uint32_t now, char *row) {
   }
   switch (b.link) {
     case BMS_LINK_OFF: row2(row, "BLE OFF", "no BMS"); return;
+    // Only visible for the moment between opening a BMS screen and bmsTask acting on it.
+    case BMS_LINK_IDLE: row2(row, "STARTING", r); return;
     case BMS_LINK_SCANNING: {
       const uint32_t scan_ms = b.link_since_ms ? age_clamped(b.link_since_ms, now) : 0u;
       if (b.link_since_ms) {

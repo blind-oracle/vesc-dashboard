@@ -827,6 +827,31 @@ static void test_screen_names_and_count() {
   }
 }
 
+// The predicate the display task hands to bms_set_active(): exactly the screens that show
+// BMS data keep the BLE link up (BMS_LINK_ON_DEMAND), every other screen drops it.
+static void test_screen_needs_bms() {
+  unsigned needing = 0;
+  for (unsigned i = 0; i < (unsigned)SCREEN_COUNT; ++i)
+    if (oled_screen_needs_bms((uint8_t)i)) ++needing;
+#if BMS_UI_ENABLE
+  TEST_ASSERT_EQUAL_UINT(1u + (unsigned)BMS_CELL_PAGES, needing);  // the BMS page + every CELLS page
+  TEST_ASSERT_TRUE(oled_screen_needs_bms(SCREEN_BMS));
+  for (unsigned p = 0; p < (unsigned)BMS_CELL_PAGES; ++p)
+    TEST_ASSERT_TRUE(oled_screen_needs_bms((uint8_t)(SCREEN_CELLS_0 + p)));
+#else
+  TEST_ASSERT_EQUAL_UINT(0u, needing);  // no BMS screens in this build: the link is never asked for
+#endif
+  TEST_ASSERT_FALSE(oled_screen_needs_bms(SCREEN_MAIN));
+  TEST_ASSERT_FALSE(oled_screen_needs_bms(SCREEN_EFF));
+  TEST_ASSERT_FALSE(oled_screen_needs_bms(SCREEN_VESC_A));
+  TEST_ASSERT_FALSE(oled_screen_needs_bms(SCREEN_VESC_B));
+  TEST_ASSERT_FALSE(oled_screen_needs_bms(SCREEN_VESC_C));
+  TEST_ASSERT_FALSE(oled_screen_needs_bms(SCREEN_GNSS));
+  TEST_ASSERT_FALSE(oled_screen_needs_bms(SCREEN_SYS));
+  TEST_ASSERT_FALSE(oled_screen_needs_bms(SCREEN_COUNT));  // out of range: never keeps the radio on
+  TEST_ASSERT_FALSE(oled_screen_needs_bms(255));
+}
+
 // ---------------------------------------------------------------- number formatting helpers
 static void test_fmt_num_budgets() {
   using oled_detail::fmt_num;
@@ -1750,6 +1775,17 @@ static void test_bms_status_rows_per_link_state() {
   TEST_ASSERT_EQUAL_STRING("BMS", g.title);
   TEST_ASSERT_EQUAL_STRING("BLE OFF    no BMS", g.rows[0]);
   assert_bms_dashes(g);
+  // idle: BMS_LINK_ON_DEMAND parked the radio; only visible for the moment between opening a
+  // BMS screen and bmsTask acting on it, so it reads as "starting" plus the usual frame age
+  s.bms.link = BMS_LINK_IDLE;
+  s.bms.t_ms = NOW - 120000;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("STARTING   last 2m", g.rows[0]);
+  assert_bms_dashes(g);
+  s.bms.t_ms = 0;
+  g = build_grid(SCREEN_BMS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("STARTING", g.rows[0]);
+  assert_bms_dashes(g);
   // scanning: how long, and the age of the last frame when there was one
   s.bms.link = BMS_LINK_SCANNING;
   s.bms.link_since_ms = NOW - 34000;
@@ -2210,6 +2246,7 @@ int main(int, char **) {
   RUN_TEST(test_fault_names_as_used_by_the_fault_row);
   RUN_TEST(test_fmt_age_short);
   RUN_TEST(test_screen_names_and_count);
+  RUN_TEST(test_screen_needs_bms);
   RUN_TEST(test_fmt_num_budgets);
   RUN_TEST(test_fmt_count_budgets);
   RUN_TEST(test_fmt_wh_and_energy_helpers);

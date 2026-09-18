@@ -160,6 +160,7 @@ enum BmsLink : uint8_t {
   BMS_LINK_CONNECTING,  // connect request in flight
   BMS_LINK_SETUP,       // connected: MTU, discovery, subscribe, 0x97/0x96 sent, waiting for the first frame
   BMS_LINK_STREAM,      // cell-info frames arriving
+  BMS_LINK_IDLE,        // BMS_LINK_ON_DEMAND: radio deliberately idle because no BMS screen is shown
 };
 
 enum BmsProto : uint8_t { BMS_PROTO_UNKNOWN = 0, BMS_PROTO_JK02_24S = 1, BMS_PROTO_JK02_32S = 2 };

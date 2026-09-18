@@ -113,7 +113,8 @@
 #define BUTTON_LONG_PRESS_MS 1500 // long press -> back to the main screen
 #endif
 #ifndef SCREEN_AUTO_RETURN_MS
-#define SCREEN_AUTO_RETURN_MS 60000 // after this long on another screen, return to the main screen; 0 = stay
+#define SCREEN_AUTO_RETURN_MS 0 // 0 (default) = stay on the selected screen; > 0 = return to the main screen this long after
+                                // the last button event. A long press always returns to the main screen.
 #endif
 #ifndef TIME_UTC_OFFSET_MIN
 #define TIME_UTC_OFFSET_MIN 0 // displayed clock = GNSS UTC + this many minutes (e.g. 120 for UTC+2). No DST logic.
@@ -168,6 +169,11 @@
 #endif
 #ifndef BMS_STALE_MS
 #define BMS_STALE_MS 10000 // no decoded cell-info frame for this long -> every BMS value shows "--" (frames arrive every ~0.5 s)
+#endif
+#ifndef BMS_LINK_ON_DEMAND
+#define BMS_LINK_ON_DEMAND 1 // 1 = scan/connect/poll ONLY while a BMS screen (BMS or CELLS) is shown and drop the link as soon
+                             // as another screen is selected (the BMS log line then only has data while such a screen is up);
+                             // 0 = hold the link from boot on, whatever is on screen (the behaviour before this option)
 #endif
 #ifndef BMS_RECONNECT_MS
 #define BMS_RECONNECT_MS 2000 // first back-off after a disconnect / failed connect ...
