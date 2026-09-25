@@ -31,9 +31,10 @@
 //   Disconnect / any failure -> back-off (link SCANNING, BMS_RECONNECT_MS doubling up to
 //        BMS_RECONNECT_MAX_MS, reset when STREAM is reached) -> direct reconnect to the known
 //        address while consecutive failures < BMS_RECONNECT_FAILS, else scan (fast preset).
-//   Host RESET -> everything forgotten, wait for the next SYNC.
-//   BMS screen closed -> scan / connect cancelled, connection terminated, PH_OFF (link IDLE)
-//        until the next bms_set_active(true).
+//   Host RESET -> everything forgotten, link OFF, wait for the next SYNC.
+//   BMS screen closed -> scan / connect cancelled (by controller state, then verified every
+//        OFF_VERIFY_MS), connection terminated, PH_OFF (link IDLE) until the next
+//        bms_set_active(true); with the host not synced the link reads OFF instead.
 //
 // GATT facts (syssi/esphome-jk-bms + captures): service 0xFFE0; the old TI module and JK-PB
 // expose ONE 0xFFE1 (write | write-no-rsp | notify), the newer module TWO 0xFFE1 (one write,
@@ -66,12 +67,29 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "ble_addr.h"
+#include "deadman.h"         // deadman_beacon_seen() / deadman_adv_other() from the host task
+#include "deadman_logic.h"   // deadman_connect_allowed(): may we blind the watchdog to reach the BMS?
 #include "jk_bms.h"
 #include "shared_state.h"
 
 extern "C" void ble_store_config_init(void);
 
 static const char *TAG = "bms";
+
+#if DEADMAN_ENABLE
+// With the dead-man's switch built, the radio must scan for the tag essentially all the
+// time, and NimBLE keeps one master context: it cannot scan and initiate at once. Pinning
+// both peers removes BMS discovery from the picture entirely - the BMS is reached by a
+// direct connect - so the only blind window left is the connect procedure itself.
+static_assert(sizeof(BMS_BLE_ADDR) == 18,
+              "DEADMAN_ENABLE requires BMS_BLE_ADDR to be pinned: a BMS discovery scan and the beacon watchdog "
+              "cannot share one NimBLE scan safely (-DBMS_BLE_ADDR='\"c8:47:8c:12:34:56\"')");
+// Parsed once in bms_ble_start(), before the host task exists, then read-only: the host
+// task compares every advert against it without a lock.
+static uint8_t s_tag_addr[6];
+static uint8_t s_bms_addr_val[6];
+#endif
 
 // ---------------------------------------------------------------- constants
 static constexpr uint16_t JK_SVC_UUID16 = 0xFFE0;
@@ -87,7 +105,15 @@ static constexpr uint32_t TERMINATE_GRACE_MS = 3000;      // DISCONNECT event mu
 static constexpr uint32_t STREAM_STALL_MS = BMS_FIRST_FRAME_TIMEOUT_MS;  // no frame in STREAM: re-poll; 2x: drop the link
 static constexpr uint32_t CRC_WARN_PERIOD_MS = 10000;
 static constexpr uint32_t RSSI_POLL_MS = 5000;
-static constexpr uint32_t TASK_POLL_MS = 100;  // message-buffer receive timeout = deadline / bms_set_active() granularity
+#if DEADMAN_ENABLE
+// The connect procedure is the watchdog's blind window (NimBLE cannot scan and initiate
+// at once), so it is bounded far tighter than the stand-alone BMS build allows.
+static constexpr uint32_t k_connect_ms = DEADMAN_BMS_CONNECT_MS;
+#else
+static constexpr uint32_t k_connect_ms = BMS_CONNECT_TIMEOUT_MS;
+#endif
+static constexpr uint32_t TASK_POLL_MS = 100;    // message-buffer receive timeout = deadline / bms_set_active() granularity
+static constexpr uint32_t OFF_VERIFY_MS = 1000;  // PH_OFF: re-check that scan / connect really stopped (the cancels are async)
 
 // Unsigned copies of the tunables so the wrap-safe arithmetic below never mixes signedness.
 static constexpr uint32_t k_reconnect_ms = BMS_RECONNECT_MS;
@@ -193,6 +219,12 @@ union MsgAny {
   MsgNotify notify;
 };
 
+#if DEADMAN_ENABLE
+// Written by bmsTask, read by the dead-man task through bms_ble_scanning(). A volatile
+// bool keeps every NimBLE call inside bmsTask, which is the invariant this file is built on.
+static volatile bool s_watch_scanning = false;
+#endif
+
 static MessageBufferHandle_t s_mb = nullptr;
 static volatile uint32_t s_dropped = 0;  // records the host task could not queue (buffer full / oversized notification)
 static MsgNotify s_tx_notify;            // host-task scratch (the host task is its only user)
@@ -214,7 +246,28 @@ static int gap_cb(struct ble_gap_event *event, void *) {
   switch (event->type) {
     case BLE_GAP_EVENT_DISC: {
       const struct ble_gap_disc_desc &d = event->disc;
-      if (d.event_type != BLE_HCI_ADV_RPT_EVTYPE_ADV_IND && d.event_type != BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP) break;
+      // Legacy PDU types we can use. ADV_NONCONN_IND / SCAN_IND are what most beacons
+      // send, so they must be accepted even though a JK BMS never uses them; DIR_IND is
+      // never addressed to us. (Extended-advertising beacons are invisible either way:
+      // CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT is off.)
+      if (d.event_type != BLE_HCI_ADV_RPT_EVTYPE_ADV_IND && d.event_type != BLE_HCI_ADV_RPT_EVTYPE_SCAN_RSP &&
+          d.event_type != BLE_HCI_ADV_RPT_EVTYPE_NONCONN_IND && d.event_type != BLE_HCI_ADV_RPT_EVTYPE_SCAN_IND)
+        break;
+#if DEADMAN_ENABLE
+      // The tag is timestamped HERE, in the host task, and never enters the message
+      // buffer: the safety timestamp must not depend on bmsTask draining a buffer that
+      // BMS notifications can fill. Three volatile stores, no lock, no log, no alloc.
+      if (ble_addr_equal(d.addr.val, s_tag_addr)) {
+        deadman_beacon_seen(d.rssi, state_now_ms());
+        break;
+      }
+      // The watchdog scan runs with filter_duplicates off, so a marina full of phones
+      // would otherwise flood the 2 KB buffer. Only the pinned BMS is worth posting.
+      if (!ble_addr_equal(d.addr.val, s_bms_addr_val)) {
+        deadman_adv_other();
+        break;
+      }
+#endif
       MsgDisc m = {};
       m.type = MSG_DISC;
       m.addr_type = d.addr.type;
@@ -431,6 +484,7 @@ struct Ctx {
   uint32_t first_frame_deadline_ms;
   uint32_t last_frame_ms;
   uint32_t next_rssi_ms;
+  uint32_t off_verify_ms;  // PH_OFF: when to re-check that the controller went idle (0 = confirmed idle)
   bool stall_polled;
   // back-off
   uint32_t backoff_ms;
@@ -537,7 +591,41 @@ static void forget_connection() {
 
 static void stop_scan() {
   (void)ble_gap_disc_cancel();  // BLE_HS_EALREADY when nothing is running: fine
+#if DEADMAN_ENABLE
+  s_watch_scanning = false;
+#endif
 }
+
+#if DEADMAN_ENABLE
+// The beacon watchdog owns the radio whenever the BMS is not mid-connect. Called once per
+// loop, so it is self-healing: it restarts a scan that a cancel, a finished connect
+// attempt or a controller hiccup left stopped. ble_gap_disc() returns EALREADY when one
+// is already running, which is success as far as we are concerned.
+static void ensure_watch_scan() {
+  if (s.phase == PH_CONNECT || ble_gap_conn_active()) return;  // the blind window; it ends by itself
+  if (ble_gap_disc_active()) {
+    s_watch_scanning = true;
+    return;
+  }
+  struct ble_gap_disc_params p = {};
+  p.itvl = ms_to_0625(DEADMAN_SCAN_ITVL_MS);
+  p.window = ms_to_0625(DEADMAN_SCAN_WINDOW_MS);
+  p.passive = 1;          // both peers are pinned by address: no need to ask for scan responses
+  p.filter_duplicates = 0;  // a liveness watchdog needs EVERY advert, not one per scan instance
+  const int rc = ble_gap_disc(s.own_addr_type, BLE_HS_FOREVER, &p, gap_cb, nullptr);
+  if (rc == 0 || rc == BLE_HS_EALREADY) {
+    if (!s_watch_scanning)
+      ESP_LOGI(TAG, "watchdog scan up (%u/%u ms, passive, no duplicate filter)", (unsigned)DEADMAN_SCAN_ITVL_MS,
+               (unsigned)DEADMAN_SCAN_WINDOW_MS);
+    s_watch_scanning = true;
+  } else if (s_watch_scanning) {
+    // The dead-man task sees this within a tick and goes NO RADIO: no protection, but it
+    // must not cut for our own failure - the mechanical kill switch still covers that.
+    ESP_LOGE(TAG, "watchdog scan will not start (rc=%d): the dead-man is blind", rc);
+    s_watch_scanning = false;
+  }
+}
+#endif
 
 // ---------------------------------------------------------------- transitions
 static void start_scan(bool fast);
@@ -551,6 +639,7 @@ static void enter_off(const char *why) {
   s.fails = 0;  // the next open starts fresh: direct connect, first back-off again
   s.backoff_ms = k_reconnect_ms;
   s.force_scan = false;
+  s.off_verify_ms = stamp(s.now + OFF_VERIFY_MS);  // the cancels are asynchronous: confirm below
   set_link(BMS_LINK_IDLE);
 }
 
@@ -614,13 +703,26 @@ static void fail_conn(const char *why, bool count_fail) {
 
 static void start_scan(bool fast) {
   struct ble_gap_disc_params p = {};
+#if DEADMAN_ENABLE
+  // One scan serves both consumers, and the beacon watchdog sets the terms: continuous,
+  // and every advert reported. filter_duplicates would report the tag ONCE per scan
+  // instance (CONFIG_BT_LE_SCAN_DUPL_TYPE_DEVICE with a cache that never refreshes),
+  // which is precisely the opposite of a liveness watchdog. Both peers are pinned, so a
+  // passive scan is enough and the fast/slow presets are irrelevant.
+  (void)fast;
+  p.itvl = ms_to_0625(DEADMAN_SCAN_ITVL_MS);
+  p.window = ms_to_0625(DEADMAN_SCAN_WINDOW_MS);
+  p.passive = 1;
+  p.filter_duplicates = 0;
+#else
   p.itvl = ms_to_0625(fast ? k_scan_fast_itvl_ms : k_scan_slow_itvl_ms);
   p.window = ms_to_0625(fast ? k_scan_fast_window_ms : k_scan_slow_window_ms);
-  p.filter_policy = 0;
-  p.limited = 0;
   // By address: passive is enough. By name: active, the name is often only in the scan response.
   p.passive = s.cfg_addr_valid ? 1 : 0;
   p.filter_duplicates = 1;
+#endif
+  p.filter_policy = 0;
+  p.limited = 0;
   // The legacy ble_gap_disc() of this NimBLE does not check the master state (it never returns
   // EALREADY / EBUSY): over a pending connect attempt it would overwrite that state, over a
   // running scan the controller rejects the parameters. Check here instead.
@@ -652,8 +754,24 @@ static void start_connect() {
   char mac[18];
   mac_str(s.peer.val, mac);
   snprintf(s_bms.addr, sizeof s_bms.addr, "%s", mac);
+#if DEADMAN_ENABLE
+  // A connect procedure blinds the beacon watchdog for its whole duration, so it is only
+  // allowed when the motor cannot be running and the tag is fresh enough that the blind
+  // window cannot itself cause a trip. Retry at a fixed short interval rather than the
+  // doubling back-off: this is "not now", not a failure, and it must not escalate.
+  if (!deadman_connect_allowed(state_snapshot(), s.now, DEADMAN_BMS_CONNECT_MS)) {
+    s.phase = PH_BACKOFF;
+    s.backoff_until_ms = s.now + DEADMAN_CONNECT_RETRY_MS;
+    ESP_LOGD(TAG, "BMS connect deferred: the dead-man will not give up the radio (moving, or too little margin)");
+    set_link(BMS_LINK_IDLE);
+    return;
+  }
+  // The scan and the connect cannot coexist (one NimBLE master context), so hand the
+  // radio over deliberately; ensure_watch_scan() takes it back on the CONNECT event.
+  stop_scan();
+#endif
   // NULL params = controller defaults; never ble_gap_update_params / set_prefered_* (C6 assert history).
-  const int rc = ble_gap_connect(s.own_addr_type, &s.peer, (int32_t)k_connect_timeout_ms, nullptr, gap_cb, nullptr);
+  const int rc = ble_gap_connect(s.own_addr_type, &s.peer, (int32_t)k_connect_ms, nullptr, gap_cb, nullptr);
   if (rc != 0) {
     s.fails++;
     if (rc == BLE_HS_EALREADY || rc == BLE_HS_EBUSY) {
@@ -666,7 +784,7 @@ static void start_connect() {
     return;
   }
   s.phase = PH_CONNECT;
-  s.deadline_ms = s.now + k_connect_timeout_ms + CONNECT_EVENT_GRACE_MS;
+  s.deadline_ms = s.now + k_connect_ms + CONNECT_EVENT_GRACE_MS;
   ESP_LOGI(TAG, "connecting %s (addr type %u, timeout %lu ms, fails=%lu)", mac, s.peer.type,
            (unsigned long)k_connect_timeout_ms, (unsigned long)s.fails);
   set_link(BMS_LINK_CONNECTING);
@@ -681,6 +799,7 @@ static void go_on() {
   s.force_scan = false;
   if (s.phase != PH_OFF) {
     ESP_LOGI(TAG, "BMS screen shown while %s: the link comes up from there", phase_str(s.phase));
+    if (!s.synced) set_link(BMS_LINK_OFF);  // waiting for the host: "BLE OFF", not a "STARTING" that never ends
     return;
   }
   if (s.peer_known) start_connect();  // known address: no scan, the fastest way back to STREAM
@@ -698,10 +817,18 @@ static void go_off() {
     enter_off("BMS screen closed");
     return;
   }
-  if (s.phase == PH_SCAN) stop_scan();
-  else if (s.phase == PH_CONNECT) (void)ble_gap_conn_cancel();  // a late CONNECT event is dropped by on_connect()
+  // Ask the controller, do not trust the phase: a connect attempt outlives PH_CONNECT whenever
+  // start_scan() backed off over it, and a scan that a failed cancel left running is exactly the
+  // case start_scan() already compensates for. A late CONNECT event is dropped by on_connect().
+#if !DEADMAN_ENABLE
+  if (ble_gap_disc_active()) (void)ble_gap_disc_cancel();  // with the dead-man built the scan must STAY up
+#endif
+  if (ble_gap_conn_active()) (void)ble_gap_conn_cancel();
   if (s.synced) enter_off("BMS screen closed");
-  else s.phase = PH_IDLE;  // host not up: nothing was running and the link already reads OFF
+  else {
+    s.phase = PH_IDLE;  // waiting for the host: it is not scanning either, and the link must not claim it is
+    set_link(BMS_LINK_OFF);
+  }
 }
 
 // Edge detector for the display task's flag; runs once per loop, before the deadlines.
@@ -897,7 +1024,7 @@ static void on_reset_msg(int reason) {
   }
   forget_connection();
   s.phase = PH_IDLE;
-  set_link(s.wanted ? BMS_LINK_SCANNING : BMS_LINK_IDLE);
+  set_link(BMS_LINK_OFF);  // the host is down until the next SYNC: not scanning, not merely parked
 }
 
 static void on_disc(const MsgDisc &d) {
@@ -1279,11 +1406,36 @@ static void stream_tick() {
 static void tick() {
   switch (s.phase) {
     case PH_IDLE: break;
-    case PH_OFF: break;  // no BMS screen on the panel: no scan, no connection, no deadline
+    case PH_OFF:
+      // No BMS screen on the panel: nothing to drive, but ble_gap_disc_cancel() / ble_gap_conn_cancel()
+      // are asynchronous and may fail, and "IDLE" on the screen and in the log must not mean "still
+      // scanning". Re-check until the controller confirms it went idle, then stop checking.
+      if (s.off_verify_ms != 0 && due(s.now, s.off_verify_ms)) {
+        // With the dead-man built, "off" means "not linked to the BMS" - the watchdog
+        // scan must keep running, so only a stuck connect attempt is worth cancelling.
+        const bool disc = DEADMAN_ENABLE ? false : ble_gap_disc_active();
+        const bool conn = ble_gap_conn_active();
+        if (!disc && !conn) {
+          s.off_verify_ms = 0;
+          break;
+        }
+        ESP_LOGW(TAG, "off but the controller is still %s: cancelling again",
+                 disc ? (conn ? "scanning and connecting" : "scanning") : "connecting");
+        if (disc) (void)ble_gap_disc_cancel();
+        if (conn) (void)ble_gap_conn_cancel();
+        s.off_verify_ms = stamp(s.now + OFF_VERIFY_MS);
+      }
+      break;
     case PH_BACKOFF:
       if (due(s.now, s.backoff_until_ms)) after_backoff();
       break;
     case PH_SCAN:
+#if DEADMAN_ENABLE
+      // The fast/slow rollover and the 5-minute refresh both exist only to flush the
+      // controller's duplicate cache, which is moot at filter_duplicates = 0 - and each
+      // restart would be another blind gap for the watchdog. ensure_watch_scan() owns it.
+      break;
+#else
       if (s.scan_fast) {
         if (due(s.now, s.scan_started_ms + k_scan_fast_ms)) {
           stop_scan();
@@ -1295,6 +1447,7 @@ static void tick() {
         start_scan(false);
       }
       break;
+#endif
     case PH_CONNECT:
       if (due(s.now, s.deadline_ms)) {
         (void)ble_gap_conn_cancel();
@@ -1340,6 +1493,9 @@ static void bms_task(void *) {
     s.now = state_now_ms();
     if (n > 0) handle_msg(s_rx, n);
     apply_want();  // before the deadlines: a screen change must not be acted on a tick late
+#if DEADMAN_ENABLE
+    ensure_watch_scan();  // the beacon watchdog owns the radio between BMS connect attempts
+#endif
     tick();
   }
 }
@@ -1354,6 +1510,16 @@ bool bms_ble_start() {
   s.backoff_ms = k_reconnect_ms;
   s.cmd_no_rsp = true;
   s.wanted = s_want;  // BMS_LINK_ON_DEMAND: false until the display selects a BMS screen
+#if DEADMAN_ENABLE
+  // Parsed here, before nimble_port_freertos_init() creates the host task, so gap_cb can
+  // compare against them without a lock or an initialisation race. A bad tag address is
+  // fatal for the dead-man (deadman_start() refuses and holds the cut), but the BMS
+  // client itself keeps working, so only warn here.
+  if (!ble_addr_parse(DEADMAN_BEACON_ADDR, s_tag_addr))
+    ESP_LOGE(TAG, "DEADMAN_BEACON_ADDR \"%s\" is unusable: no advert can ever match the tag", DEADMAN_BEACON_ADDR);
+  if (!ble_addr_parse(BMS_BLE_ADDR, s_bms_addr_val))
+    ESP_LOGE(TAG, "BMS_BLE_ADDR \"%s\" is unusable: the BMS can never be reached in a dead-man build", BMS_BLE_ADDR);
+#endif
   s_mb = xMessageBufferCreate(BMS_MSG_BUF_BYTES);
   if (s_mb == nullptr) {
     ESP_LOGE(TAG, "message buffer (%d bytes) alloc failed", BMS_MSG_BUF_BYTES);
@@ -1388,6 +1554,14 @@ bool bms_ble_start() {
            (unsigned long)esp_get_free_heap_size(), BMS_MSG_BUF_BYTES, (unsigned)NOTIFY_MAX,
            BMS_LINK_ON_DEMAND ? "on demand (only while a BMS screen is shown)" : "always on");
   return true;
+}
+
+bool bms_ble_scanning() {
+#if DEADMAN_ENABLE
+  return s_watch_scanning;
+#else
+  return false;  // without the dead-man there is no always-on scan to report
+#endif
 }
 
 void bms_set_active(bool active) {

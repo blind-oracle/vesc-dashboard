@@ -246,9 +246,17 @@ struct OledGrid {
 
 // Everything the renderer compares to decide whether to push a frame.
 struct OledFrame {
-  uint8_t screen;  // OledScreen; selects which member is valid
-  OledMain main;   // SCREEN_MAIN
-  OledGrid grid;   // every other screen
+  uint8_t screen;   // OledScreen; selects which member is valid
+  uint8_t overlay;  // OledOverlay: when set it REPLACES the screen (the dead-man alarm)
+  OledMain main;    // SCREEN_MAIN
+  OledGrid grid;    // every other screen, and every overlay
+};
+
+// An overlay takes the whole panel whatever screen is selected. There is exactly one, and
+// it exists because a cut motor must not be something you can page away from.
+enum OledOverlay : uint8_t {
+  OVERLAY_NONE = 0,
+  OVERLAY_DEADMAN,  // the dead-man's switch is holding the motor cut (TRIPPED or FAULT)
 };
 
 // Host-side facts the Arduino-free builders cannot fetch themselves.
@@ -779,7 +787,7 @@ inline void fmt_cell_slot(char *buf, size_t n, const BmsState &b, bool live, uns
 
 // Status row of the BMS screen while nothing live is shown (<= 21 chars; "last" = age
 // of the last decoded frame, omitted before the first one):
-//   "BLE OFF    no BMS"      BLE not started / init failed
+//   "BLE OFF    no BMS"      BLE not started / init failed / host reset, not re-synced
 //   "STARTING   last 2m"     BMS_LINK_ON_DEMAND: the radio is idle because no BMS screen was shown;
 //                           the screen just opened, the task brings the link up within its next tick
 //   "SCAN 34s   last 2m"     scanning for 34 s ("SCAN 34s" alone before any frame; "SCAN" if the
@@ -844,6 +852,31 @@ inline void oled_build_main(const SharedState &s, uint32_t now, OledMain &out) {
   fmt_clock(out.clock, sizeof out.clock, s.gnss, now);
   build_main_fix(s.gnss, now, out);
   build_main_can(s, f, out);
+#if DEADMAN_UI_ENABLE
+  // The states where the dead-man is NOT protecting anything, or is about to cut, take the
+  // CAN cell on the page the helmsman actually looks at. A cut itself needs no banner: the
+  // alarm overlay has already replaced the whole screen by then. The CAN string is only
+  // hidden while there is something more important to say.
+  {
+    const uint32_t tag_age = age_ms(s.deadman.beacon_t_ms, now);
+    char a[4];  // fmt_age_short is at most 3 chars ("49d"); sized so "CUT %s" cannot truncate
+    switch (s.deadman.state) {
+      // DM_WAIT_TAG deliberately does NOT take the cell. It is the resting state before the
+      // tag has ever been seen - i.e. every boot - and permanently hiding the CAN line,
+      // which is how you tell whether the VESC is alive at all, would be a bad trade for a
+      // warning that never changes. The log line and the alarm overlay carry that state.
+      case DM_UNAVAILABLE: snprintf(out.can, sizeof out.can, "NO RADIO"); break;
+      case DM_GRACE:
+        if (tag_age < (uint32_t)DEADMAN_TIMEOUT_MS) {
+          fmt_age_short(a, sizeof a, (uint32_t)DEADMAN_TIMEOUT_MS - tag_age);
+          snprintf(out.can, sizeof out.can, "CUT %s", a);  // counting down to the cut
+        }
+        break;
+      default: break;  // ARMED: nothing to say, the CAN line keeps the cell
+    }
+    clip(out.can, sizeof out.can, kCanChars);
+  }
+#endif
   build_main_cells(s, f, out);
 }
 
@@ -1269,10 +1302,96 @@ inline void oled_build_cells(const SharedState &s, uint32_t now, uint8_t page, O
 #endif  // BMS_UI_ENABLE
 
 // Builds the frame for `screen` (unknown indices fall back to the main screen).
+#if DEADMAN_UI_ENABLE
+// The dead-man alarm: shown INSTEAD of whatever page is selected, for as long as the
+// firmware is holding the motor cut. It answers, in order, the four questions the person
+// at the helm actually has: is the motor off, why, did the cut really reach the VESC, and
+// how do I get going again.
+//
+//   [MOTOR CUT         !]
+//   TRIPPED    no tag 12s      (or "FAULT      CUT FAILED")
+//   worst gap while armed      diagnostic for sizing DEADMAN_TIMEOUT_MS
+//   tag -62dBm  n 18431
+//   VESC KILLSW OK             the closed loop: OK / WAIT / FAILED / no poll
+//   hold btn: reset            or "hold btn: need tag" when the tag is not present
+inline void oled_build_deadman_alarm(const SharedState &s, uint32_t now, OledGrid &g) {
+  using namespace oled_detail;
+  const DeadmanState &d = s.deadman;
+  memset(&g, 0, sizeof g);
+  copy_str(g.title, sizeof g.title, "MOTOR CUT");
+  copy_str(g.page, sizeof g.page, "!");
+  g.nrows = kGridRows;
+
+  char l[32], r[32], a[12];
+  const uint32_t age = age_ms(d.beacon_t_ms, now);
+
+  if (d.state == DM_FAULT) {
+    row2(g.rows[0], "FAULT", "CUT FAILED");
+  } else if (d.beacon_t_ms) {
+    fmt_age_short(a, sizeof a, age_clamped(d.beacon_t_ms, now));
+    snprintf(r, sizeof r, "no tag %s", a);
+    row2(g.rows[0], "TRIPPED", r);
+  } else {
+    row2(g.rows[0], "TRIPPED", "never seen");
+  }
+
+  fmt_count(a, sizeof a, d.gap_max_ms, 5);
+  snprintf(l, sizeof l, "gapmax %sms", a);
+  row1(g.rows[1], l);
+
+  if (d.beacon_t_ms) snprintf(l, sizeof l, "tag %ddBm", (int)d.beacon_rssi);
+  else snprintf(l, sizeof l, "tag --");
+  fmt_count(a, sizeof a, d.beacon_reports, 6);
+  snprintf(r, sizeof r, "n %s", a);
+  row2(g.rows[2], l, r);
+
+  // The closed loop. "NOT CUT" is the one that means "the wiring or the VESC config is
+  // wrong and the motor may still be live" - it must not read like a mere warning.
+  switch (d.confirm) {
+    case DM_CONFIRM_OK: row1(g.rows[3], "VESC: KILLSW ok"); break;
+    case DM_CONFIRM_WAIT: row1(g.rows[3], "VESC: waiting..."); break;
+    case DM_CONFIRM_FAILED: row1(g.rows[3], "VESC: NOT CUT!"); break;
+    case DM_CONFIRM_STALE: row1(g.rows[3], "VESC: no reply"); break;
+    default: row1(g.rows[3], "VESC: --"); break;
+  }
+
+  // Row 4: how often this has happened, plus refused resets when there have been any
+  // (that pair is the "I keep pressing the button and nothing happens" diagnosis).
+  char b[8];
+  if (d.resets_refused) {
+    fmt_count(a, sizeof a, d.trips, 4);
+    fmt_count(b, sizeof b, d.resets_refused, 4);
+    snprintf(l, sizeof l, "trips %s", a);
+    snprintf(r, sizeof r, "refused %s", b);
+    row2(g.rows[4], l, r);
+  } else {
+    fmt_count(a, sizeof a, d.trips, 5);
+    snprintf(l, sizeof l, "trips %s", a);
+    row1(g.rows[4], l);
+  }
+
+  // Row 5 sits on the panel's last pixel row, so it must carry no descenders (g/j/p/q/y):
+  // all upper case, which is what an alarm wants anyway. It says whether the reset gesture
+  // can succeed right now, so nobody holds the button wondering why nothing happens.
+  if (d.state == DM_FAULT) row1(g.rows[5], "FIX WIRING - NO RESET");
+  else if (age <= (uint32_t)DEADMAN_RESET_FRESH_MS) row1(g.rows[5], "HOLD BTN: RESET");
+  else row1(g.rows[5], "HOLD BTN: NEED TAG");
+}
+#endif  // DEADMAN_UI_ENABLE
+
 inline void oled_build_frame(const SharedState &s, uint32_t now, uint8_t screen, const OledSysInfo &info,
                              OledFrame &out) {
   memset(&out, 0, sizeof out);
   out.screen = screen < SCREEN_COUNT ? screen : (uint8_t)SCREEN_MAIN;
+#if DEADMAN_UI_ENABLE
+  // A cut motor takes the whole panel, whatever page the helmsman had selected, and the
+  // long press that would normally go back to MAIN clears the latch instead.
+  if (s.deadman.state == DM_TRIPPED || s.deadman.state == DM_FAULT) {
+    out.overlay = OVERLAY_DEADMAN;
+    oled_build_deadman_alarm(s, now, out.grid);
+    return;
+  }
+#endif
 #if BMS_UI_ENABLE
   if (out.screen >= SCREEN_CELLS_0 && out.screen <= SCREEN_CELLS_LAST) {  // a range: one page per 12 cells
     oled_build_cells(s, now, (uint8_t)(out.screen - SCREEN_CELLS_0), out.grid);

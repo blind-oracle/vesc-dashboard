@@ -17,6 +17,7 @@
 #include "gnss_ubx.h"
 #include "shared_state.h"
 #include "bms_ble.h"
+#include "deadman.h"
 #include "trip.h"
 
 static const char *TAG = "main";
@@ -24,7 +25,7 @@ static const char *TAG = "main";
 // Log tags of this project. Their runtime level is raised to the compile-time level of the
 // project sources (LOG_LOCAL_LEVEL; platformio.ini may set -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG),
 // so the debug lines can be switched on without touching the IDF components' own tags.
-static const char *const kLogTags[] = {"main", "can", "gnss", "oled", "trip", "bms"};
+static const char *const kLogTags[] = {"main", "can", "gnss", "oled", "trip", "bms", "dm"};
 
 [[maybe_unused]] static const char *resetReasonStr(esp_reset_reason_t r)
 { // log-only
@@ -78,6 +79,12 @@ static inline void led_set(bool on) { gpio_set_level((gpio_num_t)PIN_LED, on ? 1
 
 static void setup()
 {
+  // FIRST, before any delay: put the dead-man's cut line into its boot state. Until this
+  // runs the pin is a floating input, so the motor is governed purely by the mechanical
+  // kill switch - which is the correct fail-passive behaviour, but the window should be
+  // milliseconds, not the SERIAL_BOOT_DELAY_MS below.
+  deadman_gpio_early_init();
+
   // The console is the USB-Serial/JTAG port (sdkconfig): nothing to open, and its output is
   // dropped rather than blocked while no host is attached. The delay gives a host time to
   // re-enumerate after the reset so the boot banner shows up in the monitor.
@@ -117,11 +124,15 @@ static void setup()
   // BLE first: the first controller enable may store the PHY calibration blob in NVS, and the TWAI
   // ISR is not cache-safe, so the CAN node must not exist yet while that flash write happens.
   [[maybe_unused]] const bool bmsOk = bms_ble_start();
+  // After the radio (it needs the scan) and before the display, so a tripped dead-man is
+  // already asserting its cut by the time the first frame is drawn.
+  [[maybe_unused]] const bool dmOk = deadman_start();
   [[maybe_unused]] const bool canOk = can_vesc_start(); // log-only
   [[maybe_unused]] const bool gnssOk = gnss_start();
   [[maybe_unused]] const bool dispOk = display_start();
   [[maybe_unused]] const bool tripOk = trip_start();
-  ESP_LOGI(TAG, "started: can=%d gnss=%d display=%d trip=%d bms=%d", canOk, gnssOk, dispOk, tripOk, bmsOk);
+  ESP_LOGI(TAG, "started: can=%d gnss=%d display=%d trip=%d bms=%d deadman=%d", canOk, gnssOk, dispOk, tripOk, bmsOk,
+           (int)(DEADMAN_ENABLE ? dmOk : 0));
 }
 
 // A heartbeat that was never touched counts as fresh during the first max_age ms
@@ -139,7 +150,7 @@ static bool hbOk(uint32_t hb, uint32_t now, uint32_t max_age)
 
 static void loop()
 {
-  static uint32_t nextVescLog = 0, nextGnssLog = 0, nextTripLog = 0, nextBmsLog = 0, nextSysLog = 0, nextStaleLog = 0, nextBlink = 0;
+  static uint32_t nextVescLog = 0, nextGnssLog = 0, nextTripLog = 0, nextBmsLog = 0, nextDmLog = 0, nextSysLog = 0, nextStaleLog = 0, nextBlink = 0;
   static bool led = false;
 
   // Snapshot BEFORE reading the clock: every timestamp inside s must be <= now,
@@ -153,7 +164,15 @@ static void loop()
   const bool gnssAlive = hbOk(hb_gnss, now, HB_MAX_GNSS_MS);
   const bool dispAlive = hbOk(hb_disp, now, HB_MAX_DISP_MS);
   const bool bmsAlive = (HB_MAX_BMS_MS > 0) ? hbOk(hb_bms, now, HB_MAX_BMS_MS) : true; // 0 = not gated
-  if (canAlive && gnssAlive && dispAlive && bmsAlive)
+#if DEADMAN_ENABLE
+  // Always gated, unlike the BMS: a stalled dead-man task is a safety failure, so it must
+  // reboot the board. The reboot releases the cut (fail-passive), which is why the
+  // mechanical kill switch stays the primary protection.
+  const bool dmAlive = hbOk(hb_deadman, now, HB_MAX_DEADMAN_MS);
+#else
+  const bool dmAlive = true;
+#endif
+  if (canAlive && gnssAlive && dispAlive && bmsAlive && dmAlive)
   {
     esp_task_wdt_reset();
   }
@@ -195,6 +214,15 @@ static void loop()
   {
     nextBmsLog = now + LOG_BMS_MS;
     bms_log_summary(s, now);
+  }
+  // Transitions every loop (a trip must not wait for the next summary), the summary on its
+  // own deadline. All dead-man logging happens here: its own task must never block on the
+  // console. Both are no-ops without DEADMAN_ENABLE.
+  deadman_log_events(s, now);
+  if (LOG_DEADMAN_MS && DEADMAN_ENABLE && (int32_t)(now - nextDmLog) >= 0)
+  {
+    nextDmLog = now + LOG_DEADMAN_MS;
+    deadman_log_summary(s, now);
   }
   if (LOG_SYS_MS && (int32_t)(now - nextSysLog) >= 0)
   {

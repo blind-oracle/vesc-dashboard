@@ -2155,6 +2155,95 @@ static void test_never_received_state() {
 #endif
 }
 
+#if DEADMAN_UI_ENABLE
+// The dead-man alarm replaces the selected screen entirely: a cut motor must not be
+// something you can page away from, and the long press that normally returns to MAIN
+// clears the latch instead (src/display_oled.cpp keys that off frame.overlay).
+static void test_deadman_alarm_overlay() {
+  SharedState s = make_state(NOW);
+  OledSysInfo info = kInfo;
+  OledFrame f;
+
+  // Not cut: no overlay, whatever the selected screen.
+  s.deadman.state = DM_ARMED;
+  memset(&f, 0xAA, sizeof f);
+  oled_build_frame(s, NOW, SCREEN_GNSS, info, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_NONE, f.overlay);
+  TEST_ASSERT_EQUAL_UINT8(SCREEN_GNSS, f.screen);
+
+  // Tripped: the overlay takes over from EVERY screen, including MAIN.
+  s.deadman.state = DM_TRIPPED;
+  s.deadman.cut = true;
+  s.deadman.beacon_t_ms = NOW - 12000;
+  s.deadman.beacon_rssi = -62;
+  s.deadman.beacon_reports = 18431;
+  s.deadman.gap_max_ms = 340;
+  s.deadman.trips = 1;
+  s.deadman.confirm = DM_CONFIRM_OK;
+  for (unsigned scr = 0; scr < (unsigned)SCREEN_COUNT; ++scr) {
+    memset(&f, 0xAA, sizeof f);
+    oled_build_frame(s, NOW, (uint8_t)scr, info, f);
+    TEST_ASSERT_EQUAL_UINT8(OVERLAY_DEADMAN, f.overlay);
+    assert_grid_lengths(f.grid);
+    TEST_ASSERT_EQUAL_STRING("MOTOR CUT", f.grid.title);
+  }
+  TEST_ASSERT_EQUAL_STRING("TRIPPED    no tag 12s", f.grid.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("gapmax 340ms", f.grid.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("tag -62dBm n 18431", f.grid.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("VESC: KILLSW ok", f.grid.rows[3]);
+  // the tag is long gone, so the reset would be refused and the row says so
+  TEST_ASSERT_EQUAL_STRING("HOLD BTN: NEED TAG", f.grid.rows[5]);
+
+  // Tag back within the reset window: the row switches to the actionable wording.
+  s.deadman.beacon_t_ms = NOW;
+  oled_build_frame(s, NOW, SCREEN_MAIN, info, f);
+  TEST_ASSERT_EQUAL_STRING("HOLD BTN: RESET", f.grid.rows[5]);
+
+  // The cut that did not take effect must not read like a mere warning, and a FAULT
+  // cannot be reset from the panel at all.
+  s.deadman.state = DM_FAULT;
+  s.deadman.confirm = DM_CONFIRM_FAILED;
+  oled_build_frame(s, NOW, SCREEN_MAIN, info, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_DEADMAN, f.overlay);
+  TEST_ASSERT_EQUAL_STRING("FAULT      CUT FAILED", f.grid.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("VESC: NOT CUT!", f.grid.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("FIX WIRING - NO RESET", f.grid.rows[5]);
+  assert_grid_lengths(f.grid);
+
+  // A tag that was never seen still renders (the overlay must never show garbage).
+  s = make_state(NOW);
+  s.deadman.state = DM_TRIPPED;
+  oled_build_frame(s, NOW, SCREEN_MAIN, info, f);
+  TEST_ASSERT_EQUAL_STRING("TRIPPED    never seen", f.grid.rows[0]);
+  assert_grid_lengths(f.grid);
+}
+
+// The MAIN screen only gives up its CAN cell for the two urgent dead-man states. NO TAG
+// is deliberately not one of them: it is the resting state before the tag has ever been
+// seen, i.e. every boot, and the CAN line is how you tell the VESC is alive at all.
+static void test_deadman_main_banner() {
+  SharedState s = make_state(NOW);
+
+  s.deadman.state = DM_WAIT_TAG;
+  TEST_ASSERT_EQUAL_STRING("VESC 74", build_main(s, NOW).can);
+  s.deadman.state = DM_ARMED;
+  TEST_ASSERT_EQUAL_STRING("VESC 74", build_main(s, NOW).can);
+
+  s.deadman.state = DM_UNAVAILABLE;
+  TEST_ASSERT_EQUAL_STRING("NO RADIO", build_main(s, NOW).can);
+
+  // GRACE counts down to the cut on the page the helmsman is actually looking at.
+  s.deadman.state = DM_GRACE;
+  s.deadman.beacon_t_ms = NOW - (DEADMAN_TIMEOUT_MS - 3000);
+  OledMain m = build_main(s, NOW);
+  TEST_ASSERT_EQUAL_STRING("CUT 3s", m.can);
+  assert_main_lengths(m);
+  // past the timeout the overlay owns the screen, so the cell simply keeps the CAN line
+  s.deadman.beacon_t_ms = NOW - DEADMAN_TIMEOUT_MS;
+  TEST_ASSERT_EQUAL_STRING("VESC 74", build_main(s, NOW).can);
+}
+#endif  // DEADMAN_UI_ENABLE
+
 static void test_boot_frame() {
   OledFrame f;
   memset(&f, 0x55, sizeof f);
@@ -2276,6 +2365,10 @@ int main(int, char **) {
   RUN_TEST(test_frame_dispatch_and_determinism);
   RUN_TEST(test_extreme_values_respect_budgets_and_buffers);
   RUN_TEST(test_never_received_state);
+#if DEADMAN_UI_ENABLE
+  RUN_TEST(test_deadman_alarm_overlay);
+  RUN_TEST(test_deadman_main_banner);
+#endif
   RUN_TEST(test_boot_frame);
   RUN_TEST(test_layout_geometry);
   return UNITY_END();

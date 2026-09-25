@@ -193,6 +193,44 @@ struct BmsState {
 };
 #endif  // BMS_UI_ENABLE
 
+#if DEADMAN_UI_ENABLE
+// ---------------------------------------------------------------- dead-man's switch
+// Written by deadmanTask (src/deadman.cpp) from the beacon timestamps the BLE host
+// task stamps; read by the DEADMAN screen, the MAIN screen's cut banner and the log.
+// The decision logic itself is pure and lives in include/deadman_logic.h.
+enum DmState : uint8_t {
+  DM_WAIT_TAG = 0,   // the tag has not been seen yet: no protection (see DEADMAN_BOOT_CUT)
+  DM_ARMED,          // tag fresh, motor permitted
+  DM_GRACE,          // tag quiet past DEADMAN_WARN_MS, still permitted, screen counting down
+  DM_TRIPPED,        // timed out: cut asserted and latched until a reset with the tag present
+  DM_UNAVAILABLE,    // the radio is not delivering adverts: no protection, and we do NOT cut for it
+  DM_FAULT,          // the cut was asserted but the VESC never reported its kill switch active
+};
+
+// Result of the closed loop against VescExt::status bit 1 (VESC_STATUS_KILL_SW).
+enum DmConfirm : uint8_t {
+  DM_CONFIRM_UNKNOWN = 0, // not asserting a cut
+  DM_CONFIRM_WAIT,        // asserted, still inside DEADMAN_CONFIRM_MS
+  DM_CONFIRM_OK,          // the VESC reports its kill switch active
+  DM_CONFIRM_FAILED,      // it never did, while polls were arriving -> DM_FAULT
+  DM_CONFIRM_STALE,       // no fresh poll reply, so nothing can be concluded (never a FAULT)
+};
+
+struct DeadmanState {
+  uint8_t state;             // DmState
+  uint8_t confirm;           // DmConfirm
+  bool cut;                  // PIN_DEADMAN_CUT is being pulled low right now
+  uint32_t state_since_ms;   // when the state was entered (0 = never)
+  uint32_t beacon_t_ms;      // last matching advert (0 = never)
+  int8_t beacon_rssi;
+  uint32_t beacon_reports;   // matching adverts since boot
+  uint32_t adv_other;        // non-matching adverts seen (a crowded-marina indicator)
+  uint32_t gap_max_ms;       // longest gap between adverts while armed: sizes DEADMAN_TIMEOUT_MS
+  uint32_t trips, resets, resets_refused;
+  uint32_t publish_skipped;  // state_lock() misses from the deadman task
+};
+#endif  // DEADMAN_UI_ENABLE
+
 struct SharedState
 {
   VescState vesc;
@@ -203,6 +241,9 @@ struct SharedState
 #if BMS_UI_ENABLE
   BmsState bms;
 #endif
+#if DEADMAN_UI_ENABLE
+  DeadmanState deadman;
+#endif
   DisplayStats disp;
   uint32_t lock_failures; // state_lock() timeouts (should stay 0)
 };
@@ -212,6 +253,10 @@ extern SharedState g_state;
 void state_init();
 // Acquire the state mutex. Returns false on timeout (and counts it).
 bool state_lock(uint32_t timeout_ms = 50);
+// Non-blocking variant that does NOT touch the shared failure counter: for the dead-man
+// task, which runs above every other task and must never block or write a counter it
+// races everyone for. A miss is counted in DeadmanState::publish_skipped instead.
+bool state_try_lock();
 void state_unlock();
 // Copy of g_state taken under the mutex (on lock failure returns the previous snapshot).
 SharedState state_snapshot();
@@ -222,6 +267,9 @@ extern volatile uint32_t hb_can;
 extern volatile uint32_t hb_gnss;
 extern volatile uint32_t hb_disp;
 extern volatile uint32_t hb_bms;   // bmsTask (logged; gates the watchdog only when HB_MAX_BMS_MS > 0)
+#if DEADMAN_ENABLE
+extern volatile uint32_t hb_deadman;  // deadmanTask: safety-relevant, so it ALWAYS gates the watchdog (HB_MAX_DEADMAN_MS)
+#endif
 
 // Milliseconds since boot (32-bit, wraps like millis() did); esp_timer underneath, so headers stay framework-free.
 uint32_t state_now_ms();

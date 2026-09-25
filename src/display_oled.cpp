@@ -65,6 +65,7 @@
 #include <string.h>
 
 #include "bms_ble.h"
+#include "deadman.h"
 #include "display_strings_oled.h"
 #include "shared_state.h"
 #include "u8g2_hal_idf.h"
@@ -227,9 +228,12 @@ static void draw_grid(const OledGrid &g) {
   for (int r = 0; r < n; ++r) draw_text(kGridX, (int16_t)(kGridBaseline0 + r * kGridPitch), g.rows[r]);
 }
 
-// Draws one frame into the (already cleared) buffer.
+// Draws one frame into the (already cleared) buffer. An overlay (the dead-man alarm)
+// replaces the selected screen entirely: it is drawn as a grid, so it needs no new
+// drawing code, only the dispatch below.
 static void draw_frame(const OledFrame &f) {
-  if (f.screen == SCREEN_MAIN) draw_main(f.main);
+  if (f.overlay != OVERLAY_NONE) draw_grid(f.grid);
+  else if (f.screen == SCREEN_MAIN) draw_main(f.main);
   else draw_grid(f.grid);
 }
 // OLED_DRAW_END
@@ -580,6 +584,15 @@ static bool poll_button(DispCtx &c, uint32_t now) {
     c.st.last_change_ms = now;
     restore_contrast(c, "button");
     if (ev == ButtonEvent::Short) changed = set_screen(c, (uint8_t)((c.screen + 1u) % SCREEN_COUNT), "short press");
+#if DEADMAN_UI_ENABLE
+    // While the dead-man alarm owns the panel a long press means "clear the latch", not
+    // "back to MAIN": the alarm is the only thing on screen, so the gesture is unambiguous,
+    // and the dead-man task may still refuse it if the tag is not present.
+    else if (c.prev.overlay == OVERLAY_DEADMAN) {
+      ESP_LOGW(TAG, "display: long press on the dead-man alarm -> reset requested");
+      deadman_request_reset();
+    }
+#endif
     else changed = set_screen(c, SCREEN_MAIN, "long press");
   }
 #endif

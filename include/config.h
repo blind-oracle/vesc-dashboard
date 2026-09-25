@@ -171,9 +171,13 @@
 #define BMS_STALE_MS 10000 // no decoded cell-info frame for this long -> every BMS value shows "--" (frames arrive every ~0.5 s)
 #endif
 #ifndef BMS_LINK_ON_DEMAND
+#if PIN_BUTTON >= 0
 #define BMS_LINK_ON_DEMAND 1 // 1 = scan/connect/poll ONLY while a BMS screen (BMS or CELLS) is shown and drop the link as soon
                              // as another screen is selected (the BMS log line then only has data while such a screen is up);
                              // 0 = hold the link from boot on, whatever is on screen (the behaviour before this option)
+#else
+#define BMS_LINK_ON_DEMAND 0 // PIN_BUTTON -1: no screen can ever be selected, so an on-demand link would never come up at all
+#endif
 #endif
 #ifndef BMS_RECONNECT_MS
 #define BMS_RECONNECT_MS 2000 // first back-off after a disconnect / failed connect ...
@@ -189,6 +193,69 @@
 #endif
 #ifndef LOG_BMS_MS
 #define LOG_BMS_MS 5000 // period of the BMS log line (0 = off)
+#endif
+
+// ============================================================================
+// Dead-man's switch (BLE beacon -> the VESC's own kill-switch input; src/deadman.cpp)
+// ============================================================================
+// A BLE tag worn by the helmsman is watched by the same radio the BMS uses. When its
+// advertisements stop arriving for DEADMAN_TIMEOUT_MS the firmware pulls PIN_DEADMAN_CUT
+// low, which is wired IN PARALLEL with the boat's mechanical kill switch on the VESC's
+// ADC2 input (VESC Tool -> App Settings -> General -> Kill Switch Mode = ADC2 Low).
+// Fail-passive by construction: the pin is open-drain, so the firmware can only ever ADD
+// a kill. A dead, hung or rebooting dashboard leaves the line alone and the mechanical
+// switch remains the primary protection - it can never strand the boat by failing.
+// The VESC samples that input every 10 ms against a hard 1.65 V threshold (no hysteresis)
+// and releases the motor immediately, overriding the local PPM/ADC throttle; it reports
+// the state back as VESC_STATUS_KILL_SW, which this firmware already polls and displays,
+// so the cut is verified end to end (DEADMAN_CONFIRM_*). Nothing is sent over CAN.
+#ifndef DEADMAN_ENABLE
+#define DEADMAN_ENABLE 0 // 1 = build the BLE-beacon dead-man's switch (needs BMS_BLE_ENABLE for the radio)
+#endif
+#ifndef PIN_DEADMAN_CUT
+#define PIN_DEADMAN_CUT 1 // open-drain output wired in PARALLEL with the mechanical kill switch on VESC ADC2.
+                          // High-Z = permit (the mechanical switch drives the line), driven low = kill.
+                          // GPIO1, 8 and 18 are the free header pins; NEVER a strapping pin (8/9/15): a glitch
+                          // low at reset would be a spurious engine cut. Needs a series resistor Rs in the
+                          // switch's 3.3 V leg (Rs <= Rpd/2, so the permit level stays clear of the VESC's
+                          // hard 1.65 V threshold, which has no hysteresis). -1 = no pin (logic only, for soak tests).
+#endif
+#ifndef DEADMAN_BEACON_ADDR
+#define DEADMAN_BEACON_ADDR "" // tag MAC "E1:23:45:67:89:AB" (fixed public address). Mandatory: there is no discovery mode
+#endif
+#ifndef DEADMAN_TIMEOUT_MS
+#define DEADMAN_TIMEOUT_MS 5000 // no matching advert for this long while armed -> assert the cut and latch it
+#endif
+#ifndef DEADMAN_WARN_MS
+#define DEADMAN_WARN_MS 2000 // ... after this long the screen counts down (state GRACE); the motor is still permitted
+#endif
+#ifndef DEADMAN_ARM_REPORTS
+#define DEADMAN_ARM_REPORTS 3 // adverts needed to arm: a tag that was never aboard must not be able to trip anything
+#endif
+#ifndef DEADMAN_ARM_WINDOW_MS
+#define DEADMAN_ARM_WINDOW_MS 2000 // ... they must all arrive inside this window
+#endif
+#ifndef DEADMAN_ARM_RSSI
+#define DEADMAN_ARM_RSSI -85 // ... and the last one must be at least this strong (dBm): arming on a tag in the car park means a trip at the dock
+#endif
+#ifndef DEADMAN_RESET_FRESH_MS
+#define DEADMAN_RESET_FRESH_MS 1000 // a reset is refused unless the tag was seen this recently: never restart while the person is still in the water
+#endif
+#ifndef DEADMAN_BOOT_CUT
+#define DEADMAN_BOOT_CUT 0 // 0 = the motor runs until the tag has been seen once (you can leave without the tag, with no protection; the screen says so)
+                           // 1 = cut until the tag is seen (you cannot forget the tag, but a dead tag battery immobilises the boat until the dashboard is powered down)
+#endif
+#ifndef DEADMAN_CONFIRM_ENABLE
+#define DEADMAN_CONFIRM_ENABLE 1 // 1 = close the loop: after asserting the cut, the VESC must report VESC_STATUS_KILL_SW back over the poll
+#endif
+#ifndef DEADMAN_CONFIRM_MS
+#define DEADMAN_CONFIRM_MS 3500 // ... within this long, else state FAULT (wiring, series resistor, or the VESC lost its ADC2 kill-switch config)
+#endif
+#ifndef DEADMAN_STANDSTILL_ERPM
+#define DEADMAN_STANDSTILL_ERPM 300 // the BMS may only connect below this |erpm| (a BLE connect blinds the watchdog); -1 = skip the erpm test (freewheeling prop under sail)
+#endif
+#ifndef DEADMAN_STANDSTILL_MM_S
+#define DEADMAN_STANDSTILL_MM_S 500 // ... and below this GNSS ground speed (~1 kn)
 #endif
 
 // ============================================================================
@@ -412,6 +479,37 @@
 #define TRIP_STALE_MS 5000 // TripState older than this -> the EFFICIENCY screen shows "--"
 #endif
 
+#ifndef TASK_PRIO_DEADMAN
+#define TASK_PRIO_DEADMAN 7 // ABOVE TASK_PRIO_CAN on purpose (see the #error below): a few comparisons and one
+                            // GPIO write per DEADMAN_TICK_MS must never wait behind a burst of CAN frames
+#endif
+#ifndef DEADMAN_TASK_STACK
+#define DEADMAN_TASK_STACK 2560 // bytes; the task never logs and never formats (all of that is in the supervisor)
+#endif
+#ifndef DEADMAN_TICK_MS
+#define DEADMAN_TICK_MS 20 // deadmanTask loop period = actuation granularity
+#endif
+#ifndef DEADMAN_SCAN_ITVL_MS
+#define DEADMAN_SCAN_ITVL_MS 100 // watchdog scan interval ...
+#endif
+#ifndef DEADMAN_SCAN_WINDOW_MS
+#define DEADMAN_SCAN_WINDOW_MS 100 // ... and window. Equal = continuous: below ~80 % duty a 300 ms tag is missed too often
+#endif
+#ifndef DEADMAN_BMS_CONNECT_MS
+#define DEADMAN_BMS_CONNECT_MS 2500 // ble_gap_connect() duration while the dead-man is built: this IS the watchdog's
+                                    // blind window (NimBLE cannot scan and initiate at once), so it must fit the margin
+#endif
+#ifndef DEADMAN_CONNECT_RETRY_MS
+#define DEADMAN_CONNECT_RETRY_MS 1000 // a BMS connect the dead-man refused (moving, or too little margin) is retried
+                                      // at this fixed interval: "not now" must not escalate the doubling back-off
+#endif
+#ifndef HB_MAX_DEADMAN_MS
+#define HB_MAX_DEADMAN_MS 1000 // supervisor: a deadman heartbeat older than this stops the WDT feed -> reboot. Unlike
+                               // HB_MAX_BMS_MS this is never 0: the task is safety-relevant and a stall must be caught
+#endif
+#ifndef LOG_DEADMAN_MS
+#define LOG_DEADMAN_MS 5000 // period of the DM log line (0 = off)
+#endif
 #ifndef BMS_TASK_PRIO
 #define BMS_TASK_PRIO 4 // bmsTask: between tripTask (3) and gnssTask (5); the NimBLE host/controller tasks run at 21/23 regardless
 #endif
@@ -473,6 +571,8 @@
 #endif
 // BMS: the shared state / screens exist when the BLE client is built or in the display demo; CELLS pages hold 12 cells each.
 #define BMS_UI_ENABLE (BMS_BLE_ENABLE || DISPLAY_DEMO)
+// Dead-man's switch: the state struct and its screen exist when the feature is built or in the demo.
+#define DEADMAN_UI_ENABLE (DEADMAN_ENABLE || DISPLAY_DEMO)
 #define BMS_CELL_PAGES ((BMS_CELLS_MAX + 11) / 12)
 
 // ============================================================================
@@ -506,6 +606,48 @@
 #if BMS_PROTOCOL < 0 || BMS_PROTOCOL > 2
 #error "BMS_PROTOCOL must be 0 (auto), 1 (JK02_24S) or 2 (JK02_32S)"
 #endif
+#if BMS_BLE_ENABLE && BMS_LINK_ON_DEMAND && PIN_BUTTON < 0
+#error "BMS_LINK_ON_DEMAND 1 needs a button: with PIN_BUTTON -1 no BMS screen can be selected, so the link would never come up (use -DBMS_LINK_ON_DEMAND=0)"
+#endif
+#if DEADMAN_ENABLE && !BMS_BLE_ENABLE
+#error "DEADMAN_ENABLE needs the NimBLE radio that the BMS client brings in: build the 'bms' env (-DBMS_BLE_ENABLE=1)"
+#endif
+#if DEADMAN_ENABLE && PIN_BUTTON < 0
+#error "DEADMAN_ENABLE needs a button: a tripped dead-man's switch latches and can only be cleared by hand (-DPIN_BUTTON=9 uses the BOOT button)"
+#endif
+#if DEADMAN_ENABLE && DEADMAN_WARN_MS >= DEADMAN_TIMEOUT_MS
+#error "DEADMAN_WARN_MS must be shorter than DEADMAN_TIMEOUT_MS (it is the on-screen countdown before the cut)"
+#endif
+#if DEADMAN_ENABLE && DEADMAN_RESET_FRESH_MS >= DEADMAN_TIMEOUT_MS
+#error "DEADMAN_RESET_FRESH_MS must be shorter than DEADMAN_TIMEOUT_MS, else a reset can succeed with a tag that is already timing out"
+#endif
+#if DEADMAN_ENABLE && DEADMAN_CONFIRM_ENABLE && (VESC_POLL_MS == 0 || CAN_LISTEN_ONLY)
+#error "DEADMAN_CONFIRM_ENABLE needs the VESC poll: the kill-switch status bit only arrives in a poll reply (set DEADMAN_CONFIRM_ENABLE 0)"
+#endif
+#if DEADMAN_ENABLE && DEADMAN_CONFIRM_ENABLE && (DEADMAN_CONFIRM_MS < 3 * VESC_POLL_MS)
+#error "DEADMAN_CONFIRM_MS must cover three poll periods, else one lost single-shot request raises a false FAULT"
+#endif
+#if DEADMAN_ENABLE && (DEADMAN_ARM_RSSI < -110 || DEADMAN_ARM_RSSI > 0)
+#error "DEADMAN_ARM_RSSI is a dBm value in -110..0"
+#endif
+#if DEADMAN_ENABLE && TASK_PRIO_DEADMAN <= TASK_PRIO_CAN
+#error "TASK_PRIO_DEADMAN must stay ABOVE TASK_PRIO_CAN: the cut must never wait behind a CAN burst. This is the deliberate exception to the rule that BMS_TASK_PRIO follows - do not 'fix' it"
+#endif
+#if DEADMAN_ENABLE && (PIN_DEADMAN_CUT == 8 || PIN_DEADMAN_CUT == 9 || PIN_DEADMAN_CUT == 15)
+#error "PIN_DEADMAN_CUT must not be a strapping pin (8/9) or the LED/JTAG pin (15): a glitch low at reset would be a spurious engine cut"
+#endif
+#if DEADMAN_ENABLE && (DEADMAN_SCAN_WINDOW_MS > DEADMAN_SCAN_ITVL_MS)
+#error "BLE scan window must not exceed the scan interval"
+#endif
+#if DEADMAN_ENABLE && (DEADMAN_SCAN_WINDOW_MS * 10 < DEADMAN_SCAN_ITVL_MS * 8)
+#error "the watchdog scan duty cycle must be >= 80 %: below that a 300 ms beacon is missed too often to trust the timeout"
+#endif
+#if DEADMAN_ENABLE && (DEADMAN_BMS_CONNECT_MS >= DEADMAN_TIMEOUT_MS)
+#error "DEADMAN_BMS_CONNECT_MS is the watchdog's blind window (NimBLE cannot scan and initiate at once): it must be shorter than DEADMAN_TIMEOUT_MS"
+#endif
+#if DEADMAN_ENABLE && HB_MAX_DEADMAN_MS == 0
+#error "HB_MAX_DEADMAN_MS must be > 0: the dead-man task is safety-relevant, so a stall has to reboot the board"
+#endif
 #if BMS_BLE_ENABLE && BMS_TASK_PRIO >= TASK_PRIO_GNSS
 #error "BMS_TASK_PRIO must stay below the data producers (TASK_PRIO_GNSS / TASK_PRIO_CAN)"
 #endif
@@ -537,6 +679,9 @@ namespace cfg_check
       PIN_OLED_SDA,
 #if PIN_BUTTON >= 0
       PIN_BUTTON,
+#endif
+#if DEADMAN_ENABLE && PIN_DEADMAN_CUT >= 0
+      PIN_DEADMAN_CUT,
 #endif
   };
 // PIN_OLED_RST is optional (-1); guard it separately.

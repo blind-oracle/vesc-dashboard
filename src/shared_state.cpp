@@ -12,6 +12,9 @@ volatile uint32_t hb_can = 0;
 volatile uint32_t hb_gnss = 0;
 volatile uint32_t hb_disp = 0;
 volatile uint32_t hb_bms = 0;
+#if DEADMAN_ENABLE
+volatile uint32_t hb_deadman = 0;
+#endif
 
 static SemaphoreHandle_t s_mutex = nullptr;
 static SharedState s_last_snapshot{};
@@ -31,6 +34,11 @@ bool state_lock(uint32_t timeout_ms) {
   // Counted without the lock: a lost increment here is acceptable, a deadlock is not.
   g_state.lock_failures++;
   return false;
+}
+
+bool state_try_lock() {
+  if (!s_mutex) return false;
+  return xSemaphoreTake(s_mutex, 0) == pdTRUE;  // no wait, no shared counter: the caller records its own miss
 }
 
 void state_unlock() {

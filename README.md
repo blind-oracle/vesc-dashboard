@@ -4,7 +4,7 @@ Be advised that this whole repo is AI-generated, so take it with a grain of salt
 
 # vesc-dashboard
 
-ESP32-C6 firmware that listens to a VESC motor controller on CAN, polls it once a second for the few values its broadcasts lack (fault code, per-MOSFET temperatures, id/iq, vd/vq, absolute tachometer), reads ground speed and time from a u-blox GNSS receiver at 5 Hz, shows everything on a 128x64 monochrome OLED (SSD1309 controller, I2C) as seven screens cycled by a push button, and integrates speed and energy into a trip log with the boat's efficiency in Wh per nautical mile (or km). Built for the DFRobot FireBeetle 2 ESP32-C6 (DFR1075) with an MCP2551-class CAN transceiver, any 2.42" or 1.54" SSD1309 module switched to I2C mode and any receiver that speaks UBX (u-blox 6/7, M8, M9, M10 or a compatible clone). On the CAN bus the firmware acknowledges frames and transmits exactly one thing: a 7-byte `COMM_GET_VALUES_SELECTIVE` request every `VESC_POLL_MS` (1 s). It never sends a command or a setting; `-DVESC_POLL_MS=0` makes it strictly passive (ACK only). Optionally (`pio run -e bms`) it also reads a JK (Jikong) BMS over Bluetooth LE with the C6's own radio and adds a BMS page and two CELLS pages (ten screens); the BLE link is only held while one of those pages is on screen (`BMS_LINK_ON_DEMAND`), and the default build contains no BLE code at all.
+ESP32-C6 firmware that listens to a VESC motor controller on CAN, polls it once a second for the few values its broadcasts lack (fault code, per-MOSFET temperatures, id/iq, vd/vq, absolute tachometer), reads ground speed and time from a u-blox GNSS receiver at 5 Hz, shows everything on a 128x64 monochrome OLED (SSD1309 controller, I2C) as seven screens cycled by a push button, and integrates speed and energy into a trip log with the boat's efficiency in Wh per nautical mile (or km). Built for the DFRobot FireBeetle 2 ESP32-C6 (DFR1075) with an MCP2551-class CAN transceiver, any 2.42" or 1.54" SSD1309 module switched to I2C mode and any receiver that speaks UBX (u-blox 6/7, M8, M9, M10 or a compatible clone). On the CAN bus the firmware acknowledges frames and transmits exactly one thing: a 7-byte `COMM_GET_VALUES_SELECTIVE` request every `VESC_POLL_MS` (1 s). It never sends a command or a setting; `-DVESC_POLL_MS=0` makes it strictly passive (ACK only). Optionally (`pio run -e bms`) it also reads a JK (Jikong) BMS over Bluetooth LE with the C6's own radio and adds a BMS page and two CELLS pages (ten screens); the BLE link is only held while one of those pages is on screen (`BMS_LINK_ON_DEMAND`), and the default build contains no BLE code at all. The same radio can optionally run a dead-man's switch (`pio run -e deadman`, section 5b): a BLE tag worn by the helmsman, and if it stops advertising the firmware pulls the VESC's own kill-switch input low, in parallel with the boat's mechanical lanyard switch. That path uses a GPIO, not CAN - what the firmware transmits on the bus is unchanged.
 
 ## 1. What it does
 
@@ -17,6 +17,7 @@ Five FreeRTOS tasks on the single core (tick 1 ms; the `bms` env adds `bmsTask` 
 | `displayTask` (`src/display_oled.cpp`) | `TASK_PRIO_DISP` = 2 | 6144 (`OLED_TASK_STACK`) | loop every `OLED_BUTTON_POLL_MS` (20 ms): debounce the button, switch screens (and tell `bmsTask` whether the new screen shows BMS data); every `OLED_PERIOD_MS` (or at once after a screen change) build the frame for the current screen from a snapshot and push it only when something changed; dim after `OLED_IDLE_DIM_MS` idle; re-probe the controller every 5 s and re-initialise a panel that stopped answering |
 | `tripTask` (`src/trip.cpp`) | `TASK_PRIO_TRIP` = 3 | 4096 (`TRIP_TASK_STACK`) | every `TRIP_PERIOD_MS` (200 ms): snapshot, integrate GNSS ground speed into distance and the VESC watt-hour counters (or `v_in x current_in`) into energy, keep the `EFF_WINDOW_S` ring, publish `g_state.trip` (section "Efficiency and trip"); a pure consumer that owns no peripheral and is not watched by the watchdog |
 | `bmsTask` (`src/bms_ble.cpp`, `bms` env only) | `BMS_TASK_PRIO` = 4 | 4096 (`BMS_TASK_STACK`) | NimBLE central for a JK BMS (section 5). While a BMS screen is shown (`BMS_LINK_ON_DEMAND`): scan for the BMS (name prefix or service 0xFFE0, or a pinned MAC), connect, exchange the MTU, discover 0xFFE0 / 0xFFE1, subscribe, send 0x97 (device info) and 0x96 (cell info); the BLE callbacks only copy notification bytes into a FreeRTOS message buffer (`BMS_MSG_BUF_BYTES`), the task reassembles the 300-byte frames, checks and decodes them (`include/jk_bms.h`), detects the 24S / 32S layout and publishes `g_state.bms`; reconnect back-off and scan presets; on any other screen it cancels the scan, terminates the link and parks (`IDLE`). The NimBLE host and controller tasks (priorities 21 / 23) run their own short slices |
+| `deadmanTask` (`src/deadman.cpp`, `deadman` env only) | `TASK_PRIO_DEADMAN` = 7 | 2560 (`DEADMAN_TASK_STACK`) | every `DEADMAN_TICK_MS` (20 ms): run the pure state machine in `include/deadman_logic.h` against the beacon timestamp the NimBLE host task stamps, drive `PIN_DEADMAN_CUT` (open drain, in parallel with the mechanical kill switch on VESC ADC2), confirm the cut against the polled `VESC_STATUS_KILL_SW` bit and publish `g_state.deadman`. Runs ABOVE `canTask` on purpose and never logs - the supervisor does that for it |
 | supervisor loop in `app_main()` (`src/main.cpp`) | 1 | 8192 (`CONFIG_ESP_MAIN_TASK_STACK_SIZE`) | sole Task-WDT subscriber (`WDT_TIMEOUT_MS`), fed only while the CAN, GNSS and display heartbeats are fresh (the trip task has none; the BMS heartbeat only gates it with `HB_MAX_BMS_MS` > 0); 1 Hz VESC and GNSS log lines, 5 s TRIP and BMS lines (`LOG_TRIP_MS`, `LOG_BMS_MS`), 10 s SYS line with the display, button, poll and BMS link counters; LED |
 
 Data flow:
@@ -54,7 +55,7 @@ Files:
 | `include/bms_ble.h`, `src/bms_ble.cpp` | NimBLE central for the JK BMS (the only file that includes NimBLE): scan, connect, subscribe, bmsTask, link state machine, BMS log line; inline no-ops when `BMS_BLE_ENABLE` is 0 |
 | `src/main.cpp` | `app_main()`: start-up and the supervisor loop |
 | `platformio.ini`, `boards/dfrobot_firebeetle2_esp32c6.json`, `sdkconfig.defaults`, `sdkconfig.defaults.bms`, `partitions.csv`, `CMakeLists.txt`, `src/CMakeLists.txt` | build: pinned platform and envs, board definition, ESP-IDF configuration (the `.bms` fragment adds the NimBLE host for the `bms` and `demo` envs), partition table, IDF project files |
-| `test/test_vesc/`, `test/test_vesc_getvalues/`, `test/test_ubx/`, `test/test_trip/`, `test/test_jk_bms/`, `test/test_display_strings_oled/` | Unity tests (one `test_main.cpp` each, 183 test cases; `test/test_jk_bms/jk_frames.h` holds recorded BMS frames), run on the host with `pio test -e native` |
+| `test/test_vesc/`, `test/test_vesc_getvalues/`, `test/test_ubx/`, `test/test_trip/`, `test/test_jk_bms/`, `test/test_display_strings_oled/` | Unity tests (one `test_main.cpp` each, 213 test cases; `test/test_jk_bms/jk_frames.h` holds recorded BMS frames), run on the host with `pio test -e native` |
 
 ## 2. Hardware and wiring
 
@@ -233,7 +234,7 @@ tripTask (`src/trip.cpp`; the arithmetic is the header-only, unit-tested `includ
 Optional: `pio run -e bms -t upload` builds the dashboard with a Bluetooth LE client for a JK (Jikong) BMS and adds the BMS and CELLS screens (section 6). The default env contains no BLE code at all (its generated `sdkconfig` has no `CONFIG_BT`; the feature cost it 64 bytes of log strings, 292,480 -> 292,544 B). `[env:bms]` in `platformio.ini` adds `-DBMS_BLE_ENABLE=1` and a second ESP-IDF fragment, `board_build.cmake_extra_args = -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.bms"`, which turns on the NimBLE host in the central and observer roles only: no advertising, no GATT server, no security or bonding, one connection, preferred MTU 256, BLE 4.2 feature set, Wi-Fi coexistence off. PlatformIO re-runs CMake only when `sdkconfig.defaults` or `sdkconfig.<env>` changed, so after editing the fragment run `touch sdkconfig.defaults` (or delete `sdkconfig.bms`). `[env:demo]` extends `bms`, so the layout demo shows the BMS pages with synthetic data. To make BLE the default, change `default_envs` in `platformio.ini`. Measured cost (init-only build, 2026-09-09): `firmware.bin` 641,664 B against 292,480 B (+349 KB of flash, in a 1,310,720 B OTA slot) and 21,884 against 18,132 B of static RAM (+3.7 KB); the heap the NimBLE pools take (expected 50..80 KB with the defaults) is logged at boot (`bms: BLE init ok, heap N -> N`) and in every BMS and SYS line, and optional pool trims are commented in `sdkconfig.defaults.bms`. The protocol details come from syssi/esphome-jk-bms (https://github.com/syssi/esphome-jk-bms), the reference implementation `include/jk_bms.h` was verified against.
 
 - No wiring: the ESP32-C6's own radio talks to the BMS's BLE module (GATT service 0xFFE0, characteristic 0xFFE1). The range is a few metres; the BMS must be within reach of the dashboard.
-- On demand (`BMS_LINK_ON_DEMAND 1`, default): the radio only runs while a BMS screen is on the panel. Selecting the BMS or a CELLS page makes `bmsTask` connect (straight to the last known address, or a fast scan when it has none) and poll; selecting any other screen cancels the scan or the pending connect, terminates the link and parks the task (`BMS link=IDLE`, the BMS page reads `STARTING` for the fraction of a second before the task reacts). Nothing retries in the background: a failed attempt while no BMS screen is up goes straight to idle instead of into the back-off. Consequences: the BMS keeps its single connection free for the phone app whenever you are not looking at the pages, the `BMS link=...` log line only carries data while such a page is up, and the first values appear a few seconds after you switch to the page (typically about a second with `BMS_BLE_ADDR` pinned, longer when it has to scan). Set `-DBMS_LINK_ON_DEMAND=0` to hold the link from boot on, as earlier versions did.
+- On demand (`BMS_LINK_ON_DEMAND 1`, default): the radio only runs while a BMS screen is on the panel. Selecting the BMS or a CELLS page makes `bmsTask` connect (straight to the last known address, or a fast scan when it has none) and poll; selecting any other screen cancels the scan or the pending connect, terminates the link and parks the task (`BMS link=IDLE`, the BMS page reads `STARTING` for the fraction of a second before the task reacts). Nothing retries in the background: a failed attempt while no BMS screen is up goes straight to idle instead of into the back-off. Consequences: the BMS keeps its single connection free for the phone app whenever you are not looking at the pages, the `BMS link=...` log line only carries data while such a page is up, and the first values appear a few seconds after you switch to the page (typically about a second with `BMS_BLE_ADDR` pinned, longer when it has to scan). Set `-DBMS_LINK_ON_DEMAND=0` to hold the link from boot on, as earlier versions did; a build with `PIN_BUTTON -1` does that by itself, because no BMS screen could ever be selected (forcing `-DBMS_LINK_ON_DEMAND=1` without a button is a compile error). While the link is parked the task keeps verifying that the controller really stopped scanning and connecting, and logs `off but the controller is still scanning: cancelling again` if a cancel did not take.
 - One central only: a JK BMS accepts exactly one BLE connection. While the JK phone app is connected the board cannot connect (it keeps retrying with back-off and the BMS screen shows `SCAN ...`, after a minute `app open?`), and while the board is connected the app cannot. Force-stop the app, or switch Bluetooth off on the phone, before expecting the board to connect; on many BMS modules a blinking red LED means "no central connected".
 - Finding the BMS: with `BMS_BLE_ADDR ""` (default) the board scans actively and connects to the first device whose name starts with `BMS_BLE_NAME_PREFIX` (`JK`) or that advertises 0xFFE0; the log prints the match (`bms: match c8:47:8c:12:34:56 rssi -61 name JK-B2A24S20P`). Pin it for your boat with `-DBMS_BLE_ADDR='"C8:47:8C:12:34:56"'` (a build flag in `[env:bms]` or your own env, or a `#define` in `config.h`): passive scan, no dependence on the name (which is editable in the app), and a phone with the same name prefix cannot be mistaken for the BMS.
 - Protocol: a 20-byte command written to 0xFFE1 (`AA 55 90 EB`, register, length, value, padding, sum8 checksum) and 300-byte answers (`55 AA EB 90`, type byte, payload, sum8 at index 299) delivered as notifications of whatever size the negotiated MTU allows (20, 128+128+44 and 150+150 have all been seen); the assembler in `include/jk_bms.h` never trusts notification boundaries, scans for the preamble at any offset and survives the ACK echoes and the 4-byte `AT\r\n` notifications of JK-PB modules. Two cell-info layouts exist and no field says which: JK02_24S (BMS software 6.x .. 10.x) and JK02_32S (11.x and newer, all JK-PB). `BMS_PROTOCOL 0` (default) auto-detects: a guess from the device-info frame (software major >= 11 or model `JK_PB` / `JK-PB` -> 32S, else 24S) that the first cell-info frame must confirm (the sum of the cells within 2 % of the pack voltage) before anything is shown; if neither layout is plausible the screen shows `CONNECTED  layout ?` and the log prints model and software version once. `BMS_PROTOCOL 1` / `2` forces 24S / 32S. JK04 firmware (3.x, float frames; e.g. JK-B2A16S sw 3.3.0 or JK-B5A24S sw 8.0.3M) is not supported.
@@ -248,7 +249,7 @@ Link handling (`config.h`):
 
 | Define | Default | Effect |
 |---|---|---|
-| `BMS_SCAN_FAST_MS` | 30000 | fast scan preset (`BMS_SCAN_FAST_ITVL_MS` / `BMS_SCAN_FAST_WINDOW_MS` = 60 / 30 ms, about 50 % radio duty) after boot and after every disconnect; then the slow preset (`BMS_SCAN_SLOW_ITVL_MS` / `BMS_SCAN_SLOW_WINDOW_MS` = 1000 / 30 ms, about 3 %) while the BMS is absent. With `BMS_BLE_ADDR` set the scan is passive |
+| `BMS_SCAN_FAST_MS` | 30000 | fast scan preset (`BMS_SCAN_FAST_ITVL_MS` / `BMS_SCAN_FAST_WINDOW_MS` = 60 / 30 ms, about 50 % radio duty) whenever the link is brought up without a known address (a BMS screen is selected, or boot with `BMS_LINK_ON_DEMAND 0`) and after every disconnect; then the slow preset (`BMS_SCAN_SLOW_ITVL_MS` / `BMS_SCAN_SLOW_WINDOW_MS` = 1000 / 30 ms, about 3 %) while the BMS is absent. With `BMS_BLE_ADDR` set the scan is passive |
 | `BMS_CONNECT_TIMEOUT_MS` | 10000 | a connect request without an answer (phone app connected, out of range) is abandoned after this |
 | `BMS_SETUP_TIMEOUT_MS` | 8000 | MTU exchange, service / characteristic / descriptor discovery and the CCCD write must finish within this |
 | `BMS_FIRST_FRAME_TIMEOUT_MS` | 15000 | the first checksum-valid, plausible cell-info frame must arrive within this after subscribing; the 0x96 request is re-sent every `BMS_POLL_MS` (5000) until the stream starts |
@@ -258,6 +259,128 @@ Link handling (`config.h`):
 | `BMS_STALE_MS` | 10000 | no decoded cell-info frame for this long: the BMS screens show `--` and `NO DATA`, and the link is recycled |
 | `BMS_APP_HINT_S` | 60 | seconds of scanning without ever having seen the BMS before the screen adds `app open?` |
 | `HB_MAX_BMS_MS` | 0 | 0 = the bmsTask heartbeat is only logged (`hb=` in the SYS line); > 0 = it gates the task watchdog like the other tasks |
+
+## 5b. Dead-man's switch (BLE beacon -> the VESC's kill-switch input)
+
+Optional: `pio run -e deadman -t upload` extends the `bms` env with a dead-man's switch. A BLE tag
+worn by the helmsman is watched by the radio the BMS client already owns; when its advertisements
+stop arriving for `DEADMAN_TIMEOUT_MS` (5 s) the firmware pulls `PIN_DEADMAN_CUT` low and the motor
+stops. **Nothing is sent over CAN** - the cut goes through the VESC's own kill-switch input, which
+is also why it works regardless of where the throttle comes from (section 9).
+
+**This is not a certified man-overboard device and does not replace a mechanical lanyard kill
+switch.** It is a second, additive layer on top of one. A spurious cut near rocks, in a lock or in
+a shipping lane is itself dangerous; so is trusting a 2.4 GHz link that water and a human body
+attenuate heavily. Read the whole section before wiring anything.
+
+### Wiring
+
+The ESP32 GPIO goes in **parallel** with the boat's existing mechanical kill switch, on the same
+VESC ADC2 input, as an **open-drain** output: high-Z means "permit" and lets the mechanical switch
+drive the line, low means "kill". The firmware can therefore only ever ADD a kill. A dashboard that
+is unpowered, in reset, crashed or unplugged leaves the line exactly as the mechanical switch has
+it, so this feature can never strand the boat by failing.
+
+```
+ 3V3 --[ Rs ]--+--------+-- VESC ADC2     Rs is the one change to the harness: without it,
+               |        |                 pulling ADC2 low shorts 3V3 to GND through the
+ mech. NC sw --+        |  [ Rpd ]        closed mechanical switch.
+                        |     |
+   ESP32 PIN_DEADMAN_CUT+    GND          open drain: high-Z = permit, driven low = kill
+      + a common ground with the VESC (already there via the CAN transceiver)
+```
+
+**Sizing Rs against the existing pull-down is a safety constraint, not a detail.** The VESC's
+threshold is a hard-coded 1.65 V **with no hysteresis**, sampled every 10 ms, so with the ESP32
+high-Z and the switch closed, `3.3 x Rpd/(Rs+Rpd)` must sit clear of it or the motor will chatter:
+
+| Rpd (measure yours) | with Rs 4.7k | verdict |
+|---|---|---|
+| 10 k | 2.24 V | ok |
+| 4.7 k | 1.65 V | **on the threshold - chatters** |
+| 100 k | 3.15 V | ok |
+
+Rule of thumb: **Rs <= Rpd/2**. Measure ADC2 with the switch closed before and after fitting Rs,
+and confirm the `KILLSW` indicator on the VESC 2/3 page follows both the mechanical switch and
+`PIN_DEADMAN_CUT`. `PIN_DEADMAN_CUT` defaults to GPIO1 (GPIO1, 8 and 18 are the free header pins);
+it must never be a strapping pin (8/9) or 15, because a glitch low at reset would be a spurious
+engine cut - `config.h` refuses to build those.
+
+### On the VESC
+
+Nothing to change if the mechanical switch already works: VESC Tool -> App Settings -> General ->
+**Kill Switch Mode** = `ADC2 Low` for a 3.3 V-high "run" line. On the entry edge the VESC's timeout
+thread releases the motor immediately (`mc_interface_release_motor_override()`, then
+`mc_interface_ignore_input_both()` re-armed every 10 ms), which overrides the local PPM/ADC
+throttle rather than racing it. **Cut latency is about 10 ms, not the app timeout.** The VESC
+reports the state back as status bit 1, which this firmware already polls and shows as `KILLSW` -
+that is what closes the loop below.
+
+### States
+
+| State | Cut | Meaning |
+|---|---|---|
+| `NO TAG` | `DEADMAN_BOOT_CUT` | the tag has not been seen yet. With the default 0 the motor runs and there is **no protection**; with 1 the tag cannot be forgotten, at the price of a dead tag battery immobilising the boat until the dashboard is powered down |
+| `ARMED` | no | the tag is fresh |
+| `GRACE` | no | quiet past `DEADMAN_WARN_MS`; the MAIN screen counts down in the CAN cell (`CUT 3s`) |
+| `TRIPPED` | **yes** | timed out. Latched: the tag coming back does not release it |
+| `NO RADIO` | no | the BLE scan is not running. **Does not cut** - our own failure must not stop the boat, the mechanical switch still covers the real hazard - but it means there is no protection, so it takes the MAIN screen's CAN cell and logs at ERROR |
+| `FAULT` | **yes** | the cut was asserted but the VESC never reported `KILLSW` within `DEADMAN_CONFIRM_MS` while its polls were arriving. Wiring, series resistor or VESC config. Never clears by itself |
+
+Arming deliberately needs `DEADMAN_ARM_REPORTS` (3) adverts inside `DEADMAN_ARM_WINDOW_MS` (2 s)
+with the last at `DEADMAN_ARM_RSSI` (-85 dBm) or better: arming on one weak packet from the car
+park would mean the first thing that happens when you leave the dock is a trip.
+
+While the motor is cut a full-screen **alarm replaces whatever page was selected** - it is not
+something you can page away from - and the long press that normally returns to MAIN clears the
+latch instead. The reset is **refused** unless the tag has been seen within
+`DEADMAN_RESET_FRESH_MS` (1 s), so the motor cannot be restarted while the person is still in the
+water; the alarm's last row says which of the two it will do.
+
+### Sharing the radio with the BMS
+
+NimBLE keeps one master context: it cannot scan and initiate a connection at the same time. The
+beacon scan is therefore the default state (continuous, passive, `filter_duplicates` off - a
+liveness watchdog needs every advert, not one per scan instance), and a BMS connect attempt is the
+only thing that interrupts it. To stop that interruption from tripping the switch, a BMS connect is
+only started when the dead-man is `ARMED`, the tag is fresh, the remaining margin covers the
+window, and nothing that is currently reporting says the boat is moving
+(`DEADMAN_STANDSTILL_ERPM` / `DEADMAN_STANDSTILL_MM_S`; a stale VESC or GNSS does not by itself
+forbid it). Otherwise the link is deferred and retried every `DEADMAN_CONNECT_RETRY_MS`. Both
+addresses must be pinned (`BMS_BLE_ADDR` and `DEADMAN_BEACON_ADDR`), which is enforced at compile
+time - a BMS discovery scan and the watchdog cannot share one scan safely.
+
+Two consequences of the BLE stack as configured: the tag must use **legacy advertising on the 1M
+PHY** (`CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT` is off, so extended-advertising beacons are invisible),
+and a dead tag battery is indistinguishable from a man overboard.
+
+### Commissioning
+
+Do this in order; the first step costs nothing and catches most of the mistakes.
+
+1. **Run it with the cut line disconnected** for several normal outings. The firmware arms, trips
+   and resets for real without touching the motor. Requirement before connecting the wire: zero
+   spurious trips over hours, with the tag carried where it will actually be carried. Watch
+   `gapmax` in the `DM` log line - **size `DEADMAN_TIMEOUT_MS` at 5x the worst gap you ever see**,
+   not by guessing.
+2. Connect the line. On the bench, prop out of the water: walk the tag away, confirm the motor
+   stops, `St KILLSW` appears on VESC 2/3 within two poll periods and the alarm says `VESC: KILLSW
+   ok`. Time "tag gone" to "motor stopped" with a clamp meter.
+3. **Negative test**: disable the kill switch in VESC Tool and repeat. The firmware must reach
+   `FAULT` and say `VESC: NOT CUT!`. This is the test that proves the closed loop is real - without
+   it, a broken cut wire looks identical to a working one until the first real trip.
+4. Confirm the mechanical lanyard still works on its own with the dashboard powered off. This is
+   the fail-passive property and the single most important test here.
+5. Unplug the dashboard mid-run and force a watchdog reboot: the motor must keep running both times.
+6. Only then a man-overboard rehearsal: tethered, low speed, open water, warm, a second person at
+   the helm, mechanical lanyard still worn.
+
+Log line (tag `dm`, every `LOG_DEADMAN_MS`), plus an immediate line on every transition:
+
+```
+I (63120) dm: DM state=ARMED since=412s out=permit tag=e1:23:45:67:89:ab last=120ms rssi=-62 n=18431 gapmax=340ms margin=4880ms trips=0 reset=0/0 confirm=- other=48219 skip=0
+E (71200) dm: TRIPPED: no tag for 5012 ms (timeout 5000, worst gap while armed 340 ms) - motor CUT and latched; long press on the DEADMAN screen with the tag present to reset
+```
 
 ## 6. Display behaviour
 
@@ -310,10 +433,21 @@ With the BMS pages (`bms` build; a 16S pack discharging, GNSS and SYS become 9/1
 - **VESC 1/3.** Row 1 is the fault row: `FAULT <name>` while the live fault byte of a fresh poll reply is non-zero, `LAST <name> <age>` when a fault was latched earlier (`34s`, `12m`, `3h`, `2d`), `FAULT none` (fresh reply, no fault, nothing latched), `FAULT --` (polled values stale, or `VESC_POLL_MS 0`). Then input voltage / battery current (one decimal), motor current / duty %, power / rpm, FET and motor temperature with one decimal (raw, no plausibility filter), Ah / Wh drawn.
 - **VESC 2/3** (polled values, `VESC_EXT_STALE_MS` window): `Tmos`, the first MOSFET temperature (the VESC reports three; MOSFET 2 and 3 stay in the poll and the log but left the screen) with `Iin`, the VESC's own averaged input current (`Tmos --    Iin --` when stale), average d/q currents, d/q voltages, tachometer (STATUS_5) / absolute tachometer (polled), status `St OK` / `TIMEOUT` (no control input, timeout brake active) / `KILLSW` / `TO+KILL` and the controller id from the reply, charged Ah / Wh.
 - **VESC 3/3**: PPM input / PID position, `ADC` 1/2/3 volts (`ADC --` when STATUS_6 is stale), poll counters `poll` (requests sent) / `ok` (complete replies) / `bad` (CRC or format failures) / `tmo` (reply timeouts) - `poll off   ok --` and `bad --     tmo --` in a `VESC_POLL_MS 0` build -, `frm` accepted status frames / `oth` frames from another controller id, `misc` non-status or odd-DLC frames / `busoff` events.
-- **BMS** (`bms` build, `g_state.bms`, section 5; the title carries the pack's cell count once a frame was decoded, `BMS 16S`). Live only while the link is streaming and the last decoded frame is within `BMS_STALE_MS` (10 s): `Vbat` pack voltage (two decimals) / `Ibat` pack current (one decimal, discharge-positive with `BMS_CURRENT_SIGN 1`); `P` pack power (same sign, `kW` from 10 kW) / `SOC` in %; `Ah` remaining / nominal capacity and `cyc` cycle count; `T` T1/T2 in whole degrees / `MOS` MOSFET temperature with one decimal (`--` outside -40..200 C, like the VESC temperatures); `lo` / `hi` lowest and highest cell as index:volts (`lo --` without an index); row 5: `d` cell delta in mV, `C` / `D` for charge / discharge MOSFET on (`-` = off), then `bal` balance current in A or, while any alarm bit is set, `ALM <name>` of the lowest set bit with `+` appended when there are more (`d 5mV CD ALM CELLUV+`; `mV` is dropped if the row would exceed 21 characters). The 32 alarm names, bit 0 first (the 24S layout carries bits 0..15 only): `WIRE_R MOS_OT CELLNO BIT3 FULL PACKOV CHG_OC CHG_SC CHG_OT CHG_UT COPROC CELLUV PACKUV DIS_OC DIS_SC DIS_OT CMOSAB DMOSAB GPS PASSWD DISON BAT_OT TSENS PLMOD SCPREL DOCP2 DOCP3 DIS_UT GPSLCK BIT29 BIT30 BIT31`. While not streaming, row 0 is a status and rows 1..5 keep their labels with `--`: `BLE OFF    no BMS` (BLE not started or NimBLE init failed), `STARTING   last 2m` (`BMS_LINK_ON_DEMAND`: the link was parked because no BMS screen was shown and the task has not yet acted on this one, at most 100 ms), `SCAN 34s` / `SCAN 34s   last 2m` (scanning for 34 s; `last` = age of the last decoded frame, omitted before the first one), `SCAN 1m    app open?` (scanning for `BMS_APP_HINT_S` = 60 s without ever seeing the BMS: the phone app probably holds its single connection), `CONNECTING last 2m`, `SETUP      last 2m` (connected: MTU exchange, discovery and subscription pending), `CONNECTED  layout ?` (frames arrive but neither cell layout is plausible), `NO DATA    last 12s` (streaming, but no frame for more than `BMS_STALE_MS`), `WAIT DATA` (subscribed, first frame pending).
+- **BMS** (`bms` build, `g_state.bms`, section 5; the title carries the pack's cell count once a frame was decoded, `BMS 16S`). Live only while the link is streaming and the last decoded frame is within `BMS_STALE_MS` (10 s): `Vbat` pack voltage (two decimals) / `Ibat` pack current (one decimal, discharge-positive with `BMS_CURRENT_SIGN 1`); `P` pack power (same sign, `kW` from 10 kW) / `SOC` in %; `Ah` remaining / nominal capacity and `cyc` cycle count; `T` T1/T2 in whole degrees / `MOS` MOSFET temperature with one decimal (`--` outside -40..200 C, like the VESC temperatures); `lo` / `hi` lowest and highest cell as index:volts (`lo --` without an index); row 5: `d` cell delta in mV, `C` / `D` for charge / discharge MOSFET on (`-` = off), then `bal` balance current in A or, while any alarm bit is set, `ALM <name>` of the lowest set bit with `+` appended when there are more (`d 5mV CD ALM CELLUV+`; `mV` is dropped if the row would exceed 21 characters). The 32 alarm names, bit 0 first (the 24S layout carries bits 0..15 only): `WIRE_R MOS_OT CELLNO BIT3 FULL PACKOV CHG_OC CHG_SC CHG_OT CHG_UT COPROC CELLUV PACKUV DIS_OC DIS_SC DIS_OT CMOSAB DMOSAB GPS PASSWD DISON BAT_OT TSENS PLMOD SCPREL DOCP2 DOCP3 DIS_UT GPSLCK BIT29 BIT30 BIT31`. While not streaming, row 0 is a status and rows 1..5 keep their labels with `--`: `BLE OFF    no BMS` (BLE not started, NimBLE init failed, or the host reset and has not re-synced), `STARTING   last 2m` (`BMS_LINK_ON_DEMAND`: the link was parked because no BMS screen was shown and the task has not yet acted on this one, at most 100 ms), `SCAN 34s` / `SCAN 34s   last 2m` (scanning for 34 s; `last` = age of the last decoded frame, omitted before the first one), `SCAN 1m    app open?` (scanning for `BMS_APP_HINT_S` = 60 s without ever seeing the BMS: the phone app probably holds its single connection), `CONNECTING last 2m`, `SETUP      last 2m` (connected: MTU exchange, discovery and subscription pending), `CONNECTED  layout ?` (frames arrive but neither cell layout is plausible), `NO DATA    last 12s` (streaming, but no frame for more than `BMS_STALE_MS`), `WAIT DATA` (subscribed, first frame pending).
 - **CELLS 1/2, 2/2** (title `CELLS 1/2 16S`): 12 cells per page in two columns, column-major (left 1..6, right 7..12), each slot `index volts` with `L` after the pack's lowest cell and `H` after its highest, `--` for a cell the pack does not have, one beyond `BMS_CELLS_MAX`, or every cell while not streaming. Page 2 shows 13..24 (`14 3.352H`, `17 --` .. `24 --` for a 16S pack); `BMS_CELLS_MAX` 12 or less gives a single `CELLS` page, 25..32 a third.
 - **GNSS**: fix and satellites (`3D 9sv`, `2D 12sv`, `TIME ONLY`, `NO FIX`, `NO DATA`, `NO GNSS`, or the phase `AUTOBAUD` / `DETECT` / `CONFIG` while nothing has been received) with pDOP; latitude/longitude with five decimals (`Pos --` without a usable fix); height above sea level / horizontal accuracy; speed (same rules as the main screen) / speed accuracy in m/s; heading of motion (only while moving) / vertical accuracy; UTC date-time (`UTC --` when unknown).
 - **SYS `FW_VERSION`**: uptime (`12m34s`, `1h23m`, `12d03h`) / debounced button presses, free heap / minimum free heap in kB, TWAI state (`UNINST` / `STOP` / `RUN` / `BUSOFF` / `RECOV`) with the TEC and REC error counters, GNSS phase, baud and PROTVER, good/bad UBX frames and redetects, reset reason / `state_lock()` timeouts.
+- **Dead-man overlay** (`deadman` build, section 5b). While the firmware is holding the motor cut
+  (`TRIPPED` or `FAULT`) a full-screen alarm **replaces** the selected page, so a cut motor is not
+  something you can page away from: title `MOTOR CUT`, then the state and how long the tag has been
+  missing, the worst advert gap while armed, the tag's RSSI and advert count, the closed-loop result
+  against the VESC (`VESC: KILLSW ok` / `waiting...` / `NOT CUT!` / `no reply`), the trip and
+  refused-reset counters, and a last row saying whether a long press will reset right now
+  (`HOLD BTN: RESET`) or be refused because the tag is absent (`HOLD BTN: NEED TAG`). A `FAULT`
+  cannot be reset from the panel at all (`FIX WIRING - NO RESET`). The MAIN screen's CAN cell is
+  taken over only by the two urgent states, `NO RADIO` and the `CUT 3s` countdown in `GRACE`; `NO
+  TAG` deliberately leaves it alone, because that is the resting state on every boot and the CAN
+  line is how you tell the VESC is alive at all.
 - **Formatting rules.** A number that does not fit its cell drops decimals one by one (`48.2` -> `100`), then switches to thousands (`12.3k`, `12k`), millions (`12M`) and finally `MAX` / `-MAX`; a clipped-but-plausible wrong number is never shown. Counters: `12345`, `1234k`, `123M`, `4G`. `-0.0` is printed as `0.0` so a current hovering around zero does not flicker. Speed: `0.0` below `SPEED_MIN_SHOW`, one decimal below 100, whole above, `--` without a usable fix or with a speed-accuracy estimate above `GNSS_MAX_SACC_MM_S`. Freshness windows: STATUS 1/4/5 `VESC_STALE_R1_MS`, STATUS 2/3/6 `VESC_STALE_R2_MS`, polled values `VESC_EXT_STALE_MS`, GNSS `GNSS_STALE_MS`, trip integrator `TRIP_STALE_MS`, BMS frames `BMS_STALE_MS`; anything older, or never received, is `--`.
 
 ### Button
@@ -345,7 +479,8 @@ Prerequisites: PlatformIO Core (`pio` on the PATH, e.g. `~/.platformio/penv/bin/
 | `pio run` | build the default firmware (env `dfrobot_firebeetle2_esp32c6`) |
 | `pio run -t upload` | build and flash over USB (`/dev/cu.usbmodem*`); hold BOOT while plugging in only if the port does not enumerate |
 | `pio device monitor` | serial console at 115200 with exception decoder and timestamps |
-| `pio test -e native` | host unit tests in six directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_ubx`, `test/test_trip`, `test/test_jk_bms`, `test/test_display_strings_oled`; 183 test cases): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, 32-bit clock wrap), JK BMS codec (command bytes, checksum, the frame assembler under every observed chunking, recorded 24S / 32S / 13S frames, layout detection, device info, alarm names), all OLED screens including BMS and CELLS, and the clock arithmetic; no hardware |
+| `pio run -e deadman -t upload` | the `bms` build plus the BLE dead-man's switch (section 5b). Both `BMS_BLE_ADDR` and `DEADMAN_BEACON_ADDR` must be set to your hardware first: the placeholders in `platformio.ini` are deliberately obvious, and a tag address that never matches leaves the switch in `NO TAG` for ever |
+| `pio test -e native` | host unit tests in six directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_ubx`, `test/test_trip`, `test/test_jk_bms`, `test/test_display_strings_oled`, `test/test_deadman`, `test/test_ble_addr`; 213 test cases): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, 32-bit clock wrap), JK BMS codec (command bytes, checksum, the frame assembler under every observed chunking, recorded 24S / 32S / 13S frames, layout detection, device info, alarm names), all OLED screens including BMS and CELLS, and the clock arithmetic; no hardware |
 | `pio run -e demo -t upload` | flash the layout demo (`DISPLAY_DEMO=1` on top of the `bms` env: all ten screens with synthetic data, dimming after 20 s) |
 | `pio run -e bms -t upload` | build and flash with the JK BMS BLE client (`BMS_BLE_ENABLE=1`, NimBLE host from `sdkconfig.defaults.bms`; +349 KB of flash, section 5). `pio run -e bms` alone only builds it |
 | `pio run -t menuconfig` | ESP-IDF menuconfig on the env's generated `sdkconfig`; put lasting changes into `sdkconfig.defaults` |
@@ -447,6 +582,7 @@ Compile-time checks stop you from using GPIO12/13, from sharing a GPIO between t
 | Active VESC polling | `VESC_POLL_MS` (0 = never transmit), `CAN_OWN_ID` (1..254, not a VESC id), `VESC_POLL_TIMEOUT_MS`, `VESC_EXT_STALE_MS`, `CAN_TX_QUEUE_LEN` |
 | GNSS | `PIN_GNSS_RX`, `PIN_GNSS_TX`, `GNSS_BAUDS`, `GNSS_TARGET_BAUD` (0 = keep the detected baud), `GNSS_RX_BUFFER`, `GNSS_RATE_MS` (200 = 5 Hz, 100 = 10 Hz), `GNSS_DYNMODEL_SEA`, `GNSS_STALE_MS`, `GNSS_REDETECT_MS`, `GNSS_ACK_TIMEOUT_MS`, `GNSS_MAX_SACC_MM_S`, `SPEED_MIN_SHOW`, `SPEED_UNIT_KNOTS` |
 | Trip / efficiency | `TRIP_PERIOD_MS`, `EFF_WINDOW_S` (2..120 s), `EFF_MIN_SPEED_MM_S`, `EFF_MIN_DIST_M`, `EFF_UNIT_KM` (1 = Wh/km even with knots), `LOG_TRIP_MS` (0 = off) |
+| Dead-man's switch (`deadman` env, section 5b) | `DEADMAN_ENABLE`, `DEADMAN_BEACON_ADDR` (mandatory), `PIN_DEADMAN_CUT`, `DEADMAN_TIMEOUT_MS`, `DEADMAN_WARN_MS`, `DEADMAN_ARM_REPORTS` / `DEADMAN_ARM_WINDOW_MS` / `DEADMAN_ARM_RSSI`, `DEADMAN_RESET_FRESH_MS`, `DEADMAN_BOOT_CUT`, `DEADMAN_CONFIRM_ENABLE` / `DEADMAN_CONFIRM_MS`, `DEADMAN_STANDSTILL_ERPM` / `DEADMAN_STANDSTILL_MM_S`, `DEADMAN_SCAN_ITVL_MS` / `DEADMAN_SCAN_WINDOW_MS`, `DEADMAN_BMS_CONNECT_MS`, `DEADMAN_CONNECT_RETRY_MS`, `TASK_PRIO_DEADMAN`, `DEADMAN_TASK_STACK`, `DEADMAN_TICK_MS`, `HB_MAX_DEADMAN_MS`, `LOG_DEADMAN_MS`. Derived: `DEADMAN_UI_ENABLE` |
 | BMS over BLE (`bms` env, section 5) | `BMS_BLE_ENABLE` (set by `[env:bms]`), `BMS_BLE_ADDR` ("" = scan by name prefix / service, a MAC = connect by address), `BMS_BLE_NAME_PREFIX`, `BMS_PROTOCOL` (0 = auto, 1 = JK02_24S, 2 = JK02_32S), `BMS_CELLS_MAX` (1..32), `BMS_CURRENT_SIGN` (1 = discharge-positive), `BMS_LINK_ON_DEMAND` (1 = link up only while a BMS screen is shown), `BMS_STALE_MS`, `BMS_RECONNECT_MS`, `BMS_RECONNECT_MAX_MS`, `BMS_RECONNECT_FAILS`, `HB_MAX_BMS_MS` (0 = never gate the watchdog), `LOG_BMS_MS` (0 = off). Derived, do not edit: `BMS_UI_ENABLE` (`BMS_BLE_ENABLE` or `DISPLAY_DEMO`: the screens and `g_state.bms` exist) and `BMS_CELL_PAGES` (ceil(`BMS_CELLS_MAX` / 12)) |
 | Tasks / watchdog / logging | `TASK_PRIO_CAN`, `TASK_PRIO_GNSS`, `TASK_PRIO_DISP`, `WDT_TIMEOUT_MS`, `HB_MAX_CAN_MS`, `HB_MAX_GNSS_MS`, `HB_MAX_DISP_MS`, `LOG_VESC_MS`, `LOG_GNSS_MS`, `LOG_TRIP_MS`, `LOG_SYS_MS`, `SERIAL_BOOT_DELAY_MS`, `PIN_LED`, `FW_VERSION` |
 | Advanced (defaults are fine) | `CAN_TASK_STACK`, `CAN_INSTALL_RETRY_MS`, `CAN_RX_TIMEOUT_MS`, `CAN_ERR_LOG_MIN_MS`, `CAN_ERR_WARN_LEVEL`, `CAN_TX_WAIT_MS`, `VESC_POLL_LOG_MIN_MS`, `VESC_POLL_BACKOFF_AFTER`, `VESC_POLL_BACKOFF_MS`, `VESC_GETVALUES_MASK` (0 = plain `COMM_GET_VALUES`), `VESC_RX_BUFFER_SIZE`, `GNSS_TASK_STACK`, `GNSS_AUTOBAUD_LISTEN_MS`, `GNSS_MONVER_TIMEOUT_MS`, `GNSS_AUTOBAUD_RETRY_MS`, `OLED_TASK_STACK`, `OLED_INIT_RETRY_MS`, `OLED_I2C_TIMEOUT_MS`, `OLED_BUTTON_POLL_MS`. Also in `config.h`, with local `#ifndef` fallbacks in the sources so a trimmed copy still builds: `GNSS_BAUD_SWITCH_ATTEMPTS` (2), `GNSS_BAUD_SWITCH_SETTLE_MS` (100), `TASK_PRIO_TRIP` (3), `TRIP_TASK_STACK` (4096), `TRIP_DT_MAX_MS` (5000), `TRIP_COUNTER_RESET_WH` (0.5), `TRIP_EFF_MIN_FILL_S` (3), `TRIP_STALE_MS` (5000). The BMS link timing (section 5): `BMS_TASK_PRIO` (4), `BMS_TASK_STACK` (4096), `BMS_CONNECT_TIMEOUT_MS` (10000), `BMS_SETUP_TIMEOUT_MS` (8000), `BMS_FIRST_FRAME_TIMEOUT_MS` (15000), `BMS_POLL_MS` (5000), `BMS_SCAN_FAST_MS` (30000), `BMS_SCAN_FAST_ITVL_MS` / `BMS_SCAN_FAST_WINDOW_MS` (60 / 30), `BMS_SCAN_SLOW_ITVL_MS` / `BMS_SCAN_SLOW_WINDOW_MS` (1000 / 30), `BMS_MSG_BUF_BYTES` (2048), `BMS_APP_HINT_S` (60). `src/can_vesc.cpp` alone: `CAN_SAMPLE_POINT_PERMILL` (800, the bit sample point) |
@@ -456,10 +592,11 @@ Notes: the OLED layout is hard-coded for 128x64 in `OLED_ROTATION` 0 or 2. `OLED
 ## 9. Passivity and safety notes
 
 - With the default `VESC_POLL_MS 1000` the board is no longer silent on the bus: it transmits one 7-byte read request per second under its own id `CAN_OWN_ID` (`candump` on a second adapter shows `0000084A [7] 78 00 32 00 3E C0 3C` for VESC id 74) and the VESC answers with seven frames. The request is the same read-only query VESC Tool uses; nothing in the firmware can write a setting or command the motor (`grep -rn twai_node_transmit src/` finds the single call in `poll_tick()`, under `#if VESC_POLL_MS > 0`). Build with `-DVESC_POLL_MS=0` to get a node that only ACKs and contains no transmit call at all.
+- The dead-man's switch (section 5b) does **not** change any of this. It cuts the motor through a GPIO wired to the VESC's own kill-switch input, so `grep -rn twai_node_transmit src/` still finds the single call in `poll_tick()` and the bytes on the CAN bus are identical with `DEADMAN_ENABLE` 0 or 1. What does change is that the board now actuates a safety input. It is fail-passive - the pin is open drain, so the firmware can only ever ADD a kill and a dead dashboard leaves the mechanical lanyard in charge - but a hung dashboard silently removes the BLE layer for up to `WDT_TIMEOUT_MS`, and a reboot releases a latched cut. It is not a certified man-overboard device and does not replace the lanyard.
 - The BLE link of the `bms` env (section 5) is read-only as well: the firmware writes exactly two registers to the BMS, 0x97 (device info) and 0x96 (start the cell-info stream), plus the CCCD subscription (`01 00`) that enables notifications; it never changes a BMS setting (charge / discharge switches, protection limits, balancing, names). It does occupy the BMS's single BLE slot while connected, so the JK app cannot be used at the same time, and it stores no bonding: after the first controller enable (PHY calibration blob, written before the CAN node exists) nothing is written to flash.
 - The polled averages (Iavg, id/iq, vd/vq) are "since the previous read": running VESC Tool's realtime page at the same time shortens their window on both sides. Everything else is unaffected by a second reader.
 - With the VESC powered off, each unanswered request costs the controller 8 error points until it goes error-passive (~16 polls); the log then shows `CAN: error passive` and the poll warnings every 10 s and the request rate drops to every 5 s. No bus-off, and it recovers by itself when the VESC is back.
-- Displayed and logged power is signed: `v_in x current_in`, negative while regenerating (the water drives the motor); VESC Tool's realtime power stat is an absolute value, so the two can differ in sign, not in magnitude. The cells are EMA-smoothed (`CAN_EMA_ALPHA`) and may be up to `VESC_STALE_R1_MS` old; a fault shows on the VESC 1/3 page only after the next poll (up to `VESC_POLL_MS` later) and only as long as the VESC keeps it or via the latch. This is a dashboard, not a protection device: rely on the VESC's own limits and a BMS for that.
+- Displayed and logged power is signed: `v_in x current_in`, negative while regenerating (the water drives the motor); VESC Tool's realtime power stat is an absolute value, so the two can differ in sign, not in magnitude. The cells are EMA-smoothed (`CAN_EMA_ALPHA`) and may be up to `VESC_STALE_R1_MS` old; a fault shows on the VESC 1/3 page only after the next poll (up to `VESC_POLL_MS` later) and only as long as the VESC keeps it or via the latch. With `DEADMAN_ENABLE` 0 (the default) this is a dashboard, not a protection device: rely on the VESC's own limits and a BMS for that. `DEADMAN_ENABLE` 1 adds one GPIO that asserts a kill the VESC already knows how to act on; it still cannot command the motor, change a limit or write a setting.
 - OLED modules are specified for roughly -40..70 C (vendor dependent; some 1.54" boards only -20..60 C), but the glass, the FPC and the boost converter must stay dry: condensation on a boat needs an enclosure or conformal coating. In direct sun a ~110 cd/m2 OLED is hard to read; a sunshade helps more than contrast.
 - Burn-in is the OLED's wear mechanism: a dashboard that shows the same numbers for hours is the worst case. Keep `OLED_IDLE_DIM_MS` enabled and expect the panel to lose brightness over thousands of hours; the detail screens' inverted title bar is the only filled area, and a long press (or `SCREEN_AUTO_RETURN_MS`, off by default) brings the sparse main screen back.
 - A hung task reboots the board after `WDT_TIMEOUT_MS` (20 s); the next banner reports `reset=TASK_WDT`. The OLED keeps its last image until the firmware pulses RES about 1.5 s into the reboot, then shows the boot frame.

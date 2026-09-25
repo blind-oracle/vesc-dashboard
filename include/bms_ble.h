@@ -27,9 +27,14 @@ const char *bms_link_str(uint8_t link);
 //   false -> terminate the link, stop scanning and stay idle (BMS_LINK_IDLE)
 // With BMS_LINK_ON_DEMAND 0 the link is held from boot on and this call does nothing.
 void bms_set_active(bool active);
+// True while the always-on beacon watchdog scan is running (DEADMAN_ENABLE builds only;
+// always false otherwise). Read by the dead-man task to decide whether it is actually
+// protecting anything - it must never call a NimBLE API itself, bmsTask owns those.
+bool bms_ble_scanning();
 #else
 inline bool bms_ble_start() { return false; }
 inline void bms_log_summary(const SharedState &, uint32_t) {}
 inline const char *bms_link_str(uint8_t) { return "OFF"; }
 inline void bms_set_active(bool) {}
+inline bool bms_ble_scanning() { return false; }
 #endif
