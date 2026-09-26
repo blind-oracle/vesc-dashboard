@@ -38,6 +38,9 @@
 
 #include "config.h"
 #include "shared_state.h"
+#if DEADMAN_UI_ENABLE
+#include "deadman_logic.h"  // deadman_pub_age(): the freshest enrolled tag, for the main row
+#endif
 #include "vesc_getvalues.h"  // vesc_fault_fmt(): "OT_FET" / "F37" (<= 8 chars), Arduino-free
 #include "vesc_status.h"
 
@@ -166,7 +169,11 @@ constexpr int kColBaseline[3] = {8, 16, 24};     // caps rows 1..7, 9..15, 17..2
 constexpr int kClockChars = 5;                   // "HH:MM"
 constexpr int kFixChars = 6;                     // clock + ' ' + fix = kColChars
 constexpr int kCanChars = 8;
+#if DEADMAN_UI_ENABLE
+constexpr int kUnitChars = kColChars;            // the dead-man row takes the whole line (see build_main_unit)
+#else
 constexpr int kUnitChars = 4;                    // "km/h"
+#endif
 // Zone B: rule, then 4 rows x 2 cells. A cell is 64 px: label at x0 + 2, value
 // right-aligned by advance to x0 + 62 (last ink column <= x0 + 60, so the left
 // value and the right label are >= 5 px apart). 10 chars = 60 px per cell.
@@ -227,7 +234,8 @@ static_assert(kGridCol2 <= kGridChars - 1, "second column inside the row");
 // ---------------------------------------------------------------- output structs
 struct OledMain {
   char speed[6];  // "10.0" / "117" / "0.0" / "--"                    (<= 4 chars, big font: digits '.' '-' only)
-  char unit[6];   // SPEED_UNIT_STR ("kn" / "km/h")                  (<= 4)
+  char unit[14];  // SPEED_UNIT_STR ("kn" / "km/h"), or in a DEADMAN_UI_ENABLE build the dead-man
+                  // row instead ("1:-62 2:-70" / "CUT IN 3s" / "NO RADIO")   (<= kUnitChars)
   char clock[6];  // "14:34" local (UTC + TIME_UTC_OFFSET_MIN) / "--:--" (5)
   char fix[8];    // "3D 9sv" / "3D12sv" / "2D 8sv" / "NOFIX" / "NODATA" / "NOGNSS" / "BOOT" (<= 6)
   char can[10];   // "VESC 74" / "CAN idle" / "CAN RECV" / "CAN OFF" / FW_VERSION at boot   (<= 8)
@@ -840,6 +848,62 @@ inline void build_bms_status(const BmsState &b, uint32_t now, char *row) {
 
 }  // namespace oled_detail
 
+#if DEADMAN_UI_ENABLE
+// The dead-man row REPLACES the speed unit on the main screen. A unit that never changes is
+// worth less than knowing whether the switch is protecting you and how much signal margin
+// each tag has; the unit is a build-time constant and is still shown on the EFFICIENCY page
+// ("mean 5.9kn"). Having this row is also what lets the CAN cell go back to always showing
+// the CAN state - the dead-man used to hijack it for want of anywhere else.
+//
+// Priority order, first match wins (12 chars):
+//   "NO RADIO"     the watchdog scan is not running: no protection at all
+//   "CUT IN 3s"    GRACE, counting down to the cut
+//   "1:-62 2:-70"  each configured tag and its RSSI
+//
+// A slot reads " --" while its tag is quiet (older than DEADMAN_WARN_MS) and "off" once the
+// enrolment window has closed without it - that is the "disabled because it was missing at
+// startup" state. An unconfigured slot is not shown at all, so a single-tag boat reads
+// "1:-62". All three slot forms are 3 characters, so the row never jitters in width.
+inline void build_main_deadman(const SharedState &s, uint32_t now, OledMain &out) {
+  using namespace oled_detail;
+  const DeadmanState &d = s.deadman;
+  if (d.state == DM_UNAVAILABLE) {
+    copy_str(out.unit, sizeof out.unit, "NO RADIO");
+    return;
+  }
+  if (d.state == DM_GRACE) {
+    const uint32_t age = deadman_pub_age(d, now);
+    if (age < (uint32_t)DEADMAN_TIMEOUT_MS) {
+      char a[4];  // fmt_age_short is at most 3 chars
+      fmt_age_short(a, sizeof a, (uint32_t)DEADMAN_TIMEOUT_MS - age);
+      snprintf(out.unit, sizeof out.unit, "CUT IN %s", a);
+      return;
+    }
+  }
+  out.unit[0] = '\0';
+  for (unsigned i = 0; i < DEADMAN_TAGS; ++i) {
+    if (!d.tags[i].configured) continue;
+    char val[6], one[10];
+    if (!d.tags[i].enrolled && !d.enrol_open) {
+      copy_str(val, sizeof val, "off");  // it was not there when the set was frozen
+    } else if (d.tags[i].t_ms == 0 || age_ms(d.tags[i].t_ms, now) > (uint32_t)DEADMAN_WARN_MS) {
+      copy_str(val, sizeof val, " --");
+    } else {
+      // Clamped to -99: a 4-digit RSSI would push two slots past the 12-char row, and
+      // anything below -99 dBm is unusable for a watchdog anyway.
+      int rssi = (int)d.tags[i].rssi;
+      if (rssi < -99) rssi = -99;
+      if (rssi > 0) rssi = 0;
+      snprintf(val, sizeof val, "%3d", rssi);
+    }
+    snprintf(one, sizeof one, "%s%u:%s", out.unit[0] ? " " : "", i + 1u, val);
+    append_str(out.unit, sizeof out.unit, one);
+  }
+  if (out.unit[0] == '\0') copy_str(out.unit, sizeof out.unit, "NO TAG");  // nothing configured
+  clip(out.unit, sizeof out.unit, kUnitChars);
+}
+#endif  // DEADMAN_UI_ENABLE
+
 // ================================================================ public builders
 // Main screen. now = current millis() (same clock as the timestamps in s).
 inline void oled_build_main(const SharedState &s, uint32_t now, OledMain &out) {
@@ -851,31 +915,9 @@ inline void oled_build_main(const SharedState &s, uint32_t now, OledMain &out) {
   clip(out.unit, sizeof out.unit, kUnitChars);
   fmt_clock(out.clock, sizeof out.clock, s.gnss, now);
   build_main_fix(s.gnss, now, out);
-  build_main_can(s, f, out);
+  build_main_can(s, f, out);  // never overridden any more: the dead-man has its own row
 #if DEADMAN_UI_ENABLE
-  // The states where the dead-man is NOT protecting anything, or is about to cut, take the
-  // CAN cell on the page the helmsman actually looks at. A cut itself needs no banner: the
-  // alarm overlay has already replaced the whole screen by then. The CAN string is only
-  // hidden while there is something more important to say.
-  {
-    const uint32_t tag_age = age_ms(s.deadman.beacon_t_ms, now);
-    char a[4];  // fmt_age_short is at most 3 chars ("49d"); sized so "CUT %s" cannot truncate
-    switch (s.deadman.state) {
-      // DM_WAIT_TAG deliberately does NOT take the cell. It is the resting state before the
-      // tag has ever been seen - i.e. every boot - and permanently hiding the CAN line,
-      // which is how you tell whether the VESC is alive at all, would be a bad trade for a
-      // warning that never changes. The log line and the alarm overlay carry that state.
-      case DM_UNAVAILABLE: snprintf(out.can, sizeof out.can, "NO RADIO"); break;
-      case DM_GRACE:
-        if (tag_age < (uint32_t)DEADMAN_TIMEOUT_MS) {
-          fmt_age_short(a, sizeof a, (uint32_t)DEADMAN_TIMEOUT_MS - tag_age);
-          snprintf(out.can, sizeof out.can, "CUT %s", a);  // counting down to the cut
-        }
-        break;
-      default: break;  // ARMED: nothing to say, the CAN line keeps the cell
-    }
-    clip(out.can, sizeof out.can, kCanChars);
-  }
+  build_main_deadman(s, now, out);  // replaces the speed unit written above
 #endif
   build_main_cells(s, f, out);
 }
@@ -1323,12 +1365,12 @@ inline void oled_build_deadman_alarm(const SharedState &s, uint32_t now, OledGri
   g.nrows = kGridRows;
 
   char l[32], r[32], a[12];
-  const uint32_t age = age_ms(d.beacon_t_ms, now);
+  const uint32_t age = deadman_pub_age(d, now);  // the freshest ENROLLED tag
 
   if (d.state == DM_FAULT) {
     row2(g.rows[0], "FAULT", "CUT FAILED");
-  } else if (d.beacon_t_ms) {
-    fmt_age_short(a, sizeof a, age_clamped(d.beacon_t_ms, now));
+  } else if (age != 0xFFFFFFFFu) {
+    fmt_age_short(a, sizeof a, age);
     snprintf(r, sizeof r, "no tag %s", a);
     row2(g.rows[0], "TRIPPED", r);
   } else {
@@ -1339,11 +1381,32 @@ inline void oled_build_deadman_alarm(const SharedState &s, uint32_t now, OledGri
   snprintf(l, sizeof l, "gapmax %sms", a);
   row1(g.rows[1], l);
 
-  if (d.beacon_t_ms) snprintf(l, sizeof l, "tag %ddBm", (int)d.beacon_rssi);
-  else snprintf(l, sizeof l, "tag --");
-  fmt_count(a, sizeof a, d.beacon_reports, 6);
-  snprintf(r, sizeof r, "n %s", a);
-  row2(g.rows[2], l, r);
+  // Both tags on one row, same "1:-62" encoding as the main screen, plus the total
+  // advert count so a tag that has gone deaf is obvious next to one that has not.
+  {
+    char slots[16] = {0};
+    uint32_t total = 0;
+    for (unsigned i = 0; i < DEADMAN_TAGS; ++i) {
+      if (!d.tags[i].configured) continue;
+      total += d.tags[i].reports;
+      char val[6], one[10];
+      if (!d.tags[i].enrolled) copy_str(val, sizeof val, "off");
+      else if (d.tags[i].t_ms == 0 || age_ms(d.tags[i].t_ms, now) > (uint32_t)DEADMAN_WARN_MS)
+        copy_str(val, sizeof val, " --");
+      else {
+        int rssi = (int)d.tags[i].rssi;
+        if (rssi < -99) rssi = -99;
+        if (rssi > 0) rssi = 0;
+        snprintf(val, sizeof val, "%3d", rssi);
+      }
+      snprintf(one, sizeof one, "%s%u:%s", slots[0] ? " " : "", i + 1u, val);
+      append_str(slots, sizeof slots, one);
+    }
+    if (slots[0] == '\0') copy_str(slots, sizeof slots, "no tags");
+    fmt_count(a, sizeof a, total, 5);
+    snprintf(r, sizeof r, "n %s", a);
+    row2(g.rows[2], slots, r);
+  }
 
   // The closed loop. "NOT CUT" is the one that means "the wiring or the VESC config is
   // wrong and the motor may still be live" - it must not read like a mere warning.

@@ -153,7 +153,7 @@
 #define BMS_BLE_ENABLE 0 // 1 = build the NimBLE client + bmsTask (needs 'pio run -e bms'); 0 = no BLE code at all
 #endif
 #ifndef BMS_BLE_ADDR
-#define BMS_BLE_ADDR "" // BMS Bluetooth MAC "C8:47:8C:12:34:56" = connect by address (passive scan); "" = match by name prefix / 0xFFE0 (active scan)
+#define BMS_BLE_ADDR "C8:47:8C:EE:D1:37" // BMS Bluetooth MAC "C8:47:8C:12:34:56" = connect by address (passive scan); "" = match by name prefix / 0xFFE0 (active scan)
 #endif
 #ifndef BMS_BLE_NAME_PREFIX
 #define BMS_BLE_NAME_PREFIX "JK" // advertised name prefix ("JK-..." / "JK_..."); the name is user-editable in the JK app
@@ -220,8 +220,23 @@
                           // switch's 3.3 V leg (Rs <= Rpd/2, so the permit level stays clear of the VESC's
                           // hard 1.65 V threshold, which has no hysteresis). -1 = no pin (logic only, for soak tests).
 #endif
+// Up to two tags. Which of them actually guard the motor is decided ONCE, at the moment
+// protection begins: the first tag to arm opens a DEADMAN_ENROL_MS window, any other tag
+// that arms inside it joins, and the set is then frozen for the run. A tag that turns up
+// later - the one left in the car, still in range at the dock - can never join and
+// silently keep the switch alive. With two tags enrolled the cut comes only when BOTH
+// have gone quiet; either one aboard keeps the motor running.
 #ifndef DEADMAN_BEACON_ADDR
-#define DEADMAN_BEACON_ADDR "" // tag MAC "E1:23:45:67:89:AB" (fixed public address). Mandatory: there is no discovery mode
+#define DEADMAN_BEACON_ADDR "F2:28:3C:03:E4:AD" // tag 1 MAC, fixed public address. Mandatory: there is no discovery mode
+#endif
+#ifndef DEADMAN_BEACON_ADDR2
+#define DEADMAN_BEACON_ADDR2 "" // tag 2 MAC, or "" for a single-tag boat. A malformed non-empty address is fatal (a typo
+                                // must never silently disable a tag); the two addresses must differ
+#endif
+#ifndef DEADMAN_ENROL_MS
+#define DEADMAN_ENROL_MS 5000 // how long the enrolment window stays open after the FIRST tag arms, so a second tag
+                              // that is also aboard can join. Longer = more forgiving of a slow tag; too long and a
+                              // tag that is merely nearby at the dock gets in
 #endif
 #ifndef DEADMAN_TIMEOUT_MS
 #define DEADMAN_TIMEOUT_MS 5000 // no matching advert for this long while armed -> assert the cut and latch it
@@ -233,7 +248,7 @@
 #define DEADMAN_ARM_REPORTS 3 // adverts needed to arm: a tag that was never aboard must not be able to trip anything
 #endif
 #ifndef DEADMAN_ARM_WINDOW_MS
-#define DEADMAN_ARM_WINDOW_MS 2000 // ... they must all arrive inside this window
+#define DEADMAN_ARM_WINDOW_MS 5000 // ... they must all arrive inside this window
 #endif
 #ifndef DEADMAN_ARM_RSSI
 #define DEADMAN_ARM_RSSI -85 // ... and the last one must be at least this strong (dBm): arming on a tag in the car park means a trip at the dock
@@ -573,6 +588,10 @@
 #define BMS_UI_ENABLE (BMS_BLE_ENABLE || DISPLAY_DEMO)
 // Dead-man's switch: the state struct and its screen exist when the feature is built or in the demo.
 #define DEADMAN_UI_ENABLE (DEADMAN_ENABLE || DISPLAY_DEMO)
+// Tag slots. Fixed at 2 so there is ONE code path: an empty or unparsable DEADMAN_BEACON_ADDR2
+// leaves slot 2 inert (ble_addr_parse zeroes its output, and an all-zero address never matches a
+// real advert), so a single-tag boat behaves exactly as it did before the slot existed.
+#define DEADMAN_TAGS 2
 #define BMS_CELL_PAGES ((BMS_CELLS_MAX + 11) / 12)
 
 // ============================================================================

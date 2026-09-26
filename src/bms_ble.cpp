@@ -87,7 +87,7 @@ static_assert(sizeof(BMS_BLE_ADDR) == 18,
               "cannot share one NimBLE scan safely (-DBMS_BLE_ADDR='\"c8:47:8c:12:34:56\"')");
 // Parsed once in bms_ble_start(), before the host task exists, then read-only: the host
 // task compares every advert against it without a lock.
-static uint8_t s_tag_addr[6];
+static uint8_t s_tag_addr[DEADMAN_TAGS][6];  // all-zero = that slot is inert and can never match
 static uint8_t s_bms_addr_val[6];
 #endif
 
@@ -257,9 +257,18 @@ static int gap_cb(struct ble_gap_event *event, void *) {
       // The tag is timestamped HERE, in the host task, and never enters the message
       // buffer: the safety timestamp must not depend on bmsTask draining a buffer that
       // BMS notifications can fill. Three volatile stores, no lock, no log, no alloc.
-      if (ble_addr_equal(d.addr.val, s_tag_addr)) {
-        deadman_beacon_seen(d.rssi, state_now_ms());
-        break;
+      // Tags are checked BEFORE the BMS, and a match breaks out immediately: reordering
+      // these two would start counting tag adverts as adv_other. An unconfigured slot is
+      // all-zero, so it never matches a real advert.
+      {
+        bool tag_hit = false;
+        for (unsigned i = 0; i < DEADMAN_TAGS; ++i) {
+          if (!ble_addr_equal(d.addr.val, s_tag_addr[i])) continue;
+          deadman_beacon_seen((uint8_t)i, d.rssi, state_now_ms());
+          tag_hit = true;
+          break;
+        }
+        if (tag_hit) break;
       }
       // The watchdog scan runs with filter_duplicates off, so a marina full of phones
       // would otherwise flood the 2 KB buffer. Only the pinned BMS is worth posting.
@@ -1515,8 +1524,14 @@ bool bms_ble_start() {
   // compare against them without a lock or an initialisation race. A bad tag address is
   // fatal for the dead-man (deadman_start() refuses and holds the cut), but the BMS
   // client itself keeps working, so only warn here.
-  if (!ble_addr_parse(DEADMAN_BEACON_ADDR, s_tag_addr))
-    ESP_LOGE(TAG, "DEADMAN_BEACON_ADDR \"%s\" is unusable: no advert can ever match the tag", DEADMAN_BEACON_ADDR);
+  {
+    const char *const tag_addr[DEADMAN_TAGS] = {DEADMAN_BEACON_ADDR, DEADMAN_BEACON_ADDR2};
+    for (unsigned i = 0; i < DEADMAN_TAGS; ++i) {
+      if (tag_addr[i][0] == '\0') continue;  // slot not configured: left all-zero, never matches
+      if (!ble_addr_parse(tag_addr[i], s_tag_addr[i]))
+        ESP_LOGE(TAG, "tag %u address \"%s\" is unusable: no advert can ever match it", i + 1u, tag_addr[i]);
+    }
+  }
   if (!ble_addr_parse(BMS_BLE_ADDR, s_bms_addr_val))
     ESP_LOGE(TAG, "BMS_BLE_ADDR \"%s\" is unusable: the BMS can never be reached in a dead-man build", BMS_BLE_ADDR);
 #endif

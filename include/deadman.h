@@ -24,10 +24,11 @@ void deadman_gpio_early_init();
 // or the beacon address is unusable; the cut is then asserted permanently and logged.
 bool deadman_start();
 
-// Called from the NimBLE host task for every advert that matches DEADMAN_BEACON_ADDR.
-// Three volatile stores: no lock, no log, no allocation. Deliberately NOT routed through
-// the BMS message buffer, so the safety timestamp never depends on bmsTask draining it.
-void deadman_beacon_seen(int8_t rssi, uint32_t now_ms);
+// Called from the NimBLE host task for every advert that matches tag slot `tag`
+// (0 = DEADMAN_BEACON_ADDR, 1 = DEADMAN_BEACON_ADDR2). Three volatile stores: no lock, no
+// log, no allocation. Deliberately NOT routed through the BMS message buffer, so the safety
+// timestamp never depends on bmsTask draining a buffer BMS notifications can fill.
+void deadman_beacon_seen(uint8_t tag, int8_t rssi, uint32_t now_ms);
 // Called from the same place for every advert that does not match (crowded-marina counter).
 void deadman_adv_other();
 
@@ -43,7 +44,7 @@ void deadman_log_summary(const SharedState &s, uint32_t now);
 #else
 inline void deadman_gpio_early_init() {}
 inline bool deadman_start() { return false; }
-inline void deadman_beacon_seen(int8_t, uint32_t) {}
+inline void deadman_beacon_seen(uint8_t, int8_t, uint32_t) {}
 inline void deadman_adv_other() {}
 inline void deadman_request_reset() {}
 inline void deadman_log_events(const SharedState &, uint32_t) {}

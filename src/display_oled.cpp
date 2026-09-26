@@ -472,6 +472,27 @@ static SharedState demo_state(uint32_t now) {
     b.connects = 1;
   }
 #endif
+
+#if DEADMAN_UI_ENABLE
+  // Dead-man's switch: two tags aboard and enrolled, their RSSI wandering on slow
+  // independent phases so the main-screen row moves the way it will on the water.
+  {
+    DeadmanState &dm = s.deadman;
+    dm.state = DM_ARMED;
+    dm.enrolled_count = 2;
+    dm.enrol_open = false;
+    dm.state_since_ms = 1u;
+    dm.gap_max_ms = 260;
+    for (unsigned i = 0; i < DEADMAN_TAGS; ++i) {
+      dm.tags[i].configured = true;
+      dm.tags[i].enrolled = true;
+      dm.tags[i].t_ms = stamp;
+      dm.tags[i].reports = tsec * 4u;
+      dm.tags[i].gap_max_ms = 200 + 60 * i;
+      dm.tags[i].rssi = (int8_t)lroundf(-62.0f - 8.0f * (float)i + 6.0f * sinf(t / (11.0f + 7.0f * (float)i)));
+    }
+  }
+#endif
   return s;
 }
 #endif

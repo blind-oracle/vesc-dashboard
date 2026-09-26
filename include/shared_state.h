@@ -216,16 +216,29 @@ enum DmConfirm : uint8_t {
   DM_CONFIRM_STALE,       // no fresh poll reply, so nothing can be concluded (never a FAULT)
 };
 
+// One tag slot as the screens and the log see it. Up to DEADMAN_TAGS of these; a slot whose
+// address is empty or unparsable is inert (configured == false) and is simply not shown.
+struct DeadmanTag {
+  uint32_t t_ms;       // last advert from THIS tag (0 = never)
+  uint32_t reports;    // adverts from this tag since boot
+  uint32_t gap_max_ms; // longest gap between ITS OWN adverts while enrolled - never the gap in the
+                       // union of both tags, which would under-report and make the README's
+                       // "size the timeout at 5x gapmax" advice unsafe
+  int8_t rssi;
+  bool configured;     // a usable address is set for this slot
+  bool enrolled;       // it was present when the enrolment window closed, so it guards the motor
+};
+
 struct DeadmanState {
   uint8_t state;             // DmState
   uint8_t confirm;           // DmConfirm
   bool cut;                  // PIN_DEADMAN_CUT is being pulled low right now
+  bool enrol_open;           // the enrolment window is still open (a second tag can still join)
+  uint8_t enrolled_count;    // tags currently guarding the motor
   uint32_t state_since_ms;   // when the state was entered (0 = never)
-  uint32_t beacon_t_ms;      // last matching advert (0 = never)
-  int8_t beacon_rssi;
-  uint32_t beacon_reports;   // matching adverts since boot
+  DeadmanTag tags[DEADMAN_TAGS];
   uint32_t adv_other;        // non-matching adverts seen (a crowded-marina indicator)
-  uint32_t gap_max_ms;       // longest gap between adverts while armed: sizes DEADMAN_TIMEOUT_MS
+  uint32_t gap_max_ms;       // max over the enrolled tags' own gaps: the number that sizes DEADMAN_TIMEOUT_MS
   uint32_t trips, resets, resets_refused;
   uint32_t publish_skipped;  // state_lock() misses from the deadman task
 };

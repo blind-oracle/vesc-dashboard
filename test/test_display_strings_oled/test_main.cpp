@@ -308,8 +308,14 @@ static void assert_zero_tail(const char *buf, size_t n) {
 static void test_main_sample_state() {
   OledMain m = build_main(make_state(NOW), NOW);
   TEST_ASSERT_EQUAL_STRING(kSpeed5144, m.speed);
+#if DEADMAN_UI_ENABLE
+  // The dead-man row owns this line in a deadman build; the unit lives on the EFFICIENCY
+  // page instead. test_deadman_main_row covers every form it can take.
+  TEST_ASSERT_EQUAL_STRING("NO TAG", m.unit);
+#else
   TEST_ASSERT_EQUAL_STRING(kUnit, m.unit);
   TEST_ASSERT_EQUAL_STRING(SPEED_UNIT_STR, m.unit);
+#endif
   TEST_ASSERT_EQUAL_STRING("3D 9sv", m.fix);
   TEST_ASSERT_EQUAL_STRING("VESC 74", m.can);
   TEST_ASSERT_EQUAL_STRING("BV", m.cells[0].label);
@@ -2174,9 +2180,12 @@ static void test_deadman_alarm_overlay() {
   // Tripped: the overlay takes over from EVERY screen, including MAIN.
   s.deadman.state = DM_TRIPPED;
   s.deadman.cut = true;
-  s.deadman.beacon_t_ms = NOW - 12000;
-  s.deadman.beacon_rssi = -62;
-  s.deadman.beacon_reports = 18431;
+  s.deadman.enrolled_count = 1;
+  s.deadman.tags[0].configured = true;
+  s.deadman.tags[0].enrolled = true;
+  s.deadman.tags[0].t_ms = NOW - 12000;
+  s.deadman.tags[0].rssi = -62;
+  s.deadman.tags[0].reports = 18431;
   s.deadman.gap_max_ms = 340;
   s.deadman.trips = 1;
   s.deadman.confirm = DM_CONFIRM_OK;
@@ -2189,13 +2198,13 @@ static void test_deadman_alarm_overlay() {
   }
   TEST_ASSERT_EQUAL_STRING("TRIPPED    no tag 12s", f.grid.rows[0]);
   TEST_ASSERT_EQUAL_STRING("gapmax 340ms", f.grid.rows[1]);
-  TEST_ASSERT_EQUAL_STRING("tag -62dBm n 18431", f.grid.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("1: --      n 18431", f.grid.rows[2]);  // 12 s stale: past DEADMAN_WARN_MS
   TEST_ASSERT_EQUAL_STRING("VESC: KILLSW ok", f.grid.rows[3]);
   // the tag is long gone, so the reset would be refused and the row says so
   TEST_ASSERT_EQUAL_STRING("HOLD BTN: NEED TAG", f.grid.rows[5]);
 
   // Tag back within the reset window: the row switches to the actionable wording.
-  s.deadman.beacon_t_ms = NOW;
+  s.deadman.tags[0].t_ms = NOW;
   oled_build_frame(s, NOW, SCREEN_MAIN, info, f);
   TEST_ASSERT_EQUAL_STRING("HOLD BTN: RESET", f.grid.rows[5]);
 
@@ -2215,33 +2224,94 @@ static void test_deadman_alarm_overlay() {
   s.deadman.state = DM_TRIPPED;
   oled_build_frame(s, NOW, SCREEN_MAIN, info, f);
   TEST_ASSERT_EQUAL_STRING("TRIPPED    never seen", f.grid.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("no tags    n 0", f.grid.rows[2]);
   assert_grid_lengths(f.grid);
 }
 
-// The MAIN screen only gives up its CAN cell for the two urgent dead-man states. NO TAG
-// is deliberately not one of them: it is the resting state before the tag has ever been
-// seen, i.e. every boot, and the CAN line is how you tell the VESC is alive at all.
-static void test_deadman_main_banner() {
+// The dead-man row REPLACES the speed unit, and in exchange the CAN cell is never hidden
+// again - that was the compromise made when there was nowhere else to put this.
+static void test_deadman_main_row() {
   SharedState s = make_state(NOW);
-
-  s.deadman.state = DM_WAIT_TAG;
-  TEST_ASSERT_EQUAL_STRING("VESC 74", build_main(s, NOW).can);
+  s.deadman.tags[0].configured = true;
+  s.deadman.tags[0].enrolled = true;
+  s.deadman.tags[0].t_ms = NOW;
+  s.deadman.tags[0].rssi = -62;
+  s.deadman.enrolled_count = 1;
   s.deadman.state = DM_ARMED;
-  TEST_ASSERT_EQUAL_STRING("VESC 74", build_main(s, NOW).can);
 
-  s.deadman.state = DM_UNAVAILABLE;
-  TEST_ASSERT_EQUAL_STRING("NO RADIO", build_main(s, NOW).can);
-
-  // GRACE counts down to the cut on the page the helmsman is actually looking at.
-  s.deadman.state = DM_GRACE;
-  s.deadman.beacon_t_ms = NOW - (DEADMAN_TIMEOUT_MS - 3000);
+  // One tag, present: the CAN line keeps its cell in every single state.
   OledMain m = build_main(s, NOW);
-  TEST_ASSERT_EQUAL_STRING("CUT 3s", m.can);
+  TEST_ASSERT_EQUAL_STRING("1:-62", m.unit);
+  TEST_ASSERT_EQUAL_STRING("VESC 74", m.can);
   assert_main_lengths(m);
-  // past the timeout the overlay owns the screen, so the cell simply keeps the CAN line
-  s.deadman.beacon_t_ms = NOW - DEADMAN_TIMEOUT_MS;
-  TEST_ASSERT_EQUAL_STRING("VESC 74", build_main(s, NOW).can);
+
+  // Quiet for longer than the warn window: the slot goes to dashes, same width.
+  s.deadman.tags[0].t_ms = NOW - DEADMAN_WARN_MS - 1;
+  TEST_ASSERT_EQUAL_STRING("1: --", build_main(s, NOW).unit);
+
+  // Two tags, both present.
+  s.deadman.tags[0].t_ms = NOW;
+  s.deadman.tags[1].configured = true;
+  s.deadman.tags[1].enrolled = true;
+  s.deadman.tags[1].t_ms = NOW;
+  s.deadman.tags[1].rssi = -70;
+  s.deadman.enrolled_count = 2;
+  m = build_main(s, NOW);
+  TEST_ASSERT_EQUAL_STRING("1:-62 2:-70", m.unit);
+  TEST_ASSERT_EQUAL_STRING("VESC 74", m.can);
+  assert_main_lengths(m);
+
+  // Tag 2 lost: visible, but nothing else changes - it is not an emergency while tag 1 is aboard.
+  s.deadman.tags[1].t_ms = NOW - DEADMAN_WARN_MS - 1;
+  m = build_main(s, NOW);
+  TEST_ASSERT_EQUAL_STRING("1:-62 2: --", m.unit);
+  TEST_ASSERT_EQUAL_STRING("VESC 74", m.can);
+  assert_main_lengths(m);
+
+  // Tag 2 configured but never enrolled, once the window has closed: "off", not "--".
+  s.deadman.tags[1].enrolled = false;
+  s.deadman.enrol_open = false;
+  s.deadman.enrolled_count = 1;
+  TEST_ASSERT_EQUAL_STRING("1:-62 2:off", build_main(s, NOW).unit);
+  // ... but while the window is still open it is merely absent, not yet disabled
+  s.deadman.enrol_open = true;
+  TEST_ASSERT_EQUAL_STRING("1:-62 2: --", build_main(s, NOW).unit);
+
+  // A wild RSSI is clamped so two slots can never overflow the 12-char row.
+  s.deadman.enrol_open = false;
+  s.deadman.tags[1].enrolled = true;
+  s.deadman.tags[1].t_ms = NOW;
+  s.deadman.tags[1].rssi = -128;
+  s.deadman.tags[0].rssi = 127;
+  m = build_main(s, NOW);
+  TEST_ASSERT_EQUAL_STRING("1:  0 2:-99", m.unit);
+  assert_main_lengths(m);
+
+  // The urgent states take the whole row, and still leave the CAN line alone.
+  s = make_state(NOW);
+  s.deadman.state = DM_UNAVAILABLE;
+  m = build_main(s, NOW);
+  TEST_ASSERT_EQUAL_STRING("NO RADIO", m.unit);
+  TEST_ASSERT_EQUAL_STRING("VESC 74", m.can);
+
+  s.deadman.state = DM_GRACE;
+  s.deadman.tags[0].configured = true;
+  s.deadman.tags[0].enrolled = true;
+  s.deadman.enrolled_count = 1;
+  s.deadman.tags[0].t_ms = NOW - (DEADMAN_TIMEOUT_MS - 3000);
+  m = build_main(s, NOW);
+  TEST_ASSERT_EQUAL_STRING("CUT IN 3s", m.unit);
+  TEST_ASSERT_EQUAL_STRING("VESC 74", m.can);
+  assert_main_lengths(m);
+
+  // Nothing configured at all (the zeroed state every other test uses).
+  s = make_state(NOW);
+  m = build_main(s, NOW);
+  TEST_ASSERT_EQUAL_STRING("NO TAG", m.unit);
+  TEST_ASSERT_EQUAL_STRING("VESC 74", m.can);
+  assert_main_lengths(m);
 }
+
 #endif  // DEADMAN_UI_ENABLE
 
 static void test_boot_frame() {
@@ -2367,7 +2437,7 @@ int main(int, char **) {
   RUN_TEST(test_never_received_state);
 #if DEADMAN_UI_ENABLE
   RUN_TEST(test_deadman_alarm_overlay);
-  RUN_TEST(test_deadman_main_banner);
+  RUN_TEST(test_deadman_main_row);
 #endif
   RUN_TEST(test_boot_frame);
   RUN_TEST(test_layout_geometry);

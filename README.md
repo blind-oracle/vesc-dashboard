@@ -55,7 +55,7 @@ Files:
 | `include/bms_ble.h`, `src/bms_ble.cpp` | NimBLE central for the JK BMS (the only file that includes NimBLE): scan, connect, subscribe, bmsTask, link state machine, BMS log line; inline no-ops when `BMS_BLE_ENABLE` is 0 |
 | `src/main.cpp` | `app_main()`: start-up and the supervisor loop |
 | `platformio.ini`, `boards/dfrobot_firebeetle2_esp32c6.json`, `sdkconfig.defaults`, `sdkconfig.defaults.bms`, `partitions.csv`, `CMakeLists.txt`, `src/CMakeLists.txt` | build: pinned platform and envs, board definition, ESP-IDF configuration (the `.bms` fragment adds the NimBLE host for the `bms` and `demo` envs), partition table, IDF project files |
-| `test/test_vesc/`, `test/test_vesc_getvalues/`, `test/test_ubx/`, `test/test_trip/`, `test/test_jk_bms/`, `test/test_display_strings_oled/` | Unity tests (one `test_main.cpp` each, 213 test cases; `test/test_jk_bms/jk_frames.h` holds recorded BMS frames), run on the host with `pio test -e native` |
+| `test/test_vesc/`, `test/test_vesc_getvalues/`, `test/test_ubx/`, `test/test_trip/`, `test/test_jk_bms/`, `test/test_display_strings_oled/` | Unity tests (one `test_main.cpp` each, 224 test cases; `test/test_jk_bms/jk_frames.h` holds recorded BMS frames), run on the host with `pio test -e native` |
 
 ## 2. Hardware and wiring
 
@@ -320,14 +320,14 @@ that is what closes the loop below.
 
 | State | Cut | Meaning |
 |---|---|---|
-| `NO TAG` | `DEADMAN_BOOT_CUT` | the tag has not been seen yet. With the default 0 the motor runs and there is **no protection**; with 1 the tag cannot be forgotten, at the price of a dead tag battery immobilising the boat until the dashboard is powered down |
-| `ARMED` | no | the tag is fresh |
-| `GRACE` | no | quiet past `DEADMAN_WARN_MS`; the MAIN screen counts down in the CAN cell (`CUT 3s`) |
+| `NO TAG` | `DEADMAN_BOOT_CUT` | no tag has enrolled yet. With the default 0 the motor runs and there is **no protection**; with 1 the tag cannot be forgotten, at the price of a dead tag battery immobilising the boat until the dashboard is powered down |
+| `ARMED` | no | at least one enrolled tag is fresh |
+| `GRACE` | no | every enrolled tag quiet past `DEADMAN_WARN_MS`; the tag row counts down (`CUT IN 3s`) |
 | `TRIPPED` | **yes** | timed out. Latched: the tag coming back does not release it |
-| `NO RADIO` | no | the BLE scan is not running. **Does not cut** - our own failure must not stop the boat, the mechanical switch still covers the real hazard - but it means there is no protection, so it takes the MAIN screen's CAN cell and logs at ERROR |
+| `NO RADIO` | no | the BLE scan is not running. **Does not cut** - our own failure must not stop the boat, the mechanical switch still covers the real hazard - but it means there is no protection, so it takes the tag row and logs at ERROR. It also throws the enrolment set away: when the radio returns, every tag must prove itself again |
 | `FAULT` | **yes** | the cut was asserted but the VESC never reported `KILLSW` within `DEADMAN_CONFIRM_MS` while its polls were arriving. Wiring, series resistor or VESC config. Never clears by itself |
 
-Arming deliberately needs `DEADMAN_ARM_REPORTS` (3) adverts inside `DEADMAN_ARM_WINDOW_MS` (2 s)
+Arming deliberately needs `DEADMAN_ARM_REPORTS` (3) adverts inside `DEADMAN_ARM_WINDOW_MS` (5 s)
 with the last at `DEADMAN_ARM_RSSI` (-85 dBm) or better: arming on one weak packet from the car
 park would mean the first thing that happens when you leave the dock is a trip.
 
@@ -336,6 +336,39 @@ something you can page away from - and the long press that normally returns to M
 latch instead. The reset is **refused** unless the tag has been seen within
 `DEADMAN_RESET_FRESH_MS` (1 s), so the motor cannot be restarted while the person is still in the
 water; the alarm's last row says which of the two it will do.
+
+### Two tags
+
+`DEADMAN_BEACON_ADDR2` adds a second tag for a second crew member; leave it empty for a one-tag
+boat and nothing below applies. **With two tags enrolled the motor is cut only when BOTH have gone
+quiet** - either one aboard keeps it running, so a flat battery in one tag is survivable.
+
+Which tags count is decided **once**, when protection begins. The first tag to complete its arming
+burst enrols and opens a `DEADMAN_ENROL_MS` (5 s) window; any other configured tag that arms inside
+that window joins; then the set is frozen for the run and the log says who is in:
+
+```
+W (48120) dm: enrolment closed: 2 tags guarding the motor. t1=f2:28:3c:03:e4:ad last=110ms rssi=-62 n=41 gapmax=0ms t2=de:ad:be:ef:00:02 last=90ms rssi=-70 n=38 gapmax=0ms
+```
+
+Freezing the set is the point: a tag that turns up afterwards - the one left in the car, still in
+range at the dock - can never join and silently keep the switch alive. It shows as `off` on the
+main screen and is ignored entirely. The window opens on the first sighting rather than at boot, so
+powering the dashboard up before you put the tag on still works.
+
+Arming is **per tag**: each needs `DEADMAN_ARM_REPORTS` of its own adverts inside
+`DEADMAN_ARM_WINDOW_MS` with its own last one at `DEADMAN_ARM_RSSI` or better. Two tags cannot
+contribute half a burst each, and a weak tag is never carried in by a strong one. Each tag's
+`gapmax` is measured over its own adverts, never the union of both, so the "size the timeout at 5x
+gapmax" rule below stays valid if you later carry only one tag.
+
+What this buys and what it costs: a dead tag battery no longer looks like a man overboard. But the
+guarantee is weaker - a tag left lying on the boat by someone who then goes over the side keeps the
+motor running. That is inherent in "cut only when both are gone", and it is why the mechanical
+lanyard remains the primary protection.
+
+The two addresses must differ; the firmware refuses to run and holds the cut if they do not, since
+both slots pointing at one fob would look armed while guarding half as much.
 
 ### Sharing the radio with the BMS
 
@@ -372,7 +405,11 @@ Do this in order; the first step costs nothing and catches most of the mistakes.
 4. Confirm the mechanical lanyard still works on its own with the dashboard powered off. This is
    the fail-passive property and the single most important test here.
 5. Unplug the dashboard mid-run and force a watchdog reboot: the motor must keep running both times.
-6. Only then a man-overboard rehearsal: tethered, low speed, open water, warm, a second person at
+6. With two tags: check the `enrolment closed` line names both. Walk tag 2 out of range - the motor
+   must keep running and the row must show `2: --`. Then walk tag 1 out too: the cut must come
+   `DEADMAN_TIMEOUT_MS` after the **second** tag went, not the first. Separately, power up with only
+   tag 1 present and then bring tag 2 into range: it must show `off` and never join.
+7. Only then a man-overboard rehearsal: tethered, low speed, open water, warm, a second person at
    the helm, mechanical lanyard still worn.
 
 Log line (tag `dm`, every `LOG_DEADMAN_MS`), plus an immediate line on every transition:
@@ -445,9 +482,18 @@ With the BMS pages (`bms` build; a 16S pack discharging, GNSS and SYS become 9/1
   refused-reset counters, and a last row saying whether a long press will reset right now
   (`HOLD BTN: RESET`) or be refused because the tag is absent (`HOLD BTN: NEED TAG`). A `FAULT`
   cannot be reset from the panel at all (`FIX WIRING - NO RESET`). The MAIN screen's CAN cell is
-  taken over only by the two urgent states, `NO RADIO` and the `CUT 3s` countdown in `GRACE`; `NO
-  TAG` deliberately leaves it alone, because that is the resting state on every boot and the CAN
-  line is how you tell the VESC is alive at all.
+  never taken over any more: the dead-man has its own row (below), which is what let the CAN line
+  have its cell back.
+- **Dead-man tag row** (`deadman` build). The third right-column line - the one the art above shows
+  as `kn` - carries the dead-man instead of the speed unit. A unit that never changes is worth less
+  than knowing whether the switch is protecting you and how much signal margin each tag has, and
+  the unit is a build-time constant that is still on the EFFICIENCY page (`mean 5.9kn`). First
+  match wins: `NO RADIO` (the scan is down, so there is no protection at all), `CUT IN 3s` (the
+  `GRACE` countdown), else one slot per configured tag: `1:-62 2:-70`. A slot reads ` --` while its
+  tag is quiet (older than `DEADMAN_WARN_MS`) and `off` once the enrolment window closed without it
+  - that is the "it was missing at startup, so it guards nothing" state. A single-tag boat reads
+  `1:-62`, and `NO TAG` means nothing is configured. RSSI is clamped to -99 dBm so two slots always
+  fit the 12-character line.
 - **Formatting rules.** A number that does not fit its cell drops decimals one by one (`48.2` -> `100`), then switches to thousands (`12.3k`, `12k`), millions (`12M`) and finally `MAX` / `-MAX`; a clipped-but-plausible wrong number is never shown. Counters: `12345`, `1234k`, `123M`, `4G`. `-0.0` is printed as `0.0` so a current hovering around zero does not flicker. Speed: `0.0` below `SPEED_MIN_SHOW`, one decimal below 100, whole above, `--` without a usable fix or with a speed-accuracy estimate above `GNSS_MAX_SACC_MM_S`. Freshness windows: STATUS 1/4/5 `VESC_STALE_R1_MS`, STATUS 2/3/6 `VESC_STALE_R2_MS`, polled values `VESC_EXT_STALE_MS`, GNSS `GNSS_STALE_MS`, trip integrator `TRIP_STALE_MS`, BMS frames `BMS_STALE_MS`; anything older, or never received, is `--`.
 
 ### Button
@@ -480,7 +526,7 @@ Prerequisites: PlatformIO Core (`pio` on the PATH, e.g. `~/.platformio/penv/bin/
 | `pio run -t upload` | build and flash over USB (`/dev/cu.usbmodem*`); hold BOOT while plugging in only if the port does not enumerate |
 | `pio device monitor` | serial console at 115200 with exception decoder and timestamps |
 | `pio run -e deadman -t upload` | the `bms` build plus the BLE dead-man's switch (section 5b). Both `BMS_BLE_ADDR` and `DEADMAN_BEACON_ADDR` must be set to your hardware first: the placeholders in `platformio.ini` are deliberately obvious, and a tag address that never matches leaves the switch in `NO TAG` for ever |
-| `pio test -e native` | host unit tests in six directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_ubx`, `test/test_trip`, `test/test_jk_bms`, `test/test_display_strings_oled`, `test/test_deadman`, `test/test_ble_addr`; 213 test cases): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, 32-bit clock wrap), JK BMS codec (command bytes, checksum, the frame assembler under every observed chunking, recorded 24S / 32S / 13S frames, layout detection, device info, alarm names), all OLED screens including BMS and CELLS, and the clock arithmetic; no hardware |
+| `pio test -e native` | host unit tests in six directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_ubx`, `test/test_trip`, `test/test_jk_bms`, `test/test_display_strings_oled`, `test/test_deadman`, `test/test_ble_addr`; 224 test cases): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, 32-bit clock wrap), JK BMS codec (command bytes, checksum, the frame assembler under every observed chunking, recorded 24S / 32S / 13S frames, layout detection, device info, alarm names), all OLED screens including BMS and CELLS, and the clock arithmetic; no hardware |
 | `pio run -e demo -t upload` | flash the layout demo (`DISPLAY_DEMO=1` on top of the `bms` env: all ten screens with synthetic data, dimming after 20 s) |
 | `pio run -e bms -t upload` | build and flash with the JK BMS BLE client (`BMS_BLE_ENABLE=1`, NimBLE host from `sdkconfig.defaults.bms`; +349 KB of flash, section 5). `pio run -e bms` alone only builds it |
 | `pio run -t menuconfig` | ESP-IDF menuconfig on the env's generated `sdkconfig`; put lasting changes into `sdkconfig.defaults` |
@@ -582,7 +628,7 @@ Compile-time checks stop you from using GPIO12/13, from sharing a GPIO between t
 | Active VESC polling | `VESC_POLL_MS` (0 = never transmit), `CAN_OWN_ID` (1..254, not a VESC id), `VESC_POLL_TIMEOUT_MS`, `VESC_EXT_STALE_MS`, `CAN_TX_QUEUE_LEN` |
 | GNSS | `PIN_GNSS_RX`, `PIN_GNSS_TX`, `GNSS_BAUDS`, `GNSS_TARGET_BAUD` (0 = keep the detected baud), `GNSS_RX_BUFFER`, `GNSS_RATE_MS` (200 = 5 Hz, 100 = 10 Hz), `GNSS_DYNMODEL_SEA`, `GNSS_STALE_MS`, `GNSS_REDETECT_MS`, `GNSS_ACK_TIMEOUT_MS`, `GNSS_MAX_SACC_MM_S`, `SPEED_MIN_SHOW`, `SPEED_UNIT_KNOTS` |
 | Trip / efficiency | `TRIP_PERIOD_MS`, `EFF_WINDOW_S` (2..120 s), `EFF_MIN_SPEED_MM_S`, `EFF_MIN_DIST_M`, `EFF_UNIT_KM` (1 = Wh/km even with knots), `LOG_TRIP_MS` (0 = off) |
-| Dead-man's switch (`deadman` env, section 5b) | `DEADMAN_ENABLE`, `DEADMAN_BEACON_ADDR` (mandatory), `PIN_DEADMAN_CUT`, `DEADMAN_TIMEOUT_MS`, `DEADMAN_WARN_MS`, `DEADMAN_ARM_REPORTS` / `DEADMAN_ARM_WINDOW_MS` / `DEADMAN_ARM_RSSI`, `DEADMAN_RESET_FRESH_MS`, `DEADMAN_BOOT_CUT`, `DEADMAN_CONFIRM_ENABLE` / `DEADMAN_CONFIRM_MS`, `DEADMAN_STANDSTILL_ERPM` / `DEADMAN_STANDSTILL_MM_S`, `DEADMAN_SCAN_ITVL_MS` / `DEADMAN_SCAN_WINDOW_MS`, `DEADMAN_BMS_CONNECT_MS`, `DEADMAN_CONNECT_RETRY_MS`, `TASK_PRIO_DEADMAN`, `DEADMAN_TASK_STACK`, `DEADMAN_TICK_MS`, `HB_MAX_DEADMAN_MS`, `LOG_DEADMAN_MS`. Derived: `DEADMAN_UI_ENABLE` |
+| Dead-man's switch (`deadman` env, section 5b) | `DEADMAN_ENABLE`, `DEADMAN_BEACON_ADDR` (mandatory), `DEADMAN_BEACON_ADDR2` ("" = one tag), `DEADMAN_ENROL_MS`, `PIN_DEADMAN_CUT`, `DEADMAN_TIMEOUT_MS`, `DEADMAN_WARN_MS`, `DEADMAN_ARM_REPORTS` / `DEADMAN_ARM_WINDOW_MS` / `DEADMAN_ARM_RSSI`, `DEADMAN_RESET_FRESH_MS`, `DEADMAN_BOOT_CUT`, `DEADMAN_CONFIRM_ENABLE` / `DEADMAN_CONFIRM_MS`, `DEADMAN_STANDSTILL_ERPM` / `DEADMAN_STANDSTILL_MM_S`, `DEADMAN_SCAN_ITVL_MS` / `DEADMAN_SCAN_WINDOW_MS`, `DEADMAN_BMS_CONNECT_MS`, `DEADMAN_CONNECT_RETRY_MS`, `TASK_PRIO_DEADMAN`, `DEADMAN_TASK_STACK`, `DEADMAN_TICK_MS`, `HB_MAX_DEADMAN_MS`, `LOG_DEADMAN_MS`. Derived: `DEADMAN_UI_ENABLE` |
 | BMS over BLE (`bms` env, section 5) | `BMS_BLE_ENABLE` (set by `[env:bms]`), `BMS_BLE_ADDR` ("" = scan by name prefix / service, a MAC = connect by address), `BMS_BLE_NAME_PREFIX`, `BMS_PROTOCOL` (0 = auto, 1 = JK02_24S, 2 = JK02_32S), `BMS_CELLS_MAX` (1..32), `BMS_CURRENT_SIGN` (1 = discharge-positive), `BMS_LINK_ON_DEMAND` (1 = link up only while a BMS screen is shown), `BMS_STALE_MS`, `BMS_RECONNECT_MS`, `BMS_RECONNECT_MAX_MS`, `BMS_RECONNECT_FAILS`, `HB_MAX_BMS_MS` (0 = never gate the watchdog), `LOG_BMS_MS` (0 = off). Derived, do not edit: `BMS_UI_ENABLE` (`BMS_BLE_ENABLE` or `DISPLAY_DEMO`: the screens and `g_state.bms` exist) and `BMS_CELL_PAGES` (ceil(`BMS_CELLS_MAX` / 12)) |
 | Tasks / watchdog / logging | `TASK_PRIO_CAN`, `TASK_PRIO_GNSS`, `TASK_PRIO_DISP`, `WDT_TIMEOUT_MS`, `HB_MAX_CAN_MS`, `HB_MAX_GNSS_MS`, `HB_MAX_DISP_MS`, `LOG_VESC_MS`, `LOG_GNSS_MS`, `LOG_TRIP_MS`, `LOG_SYS_MS`, `SERIAL_BOOT_DELAY_MS`, `PIN_LED`, `FW_VERSION` |
 | Advanced (defaults are fine) | `CAN_TASK_STACK`, `CAN_INSTALL_RETRY_MS`, `CAN_RX_TIMEOUT_MS`, `CAN_ERR_LOG_MIN_MS`, `CAN_ERR_WARN_LEVEL`, `CAN_TX_WAIT_MS`, `VESC_POLL_LOG_MIN_MS`, `VESC_POLL_BACKOFF_AFTER`, `VESC_POLL_BACKOFF_MS`, `VESC_GETVALUES_MASK` (0 = plain `COMM_GET_VALUES`), `VESC_RX_BUFFER_SIZE`, `GNSS_TASK_STACK`, `GNSS_AUTOBAUD_LISTEN_MS`, `GNSS_MONVER_TIMEOUT_MS`, `GNSS_AUTOBAUD_RETRY_MS`, `OLED_TASK_STACK`, `OLED_INIT_RETRY_MS`, `OLED_I2C_TIMEOUT_MS`, `OLED_BUTTON_POLL_MS`. Also in `config.h`, with local `#ifndef` fallbacks in the sources so a trimmed copy still builds: `GNSS_BAUD_SWITCH_ATTEMPTS` (2), `GNSS_BAUD_SWITCH_SETTLE_MS` (100), `TASK_PRIO_TRIP` (3), `TRIP_TASK_STACK` (4096), `TRIP_DT_MAX_MS` (5000), `TRIP_COUNTER_RESET_WH` (0.5), `TRIP_EFF_MIN_FILL_S` (3), `TRIP_STALE_MS` (5000). The BMS link timing (section 5): `BMS_TASK_PRIO` (4), `BMS_TASK_STACK` (4096), `BMS_CONNECT_TIMEOUT_MS` (10000), `BMS_SETUP_TIMEOUT_MS` (8000), `BMS_FIRST_FRAME_TIMEOUT_MS` (15000), `BMS_POLL_MS` (5000), `BMS_SCAN_FAST_MS` (30000), `BMS_SCAN_FAST_ITVL_MS` / `BMS_SCAN_FAST_WINDOW_MS` (60 / 30), `BMS_SCAN_SLOW_ITVL_MS` / `BMS_SCAN_SLOW_WINDOW_MS` (1000 / 30), `BMS_MSG_BUF_BYTES` (2048), `BMS_APP_HINT_S` (60). `src/can_vesc.cpp` alone: `CAN_SAMPLE_POINT_PERMILL` (800, the bit sample point) |
