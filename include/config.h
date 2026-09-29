@@ -227,7 +227,7 @@
 // silently keep the switch alive. With two tags enrolled the cut comes only when BOTH
 // have gone quiet; either one aboard keeps the motor running.
 #ifndef DEADMAN_BEACON_ADDR
-#define DEADMAN_BEACON_ADDR "F2:28:3C:03:E4:AD" // tag 1 MAC, fixed public address. Mandatory: there is no discovery mode
+#define DEADMAN_BEACON_ADDR "" // tag 1 MAC, fixed public address. Mandatory: there is no discovery mode
 #endif
 #ifndef DEADMAN_BEACON_ADDR2
 #define DEADMAN_BEACON_ADDR2 "" // tag 2 MAC, or "" for a single-tag boat. A malformed non-empty address is fatal (a typo
@@ -251,7 +251,7 @@
 #define DEADMAN_ARM_WINDOW_MS 5000 // ... they must all arrive inside this window
 #endif
 #ifndef DEADMAN_ARM_RSSI
-#define DEADMAN_ARM_RSSI -85 // ... and the last one must be at least this strong (dBm): arming on a tag in the car park means a trip at the dock
+#define DEADMAN_ARM_RSSI -75 // ... and the last one must be at least this strong (dBm): arming on a tag in the car park means a trip at the dock
 #endif
 #ifndef DEADMAN_RESET_FRESH_MS
 #define DEADMAN_RESET_FRESH_MS 1000 // a reset is refused unless the tag was seen this recently: never restart while the person is still in the water
@@ -270,7 +270,7 @@
 #define DEADMAN_STANDSTILL_ERPM 300 // the BMS may only connect below this |erpm| (a BLE connect blinds the watchdog); -1 = skip the erpm test (freewheeling prop under sail)
 #endif
 #ifndef DEADMAN_STANDSTILL_MM_S
-#define DEADMAN_STANDSTILL_MM_S 500 // ... and below this GNSS ground speed (~1 kn)
+#define DEADMAN_STANDSTILL_MM_S 1000 // ... and below this GNSS ground speed (~2 kn)
 #endif
 
 // ============================================================================
