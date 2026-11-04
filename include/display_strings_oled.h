@@ -239,6 +239,7 @@ struct OledMain {
   char clock[6];  // "14:34" local (UTC + TIME_UTC_OFFSET_MIN) / "--:--" (5)
   char fix[8];    // "3D 9sv" / "3D12sv" / "2D 8sv" / "NOFIX" / "NODATA" / "NOGNSS" / "BOOT" (<= 6)
   char can[10];   // "VESC 74" / "CAN idle" / "CAN RECV" / "CAN OFF" / FW_VERSION at boot   (<= 8)
+                  // (VESC_LINK_UART: "VESC 74" / "NO VESC" / "UART OFF")
   struct Cell {
     char label[4];  // "BV" "BA" "MA" "PW" "TF" "TM" "RPM" "WH"        (<= 3)
     char value[8];  // "48.2v" "12.4A" "35A" "598W" "45\260" "2350" "56.7" / "--" / "n/a" (<= 6)
@@ -605,6 +606,13 @@ inline void build_main_fix(const GnssState &g, uint32_t now, OledMain &out) {
 }
 
 inline void build_main_can(const SharedState &s, const VescFresh &f, OledMain &out) {
+#if VESC_LINK_UART
+  // UART link: the state only says whether the driver is up; freshness says whether the VESC answers.
+  if (s.can.state != CAN_STATE_RUNNING) snprintf(out.can, sizeof out.can, "UART OFF");
+  else if (!f.s1 && !f.s5) snprintf(out.can, sizeof out.can, "NO VESC");
+  else if (s.vesc.locked_id >= 0) snprintf(out.can, sizeof out.can, "VESC %u", (unsigned)(s.vesc.locked_id & 0xFF));
+  else snprintf(out.can, sizeof out.can, "VESC ?");  // a reply without the controller id field (very old firmware)
+#else
   switch (s.can.state) {
     case CAN_STATE_RUNNING:
       // Same freshness test as the LED in main.cpp: STATUS_1 or STATUS_5 within VESC_STALE_R1_MS.
@@ -615,6 +623,7 @@ inline void build_main_can(const SharedState &s, const VescFresh &f, OledMain &o
     case CAN_STATE_RECOVERING: snprintf(out.can, sizeof out.can, "CAN RECV"); break;
     default: snprintf(out.can, sizeof out.can, "CAN OFF"); break;  // STOPPED, BUS_OFF, UNINSTALLED, unknown
   }
+#endif
   clip(out.can, sizeof out.can, kCanChars);
 }
 
@@ -1138,8 +1147,13 @@ inline void oled_build_sys(const SharedState &s, uint32_t now, const OledSysInfo
   append_str(r, sizeof r, "k");
   row2(g.rows[1], l, r);
 
+#if VESC_LINK_UART
+  snprintf(l, sizeof l, "UART %s", can_state_name(s.can.state));
+  snprintf(r, sizeof r, "%lu", (unsigned long)VESC_UART_BAUD);  // no error counters: CRC failures are "bad" on VESC 3/3
+#else
   snprintf(l, sizeof l, "CAN %s", can_state_name(s.can.state));
   snprintf(r, sizeof r, "T%lu R%lu", (unsigned long)s.can.tec, (unsigned long)s.can.rec);  // TEC / REC error counters
+#endif
   row2(g.rows[2], l, r);
 
   // "GNSS RUN 38400 34.10" (phase, baud when known, PROTVER while running)

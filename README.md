@@ -4,7 +4,7 @@ Be advised that this whole repo is AI-generated, so take it with a grain of salt
 
 # vesc-dashboard
 
-ESP32-C6 firmware that listens to a VESC motor controller on CAN, polls it once a second for the few values its broadcasts lack (fault code, per-MOSFET temperatures, id/iq, vd/vq, absolute tachometer), reads ground speed and time from a u-blox GNSS receiver at 5 Hz, shows everything on a 128x64 monochrome OLED (SSD1309 controller, I2C) as seven screens cycled by a push button, and integrates speed and energy into a trip log with the boat's efficiency in Wh per nautical mile (or km). Built for the DFRobot FireBeetle 2 ESP32-C6 (DFR1075) with an MCP2551-class CAN transceiver, any 2.42" or 1.54" SSD1309 module switched to I2C mode and any receiver that speaks UBX (u-blox 6/7, M8, M9, M10 or a compatible clone). On the CAN bus the firmware acknowledges frames and transmits exactly one thing: a 7-byte `COMM_GET_VALUES_SELECTIVE` request every `VESC_POLL_MS` (1 s). It never sends a command or a setting; `-DVESC_POLL_MS=0` makes it strictly passive (ACK only). Optionally (`pio run -e bms`) it also reads a JK (Jikong) BMS over Bluetooth LE with the C6's own radio and adds a BMS page and two CELLS pages (ten screens); the BLE link is only held while one of those pages is on screen (`BMS_LINK_ON_DEMAND`), and the default build contains no BLE code at all. The same radio can optionally run a dead-man's switch (`pio run -e deadman`, section 5b): a BLE tag worn by the helmsman, and if it stops advertising the firmware pulls the VESC's own kill-switch input low, in parallel with the boat's mechanical lanyard switch. That path uses a GPIO, not CAN - what the firmware transmits on the bus is unchanged.
+ESP32-C6 firmware that listens to a VESC motor controller on CAN, polls it once a second for the few values its broadcasts lack (fault code, per-MOSFET temperatures, id/iq, vd/vq, absolute tachometer), reads ground speed and time from a u-blox GNSS receiver at 5 Hz, shows everything on a 128x64 monochrome OLED (SSD1309 controller, I2C) as seven screens cycled by a push button, and integrates speed and energy into a trip log with the boat's efficiency in Wh per nautical mile (or km). Built for the DFRobot FireBeetle 2 ESP32-C6 (DFR1075) with an MCP2551-class CAN transceiver, any 2.42" or 1.54" SSD1309 module switched to I2C mode and any receiver that speaks UBX (u-blox 6/7, M8, M9, M10 or a compatible clone). On the CAN bus the firmware acknowledges frames and transmits exactly one thing: a 7-byte `COMM_GET_VALUES_SELECTIVE` request every `VESC_POLL_MS` (1 s). It never sends a command or a setting; `-DVESC_POLL_MS=0` makes it strictly passive (ACK only). Optionally (`pio run -e bms`) it also reads a JK (Jikong) BMS over Bluetooth LE with the C6's own radio and adds a BMS page and two CELLS pages (ten screens); the BLE link is only held while one of those pages is on screen (`BMS_LINK_ON_DEMAND`), and the default build contains no BLE code at all. The same radio can optionally run a dead-man's switch (`pio run -e deadman`, section 5b): a BLE tag worn by the helmsman, and if it stops advertising the firmware pulls the VESC's own kill-switch input low, in parallel with the boat's mechanical lanyard switch. That path uses a GPIO, not CAN - what the firmware transmits on the bus is unchanged. Without a CAN transceiver, `pio run -e deadman_uart` talks to the VESC over its COMM-header UART instead (section 3b): one `COMM_GET_VALUES` poll every 100 ms replaces both the broadcasts and the CAN poll, and everything except the ADC/PPM row stays available.
 
 ## 1. What it does
 
@@ -205,6 +205,65 @@ Some values exist only in the reply to a request. Every `VESC_POLL_MS` (1000 ms)
 ### Why the board acknowledges
 
 `CAN_LISTEN_ONLY 0` (default) runs the TWAI node in normal mode, so it generates the ACK bit for every frame it receives. That ACK is required when the VESC and this board are the only two nodes: the VESC's STM32 bxCAN has no retransmit limit, so with a non-acknowledging listener it goes error-passive and repeats the same stale STATUS frame forever ("lonely VESC"). The node is configured single-shot (`fail_retry_cnt 0`, no automatic retransmission) for the mirror-image reason: with the VESC powered off a request is simply lost (`VESC poll: N request(s) not acknowledged on the bus (VESC off? ack errors=N TEC=N)`, error-passive after ~16 polls, never bus-off) instead of being retransmitted for ever. Set `-DCAN_LISTEN_ONLY=1 -DVESC_POLL_MS=0` (no ACK, TX electrically silent) only when another node acknowledges anyway: a second VESC, a BMS, a permanently attached VESC Tool CAN adapter.
+
+## 3b. VESC over UART (no CAN)
+
+`pio run -e deadman_uart` is the `deadman` build with the VESC link moved from CAN to a UART (`VESC_LINK_UART=1`; task in `src/uart_vesc.cpp`, codec in `include/vesc_uart.h`). There is no transceiver, and the TWAI driver is not even linked. Every `VESC_POLL_MS` (100 ms) the board sends the 6-byte request `02 01 04 40 84 03` (`COMM_GET_VALUES`). The VESC answers with one 79-byte frame (74-byte payload, ~7 ms at 115200). That frame holds every field of STATUS_1..5 and every value the CAN build polls: fault, MOSFET temperatures, id/iq, vd/vq, absolute tachometer, controller id, and the timeout / kill-switch status byte. The main screen, VESC 1/3 and 2/3, the trip log and the dead-man's switch, including its `KILLSW` closed loop, therefore work unchanged.
+
+### Wiring
+
+| FireBeetle | series | VESC COMM header (75_300: USART3) |
+|---|---|---|
+| GPIO3 (`PIN_VESC_UART_TX`) | 1 kOhm | RX (PB11) |
+| GPIO2 (`PIN_VESC_UART_RX`) | 1 kOhm | TX (PB10) |
+| GND | | GND |
+
+- Both sides are 3.3 V logic: wire them directly, and never to the header's 5 V pin.
+- The series resistors limit the current through the input protection diodes when only one side is powered. A UART line idles high, so without them an unpowered VESC would be fed from the dashboard's TX, and vice versa.
+- GPIO2/3 are the CAN transceiver's pins. This build does not use CAN, so remove the transceiver or leave it disconnected.
+- RX has the internal pull-up enabled, so an unplugged VESC reads as an idle line.
+- The link runs on the C6's UART0: UART1 is the GNSS, and the console stays on USB-Serial/JTAG (`config.h` refuses a UART console in this build).
+
+### On the VESC (VESC Tool)
+
+| Setting | Value |
+|---|---|
+| App Settings > General > App to Use | a mode that includes UART: `ADC and UART` with an ADC throttle, `PPM and UART` with PPM. The throttle keeps working; the UART is added |
+| App Settings > UART > Baudrate | 115200 (= `VESC_UART_BAUD`) |
+| CAN status messages | not needed (they may stay on; nothing listens) |
+
+Then "Write App Configuration".
+
+- The COMM-header UART only runs its packet interface in those app modes (`app.c`: `APP_UART` / `APP_PPM_UART` / `APP_ADC_UART`).
+- Its pads double as I2C2, which the VESC switches off when the UART starts.
+- Some hardware has a second, "permanent" UART (`HW_UART_P_DEV`). On the 75_300 R2/R3 that is UART4 on PC10/PC11, at a fixed 115200, labelled "for NRF51" in the firmware. It speaks the protocol whatever the app, but only if nothing else is on it, typically a Bluetooth module: two transmitters on one RX line corrupt each other.
+- `COMM_GET_VALUES` is read-only and does not call `timeout_reset()` on the VESC, so polling can never keep the motor's control timeout alive.
+
+### What differs from the CAN build
+
+| | CAN build | UART build |
+|---|---|---|
+| PPM / ADC1..3 (VESC 3/3) | STATUS_6 | always `--`. GET_VALUES does not carry the raw pin voltages, and `COMM_GET_DECODED_ADC/PPM` only report the apps' processed values (ADC only in ADC modes, no ADC3) |
+| Motor / battery current (`MA`, `BA`, `PW`) | STATUS_1/4 filtered currents, EMA `CAN_EMA_ALPHA` 0.15 at 50 Hz | the VESC's averages over each 100 ms poll, EMA `VESC_UART_EMA_ALPHA` 0.5 |
+| Update rate | Rate 1/2 broadcasts + 1 Hz poll | everything at 10 Hz (`VESC_POLL_MS` 100, `VESC_POLL_TIMEOUT_MS` 50) |
+| Main screen link text | `VESC 74` / `CAN idle` / `CAN OFF` | `VESC 74` / `NO VESC` / `UART OFF` |
+| SYS row 3 | `CAN RUN T0 R0` (TEC / REC) | `UART RUN 115200` |
+| VESC 3/3 counters | `frm` status frames, `misc` odd frames, `busoff` | `frm` replies, `misc` bytes outside any frame, `busoff` always 0; `bad` = frames with a CRC or stop-byte mismatch |
+| VESC id | locked from the first STATUS frame (`VESC_CAN_ID`) | the controller id field of each reply |
+| Silent VESC | back-off to 5 s; a STATUS frame resumes polling at once | `tmo` counts up, back-off to `VESC_POLL_BACKOFF_MS` (1 s) |
+| Log | tag `can`, `VESC id=...` line ending in `can=RUN tec=...` | tag `vesc`, the same line ending in `uart=RUN baud=115200 junk=N` |
+
+The averages are read-and-reset on the VESC: VESC Tool's realtime page running at the same time (over USB or Bluetooth) shortens their window, as on CAN.
+
+A healthy start:
+
+```
+I (1513) main: cfg VESC: uart0 tx=3 rx=2 115200 baud poll=100 ms timeout=50 ms poles=10 (no CAN)
+I (1530) vesc: VESC: UART0 tx=GPIO3 rx=GPIO2 115200 baud ring=1024 B, COMM_GET_VALUES every 100 ms (timeout 50 ms)
+I (1640) vesc: VESC: replying over UART, controller id 74 (74 B, 22 fields)
+```
+
+No answer at all shows up as `VESC poll: N request(s) without a complete reply within 50 ms (VESC off, TX/RX swapped, App to Use without UART, or VESC baud != 115200)`, repeated every 10 s.
 
 ## 4. GNSS
 
@@ -526,7 +585,8 @@ Prerequisites: PlatformIO Core (`pio` on the PATH, e.g. `~/.platformio/penv/bin/
 | `pio run -t upload` | build and flash over USB (`/dev/cu.usbmodem*`); hold BOOT while plugging in only if the port does not enumerate |
 | `pio device monitor` | serial console at 115200 with exception decoder and timestamps |
 | `pio run -e deadman -t upload` | the `bms` build plus the BLE dead-man's switch (section 5b). Both `BMS_BLE_ADDR` and `DEADMAN_BEACON_ADDR` must be set to your hardware first: the placeholders in `platformio.ini` are deliberately obvious, and a tag address that never matches leaves the switch in `NO TAG` for ever |
-| `pio test -e native` | host unit tests in six directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_ubx`, `test/test_trip`, `test/test_jk_bms`, `test/test_display_strings_oled`, `test/test_deadman`, `test/test_ble_addr`; 224 test cases): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, 32-bit clock wrap), JK BMS codec (command bytes, checksum, the frame assembler under every observed chunking, recorded 24S / 32S / 13S frames, layout detection, device info, alarm names), all OLED screens including BMS and CELLS, and the clock arithmetic; no hardware |
+| `pio run -e deadman_uart -t upload` | the `deadman` build with the VESC on its COMM-header UART instead of CAN (section 3b): no transceiver; App to Use must include UART |
+| `pio test -e native` | host unit tests in nine directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_vesc_uart`, `test/test_ubx`, `test/test_trip`, `test/test_jk_bms`, `test/test_display_strings_oled`, `test/test_deadman`, `test/test_ble_addr`; 247 test cases): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UART link codec (request frame, reassembly through junk, damaged frames and bogus headers, the state update from a reply), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, 32-bit clock wrap), JK BMS codec (command bytes, checksum, the frame assembler under every observed chunking, recorded 24S / 32S / 13S frames, layout detection, device info, alarm names), all OLED screens including BMS and CELLS, and the clock arithmetic; no hardware |
 | `pio run -e demo -t upload` | flash the layout demo (`DISPLAY_DEMO=1` on top of the `bms` env: all ten screens with synthetic data, dimming after 20 s) |
 | `pio run -e bms -t upload` | build and flash with the JK BMS BLE client (`BMS_BLE_ENABLE=1`, NimBLE host from `sdkconfig.defaults.bms`; +349 KB of flash, section 5). `pio run -e bms` alone only builds it |
 | `pio run -t menuconfig` | ESP-IDF menuconfig on the env's generated `sdkconfig`; put lasting changes into `sdkconfig.defaults` |
@@ -617,7 +677,7 @@ build_flags =
 
 Then build with `pio run -e myboat -t upload`. For a boat with a BMS extend `env:bms` (and inherit `${env:bms.build_flags}`) instead, adding `-DBMS_BLE_ADDR='"C8:47:8C:12:34:56"'` to pin your BMS; the NimBLE fragment comes along with the inherited `board_build.cmake_extra_args`, as it does for the `demo` env.
 
-Compile-time checks stop you from using GPIO12/13, from sharing a GPIO between two peripherals (the button pin takes part; `PIN_OLED_RST` is checked separately because it may be -1), from an unsupported CAN bitrate, from a `CAN_OWN_ID` outside 1..254 or equal to `VESC_CAN_ID`, from polling in listen-only mode, from a `GNSS_RATE_MS` outside 50..10000 ms, from an `EFF_WINDOW_S` outside 2..120 s, from a `BMS_CELLS_MAX` outside 1..32 or a `BMS_PROTOCOL` outside 0..2, from a `BMS_TASK_PRIO` at or above `TASK_PRIO_GNSS`, from a BLE scan window longer than its interval and from `BMS_BLE_ENABLE 1` without the NimBLE host in the sdkconfig (`sdkconfig.defaults.bms`). `src/gnss_ubx.cpp` adds `static_assert`s that `GNSS_TARGET_BAUD` is 0 or one of `GNSS_BAUDS` and that `GNSS_BAUD_SWITCH_ATTEMPTS` is 1..255. `src/display_oled.cpp` adds `static_assert`s for 128x64, `OLED_ROTATION` 0 or 2, `PIN_OLED_RST` in -1..30, contrast 0..255, `OLED_I2C_ADDR` a 7-bit address, `OLED_I2C_HZ` in 1..1000000, `PIN_BUTTON` in -1..30, `BUTTON_DEBOUNCE_MS` shorter than `BUTTON_LONG_PRESS_MS` and `OLED_BUTTON_POLL_MS` not above `OLED_PERIOD_MS`.
+Compile-time checks stop you from using GPIO12/13, from sharing a GPIO between two peripherals (the button pin takes part; `PIN_OLED_RST` is checked separately because it may be -1), from an unsupported CAN bitrate, from a `CAN_OWN_ID` outside 1..254 or equal to `VESC_CAN_ID`, from polling in listen-only mode, from a `GNSS_RATE_MS` outside 50..10000 ms, from an `EFF_WINDOW_S` outside 2..120 s, from a `BMS_CELLS_MAX` outside 1..32 or a `BMS_PROTOCOL` outside 0..2, from a `BMS_TASK_PRIO` at or above `TASK_PRIO_GNSS`, from a BLE scan window longer than its interval and from `BMS_BLE_ENABLE 1` without the NimBLE host in the sdkconfig (`sdkconfig.defaults.bms`), and, with `VESC_LINK_UART 1`, from `VESC_POLL_MS 0`, from equal UART pins and from a UART console in the sdkconfig. `src/gnss_ubx.cpp` adds `static_assert`s that `GNSS_TARGET_BAUD` is 0 or one of `GNSS_BAUDS` and that `GNSS_BAUD_SWITCH_ATTEMPTS` is 1..255. `src/display_oled.cpp` adds `static_assert`s for 128x64, `OLED_ROTATION` 0 or 2, `PIN_OLED_RST` in -1..30, contrast 0..255, `OLED_I2C_ADDR` a 7-bit address, `OLED_I2C_HZ` in 1..1000000, `PIN_BUTTON` in -1..30, `BUTTON_DEBOUNCE_MS` shorter than `BUTTON_LONG_PRESS_MS` and `OLED_BUTTON_POLL_MS` not above `OLED_PERIOD_MS`.
 
 | Group | Defines |
 |---|---|
@@ -626,6 +686,7 @@ Compile-time checks stop you from using GPIO12/13, from sharing a GPIO between t
 | Screens, button, clock | `PIN_BUTTON` (-1 = none, 9 = BOOT button), `BUTTON_ACTIVE_LOW`, `BUTTON_DEBOUNCE_MS`, `BUTTON_LONG_PRESS_MS`, `SCREEN_AUTO_RETURN_MS` (0 = stay, the default), `TIME_UTC_OFFSET_MIN` |
 | CAN / VESC | `PIN_CAN_TX`, `PIN_CAN_RX`, `CAN_BITRATE_KBPS` (125/250/500/1000), `CAN_LISTEN_ONLY`, `CAN_RX_QUEUE_LEN`, `VESC_CAN_ID` (-1 = any), `VESC_MOTOR_POLES`, `VESC_STALE_R1_MS`, `VESC_STALE_R2_MS`, `CAN_EMA_ALPHA`, `CAN_HEALTH_LOG_MS`, `CAN_LOG_RAW_FRAMES` (also logs the poll request and reply frames) |
 | Active VESC polling | `VESC_POLL_MS` (0 = never transmit), `CAN_OWN_ID` (1..254, not a VESC id), `VESC_POLL_TIMEOUT_MS`, `VESC_EXT_STALE_MS`, `CAN_TX_QUEUE_LEN` |
+| VESC over UART (`deadman_uart` env, section 3b) | `VESC_LINK_UART` (set by `[env:deadman_uart]`), `PIN_VESC_UART_TX`, `PIN_VESC_UART_RX`, `VESC_UART_BAUD`, `VESC_UART_RX_BUFFER`, `VESC_UART_EMA_ALPHA`, `VESC_UART_RX_WAIT_MS`; `VESC_POLL_MS` / `VESC_POLL_TIMEOUT_MS` / `VESC_POLL_BACKOFF_MS` default to 100 / 50 / 1000 ms there |
 | GNSS | `PIN_GNSS_RX`, `PIN_GNSS_TX`, `GNSS_BAUDS`, `GNSS_TARGET_BAUD` (0 = keep the detected baud), `GNSS_RX_BUFFER`, `GNSS_RATE_MS` (200 = 5 Hz, 100 = 10 Hz), `GNSS_DYNMODEL_SEA`, `GNSS_STALE_MS`, `GNSS_REDETECT_MS`, `GNSS_ACK_TIMEOUT_MS`, `GNSS_MAX_SACC_MM_S`, `SPEED_MIN_SHOW`, `SPEED_UNIT_KNOTS` |
 | Trip / efficiency | `TRIP_PERIOD_MS`, `EFF_WINDOW_S` (2..120 s), `EFF_MIN_SPEED_MM_S`, `EFF_MIN_DIST_M`, `EFF_UNIT_KM` (1 = Wh/km even with knots), `LOG_TRIP_MS` (0 = off) |
 | Dead-man's switch (`deadman` env, section 5b) | `DEADMAN_ENABLE`, `DEADMAN_BEACON_ADDR` (mandatory), `DEADMAN_BEACON_ADDR2` ("" = one tag), `DEADMAN_ENROL_MS`, `PIN_DEADMAN_CUT`, `DEADMAN_TIMEOUT_MS`, `DEADMAN_WARN_MS`, `DEADMAN_ARM_REPORTS` / `DEADMAN_ARM_WINDOW_MS` / `DEADMAN_ARM_RSSI`, `DEADMAN_RESET_FRESH_MS`, `DEADMAN_BOOT_CUT`, `DEADMAN_CONFIRM_ENABLE` / `DEADMAN_CONFIRM_MS`, `DEADMAN_STANDSTILL_ERPM` / `DEADMAN_STANDSTILL_MM_S`, `DEADMAN_SCAN_ITVL_MS` / `DEADMAN_SCAN_WINDOW_MS`, `DEADMAN_BMS_CONNECT_MS`, `DEADMAN_CONNECT_RETRY_MS`, `TASK_PRIO_DEADMAN`, `DEADMAN_TASK_STACK`, `DEADMAN_TICK_MS`, `HB_MAX_DEADMAN_MS`, `LOG_DEADMAN_MS`. Derived: `DEADMAN_UI_ENABLE` |
@@ -639,6 +700,7 @@ Notes: the OLED layout is hard-coded for 128x64 in `OLED_ROTATION` 0 or 2. `OLED
 
 - With the default `VESC_POLL_MS 1000` the board is no longer silent on the bus: it transmits one 7-byte read request per second under its own id `CAN_OWN_ID` (`candump` on a second adapter shows `0000084A [7] 78 00 32 00 3E C0 3C` for VESC id 74) and the VESC answers with seven frames. The request is the same read-only query VESC Tool uses; nothing in the firmware can write a setting or command the motor (`grep -rn twai_node_transmit src/` finds the single call in `poll_tick()`, under `#if VESC_POLL_MS > 0`). Build with `-DVESC_POLL_MS=0` to get a node that only ACKs and contains no transmit call at all.
 - The dead-man's switch (section 5b) does **not** change any of this. It cuts the motor through a GPIO wired to the VESC's own kill-switch input, so `grep -rn twai_node_transmit src/` still finds the single call in `poll_tick()` and the bytes on the CAN bus are identical with `DEADMAN_ENABLE` 0 or 1. What does change is that the board now actuates a safety input. It is fail-passive - the pin is open drain, so the firmware can only ever ADD a kill and a dead dashboard leaves the mechanical lanyard in charge - but a hung dashboard silently removes the BLE layer for up to `WDT_TIMEOUT_MS`, and a reboot releases a latched cut. It is not a certified man-overboard device and does not replace the lanyard.
+- The UART build (section 3b) transmits exactly one thing: the 6-byte `COMM_GET_VALUES` request every `VESC_POLL_MS`, from `poll_tick()` in `src/uart_vesc.cpp` (the only `uart_write_bytes` call there). It is read-only and does not reset the VESC's control timeout, and the TWAI driver is not linked at all.
 - The BLE link of the `bms` env (section 5) is read-only as well: the firmware writes exactly two registers to the BMS, 0x97 (device info) and 0x96 (start the cell-info stream), plus the CCCD subscription (`01 00`) that enables notifications; it never changes a BMS setting (charge / discharge switches, protection limits, balancing, names). It does occupy the BMS's single BLE slot while connected, so the JK app cannot be used at the same time, and it stores no bonding: after the first controller enable (PHY calibration blob, written before the CAN node exists) nothing is written to flash.
 - The polled averages (Iavg, id/iq, vd/vq) are "since the previous read": running VESC Tool's realtime page at the same time shortens their window on both sides. Everything else is unaffected by a second reader.
 - With the VESC powered off, each unanswered request costs the controller 8 error points until it goes error-passive (~16 polls); the log then shows `CAN: error passive` and the poll warnings every 10 s and the request rate drops to every 5 s. No bus-off, and it recovers by itself when the VESC is back.

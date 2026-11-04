@@ -8,10 +8,11 @@
 //
 // Board: DFRobot FireBeetle 2 ESP32-C6 (DFR1075). Silkscreen labels equal GPIO
 // numbers. Pins to leave alone: 12/13 (USB), 16/17 (UART0 boot console, GPIO16
-// is driven by UART0 TX the whole run), 9 (BOOT button), 0 (battery ADC, not on
-// the header). Strapping pins: 4/5 (SDIO edge only, harmless), 8/9 (boot mode),
-// 15 (JTAG select, on-board LED). Never put a peripheral-driven INPUT (a sensor
-// IRQ or busy line, say) on 8, 9 or 15.
+// is driven by UART0 TX the whole run; with VESC_LINK_UART, UART0 is the VESC link
+// on PIN_VESC_UART_TX/RX and GPIO16 may still mirror its TX), 9 (BOOT button), 0
+// (battery ADC, not on the header). Strapping pins: 4/5 (SDIO edge only, harmless),
+// 8/9 (boot mode), 15 (JTAG select, on-board LED). Never put a peripheral-driven
+// INPUT (a sensor IRQ or busy line, say) on 8, 9 or 15.
 // ----------------------------------------------------------------------------
 #pragma once
 
@@ -19,6 +20,19 @@
 
 #ifndef FW_VERSION
 #define FW_VERSION "0.1.0"
+#endif
+
+// ============================================================================
+// VESC link: CAN (default) or UART
+// ============================================================================
+// 0 = CAN (src/can_vesc.cpp): TWAI + transceiver, STATUS_1..6 broadcasts plus a 1 Hz
+//     COMM_GET_VALUES_SELECTIVE poll for the values no broadcast carries.
+// 1 = UART (src/uart_vesc.cpp, env 'deadman_uart'): no transceiver; the VESC's COMM-header
+//     UART is polled with COMM_GET_VALUES every VESC_POLL_MS. Everything the dashboard
+//     shows is in that reply except STATUS_6 (ADC1..3, PPM), which stays "--". The CAN
+//     settings below are then unused. See README section 3b.
+#ifndef VESC_LINK_UART
+#define VESC_LINK_UART 0
 #endif
 
 // ============================================================================
@@ -81,19 +95,52 @@
 // answered as FILL_RX_BUFFER/PROCESS_RX_BUFFER frames). This is the ONLY place the
 // firmware transmits on the bus. Set VESC_POLL_MS 0 for a strictly passive (ACK-only) node.
 #ifndef VESC_POLL_MS
+#if VESC_LINK_UART
+#define VESC_POLL_MS 100 // UART: the poll is the ONLY data source (79-byte reply, ~7 ms at 115200), so 10 Hz; must be > 0
+#else
 #define VESC_POLL_MS 1000 // request period in ms; 0 = never transmit anything
+#endif
 #endif
 #ifndef CAN_OWN_ID
 #define CAN_OWN_ID 120 // our controller id on the VESC bus: 1..254, must differ from every VESC id (255 = broadcast)
 #endif
 #ifndef VESC_POLL_TIMEOUT_MS
+#if VESC_LINK_UART
+#define VESC_POLL_TIMEOUT_MS 50 // UART: no complete reply within this long = timeout (a reply takes ~7 ms on the wire)
+#else
 #define VESC_POLL_TIMEOUT_MS 500 // an incomplete reply is discarded after this long
+#endif
 #endif
 #ifndef VESC_EXT_STALE_MS
 #define VESC_EXT_STALE_MS 3000 // polled values older than this are shown as "--"
 #endif
 #ifndef CAN_TX_QUEUE_LEN
 #define CAN_TX_QUEUE_LEN 4 // TWAI node TX queue depth (>= 1); only the poll requests ever use it
+#endif
+
+// ============================================================================
+// VESC over UART (VESC_LINK_UART 1 only; src/uart_vesc.cpp, include/vesc_uart.h)
+// ============================================================================
+// HP UART0 of the C6 (UART1 is the GNSS, the console is USB-Serial/JTAG) on the two pins
+// the CAN transceiver used. 3.3 V logic on both sides, no transceiver, 1 kOhm in series in
+// each line. On the VESC: the COMM-header UART, which only runs while App to Use includes
+// UART ("ADC and UART", "PPM and UART" or "UART"). The only thing ever sent is the 6-byte
+// read-only COMM_GET_VALUES request.
+#ifndef PIN_VESC_UART_TX
+#define PIN_VESC_UART_TX 3 // GPIO3 -> 1k -> VESC RX (COMM header; PB11 on the 75_300)
+#endif
+#ifndef PIN_VESC_UART_RX
+#define PIN_VESC_UART_RX 2 // GPIO2 <- 1k <- VESC TX (PB10 on the 75_300); internal pull-up, so an unpowered VESC reads idle
+#endif
+#ifndef VESC_UART_BAUD
+#define VESC_UART_BAUD 115200 // must equal VESC Tool > App Settings > UART > Baudrate (default 115200)
+#endif
+#ifndef VESC_UART_RX_BUFFER
+#define VESC_UART_RX_BUFFER 1024 // UART0 driver RX ring (bytes); one reply is 79
+#endif
+#ifndef VESC_UART_EMA_ALPHA
+#define VESC_UART_EMA_ALPHA 0.5f // display smoothing of I_in / I_motor / V_in per reply. The UART currents already are
+                                 // averages over the poll period, so lighter than CAN_EMA_ALPHA at 50 Hz. 1.0f = off
 #endif
 
 // ============================================================================
@@ -370,7 +417,7 @@
 // Tasks / watchdog / logging
 // ============================================================================
 #ifndef TASK_PRIO_CAN
-#define TASK_PRIO_CAN 6 // highest: CAN reception must never be starved
+#define TASK_PRIO_CAN 6 // highest: CAN reception must never be starved. With VESC_LINK_UART it is the UART link task's priority
 #endif
 #ifndef TASK_PRIO_GNSS
 #define TASK_PRIO_GNSS 5
@@ -411,7 +458,7 @@
 
 // ---- Advanced task tunables (defaults are fine; exposed so nothing is hidden in the .cpp files) ----
 #ifndef CAN_TASK_STACK
-#define CAN_TASK_STACK 4096 // canTask stack, bytes
+#define CAN_TASK_STACK 4096 // canTask stack, bytes (also the UART link task's, and HB_MAX_CAN_MS / hb_can gate it the same way)
 #endif
 #ifndef CAN_INSTALL_RETRY_MS
 #define CAN_INSTALL_RETRY_MS 5000 // retry period while creating / enabling the TWAI node keeps failing
@@ -460,7 +507,14 @@
 #define VESC_POLL_BACKOFF_AFTER 3 // consecutive polls without a reply before slowing down ...
 #endif
 #ifndef VESC_POLL_BACKOFF_MS
+#if VESC_LINK_UART
+#define VESC_POLL_BACKOFF_MS 1000 // ... to this period. UART: no broadcast announces a VESC that is back, so keep probing at 1 Hz
+#else
 #define VESC_POLL_BACKOFF_MS 5000 // ... to this period (a STATUS frame resumes the normal rate at once)
+#endif
+#endif
+#ifndef VESC_UART_RX_WAIT_MS
+#define VESC_UART_RX_WAIT_MS 10 // UART: uart_read_bytes() wait = task loop period; a read that returns nothing means the line was idle
 #endif
 #ifndef VESC_GETVALUES_MASK
 #define VESC_GETVALUES_MASK 0x003EC03Cu // COMM_GET_VALUES_SELECTIVE field mask (fields the STATUS frames lack); 0 = plain COMM_GET_VALUES
@@ -612,6 +666,12 @@
 #if EFF_WINDOW_S < 2 || EFF_WINDOW_S > 120
 #error "EFF_WINDOW_S must be 2..120 seconds"
 #endif
+#if VESC_LINK_UART && VESC_POLL_MS <= 0
+#error "VESC_LINK_UART needs VESC_POLL_MS > 0: over UART nothing is broadcast, the poll is the only data source"
+#endif
+#if VESC_LINK_UART && PIN_VESC_UART_TX == PIN_VESC_UART_RX
+#error "PIN_VESC_UART_TX and PIN_VESC_UART_RX must differ"
+#endif
 #if CAN_OWN_ID < 1 || CAN_OWN_ID > 254
 #error "CAN_OWN_ID must be 1..254 (255 is the CAN broadcast id)"
 #endif
@@ -679,6 +739,9 @@
 #if !defined(CONFIG_IDF_TARGET_ESP32C6)
 #error "This firmware targets the ESP32-C6 (ESP-IDF). Check platform / board in platformio.ini and sdkconfig.defaults."
 #endif
+#if VESC_LINK_UART && defined(CONFIG_ESP_CONSOLE_UART)
+#error "VESC_LINK_UART drives UART0, which must not be the console: keep CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG (sdkconfig.defaults)"
+#endif
 #if BMS_BLE_ENABLE && !defined(CONFIG_BT_NIMBLE_ENABLED)
 #error "BMS_BLE_ENABLE needs the NimBLE host: build the 'bms' env (sdkconfig.defaults.bms), see platformio.ini"
 #endif
@@ -687,10 +750,18 @@
 #ifdef __cplusplus
 namespace cfg_check
 {
+  // The two pins of the VESC link: the CAN transceiver's, or the UART's.
+#if VESC_LINK_UART
+  constexpr int kLinkTx = PIN_VESC_UART_TX;
+  constexpr int kLinkRx = PIN_VESC_UART_RX;
+#else
+  constexpr int kLinkTx = PIN_CAN_TX;
+  constexpr int kLinkRx = PIN_CAN_RX;
+#endif
   // Every GPIO in use must be unique and off the USB pair (12/13).
   constexpr int kPins[] = {
-      PIN_CAN_TX,
-      PIN_CAN_RX,
+      kLinkTx,
+      kLinkRx,
       PIN_GNSS_RX,
       PIN_GNSS_TX,
       PIN_LED,
@@ -705,8 +776,8 @@ namespace cfg_check
   };
 // PIN_OLED_RST is optional (-1); guard it separately.
 #if PIN_OLED_RST >= 0
-  static_assert(PIN_OLED_RST != PIN_OLED_SCL && PIN_OLED_RST != PIN_OLED_SDA && PIN_OLED_RST != PIN_CAN_TX &&
-                    PIN_OLED_RST != PIN_CAN_RX && PIN_OLED_RST != PIN_GNSS_RX && PIN_OLED_RST != PIN_GNSS_TX &&
+  static_assert(PIN_OLED_RST != PIN_OLED_SCL && PIN_OLED_RST != PIN_OLED_SDA && PIN_OLED_RST != kLinkTx &&
+                    PIN_OLED_RST != kLinkRx && PIN_OLED_RST != PIN_GNSS_RX && PIN_OLED_RST != PIN_GNSS_TX &&
                     PIN_OLED_RST != PIN_LED && PIN_OLED_RST != 12 && PIN_OLED_RST != 13,
                 "PIN_OLED_RST collides with another pin");
 #endif

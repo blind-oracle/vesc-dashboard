@@ -6,6 +6,12 @@
 // This header is framework-free (only <stdint.h> + shared_state.h + vesc_getvalues.h)
 // so main.cpp, the display code and the native tests can include it; everything
 // that touches the TWAI driver or FreeRTOS lives in src/can_vesc.cpp.
+//
+// VESC_LINK_UART 1 swaps the transport: src/uart_vesc.cpp then implements this same
+// API over a UART (COMM_GET_VALUES polls, include/vesc_uart.h) and src/can_vesc.cpp
+// compiles to nothing. It fills the same g_state.vesc / g_state.vesc_ext fields (the
+// STATUS_1..5 slots are stamped from the replies, STATUS_6 never), so every consumer
+// works unchanged; g_state.can then only carries the link state (RUNNING / UNINSTALLED).
 #pragma once
 
 #include <stdint.h>
@@ -33,6 +39,7 @@ const char *can_state_str(int can_state);
 // True when this build transmits COMM_GET_VALUES_SELECTIVE requests (VESC_POLL_MS > 0)
 // and polling has not been suspended at runtime (a VESC was seen broadcasting under
 // CAN_OWN_ID). False = strictly passive node; g_state.vesc_ext then stays all zero.
+// Always true over UART (the poll is the only data source there).
 bool can_vesc_polling_enabled();
 
 // Latched fault: the last NON-ZERO fault code seen in a poll reply (0 = none so far)

@@ -25,7 +25,7 @@ static const char *TAG = "main";
 // Log tags of this project. Their runtime level is raised to the compile-time level of the
 // project sources (LOG_LOCAL_LEVEL; platformio.ini may set -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG),
 // so the debug lines can be switched on without touching the IDF components' own tags.
-static const char *const kLogTags[] = {"main", "can", "gnss", "oled", "trip", "bms", "dm"};
+static const char *const kLogTags[] = {"main", "can", "vesc", "gnss", "oled", "trip", "bms", "dm"};
 
 [[maybe_unused]] static const char *resetReasonStr(esp_reset_reason_t r)
 { // log-only
@@ -58,10 +58,15 @@ static const char *const kLogTags[] = {"main", "can", "gnss", "oled", "trip", "b
 
 static void logConfig()
 {
+#if VESC_LINK_UART
+  ESP_LOGI(TAG, "cfg VESC: uart0 tx=%d rx=%d %d baud poll=%d ms timeout=%d ms poles=%d (no CAN)", PIN_VESC_UART_TX,
+           PIN_VESC_UART_RX, VESC_UART_BAUD, VESC_POLL_MS, VESC_POLL_TIMEOUT_MS, VESC_MOTOR_POLES);
+#else
   ESP_LOGI(TAG, "cfg CAN : tx=%d rx=%d %d kbit/s mode=%s rxq=%d vesc_id=%d poles=%d poll=%d ms own_id=%d", PIN_CAN_TX,
            PIN_CAN_RX, CAN_BITRATE_KBPS,
            CAN_LISTEN_ONLY ? "LISTEN_ONLY" : (VESC_POLL_MS > 0 ? "NORMAL(ack+poll)" : "NORMAL(ack-only)"),
            CAN_RX_QUEUE_LEN, VESC_CAN_ID, VESC_MOTOR_POLES, VESC_POLL_MS, CAN_OWN_ID);
+#endif
   ESP_LOGI(TAG, "cfg OLED: sda=%d scl=%d rst=%d addr=0x%02X i2c=%lu Hz %dx%d rot=%d period=%d ms dim_after=%lu ms",
            PIN_OLED_SDA, PIN_OLED_SCL, PIN_OLED_RST, (unsigned)OLED_I2C_ADDR, (unsigned long)OLED_I2C_HZ, OLED_WIDTH,
            OLED_HEIGHT, OLED_ROTATION, OLED_PERIOD_MS, (unsigned long)OLED_IDLE_DIM_MS);
