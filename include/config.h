@@ -6,7 +6,8 @@
 //
 // Display: 128x64 SSD1309 OLED over I2C (see the OLED section).
 //
-// Board: DFRobot FireBeetle 2 ESP32-C6 (DFR1075). Silkscreen labels equal GPIO
+// Board: DFRobot FireBeetle 2 ESP32-C6 (DFR1075) by default; BOARD_S3_ZERO 1 selects
+// the Waveshare ESP32-S3-Zero (see the Board block below). FireBeetle: silkscreen labels equal GPIO
 // numbers. Pins to leave alone: 12/13 (USB), 16/17 (UART0 boot console, GPIO16
 // is driven by UART0 TX the whole run; with VESC_LINK_UART, UART0 is the VESC link
 // on PIN_VESC_UART_TX/RX and GPIO16 may still mirror its TX), 9 (BOOT button), 0
@@ -20,6 +21,65 @@
 
 #ifndef FW_VERSION
 #define FW_VERSION "0.1.0"
+#endif
+
+// ============================================================================
+// Board
+// ============================================================================
+// 0 = DFRobot FireBeetle 2 ESP32-C6 (every env except s3zero_*): the defaults further down.
+// 1 = Waveshare ESP32-S3-Zero (env s3zero_deadman_uart, README section 2b). Same GPIO numbers
+//     as the FireBeetle wherever the module has them: the block below only moves the OLED
+//     (there is no GPIO22/23) and the status LED (the on-board WS2812), and puts the UART
+//     VESC link on UART2. Its pins are #ifndef too, so -D overrides still win.
+#ifndef BOARD_S3_ZERO
+#define BOARD_S3_ZERO 0
+#endif
+
+#if BOARD_S3_ZERO
+// Waveshare ESP32-S3-Zero: ESP32-S3FH4R2 (4 MB flash, 2 MB PSRAM left unused), native USB
+// only (GPIO19/20), WS2812 on GPIO21, BOOT button on GPIO0 (not on the edge). Front edge:
+// 5V / GND / 3V3 / GP1..GP6 on one side, TX(43) / RX(44) / GP13..GP7 on the other, GP14..16
+// as pads at the bottom; GP17, 18, 38..42 and 45 are pads on the back. Strapping pins: 0, 3,
+// 45, 46. GPIO3 only selects the JTAG source when the STRAP_JTAG_SEL eFuse is burned (it is
+// not from the factory), so the VESC TX output there is fine. GPIO26..37 belong to the
+// in-package flash / PSRAM and are not broken out.
+#define BOARD_NAME "Waveshare ESP32-S3-Zero"
+#define BOARD_GPIO_MAX 48
+#define BOARD_USB_DM 19
+#define BOARD_USB_DP 20
+#define BOARD_BOOT_BUTTON 0
+#define BOARD_CUT_PIN_FORBIDDEN(p) ((p) == 0 || (p) == 3 || (p) == 45 || (p) == 46) // strapping pins
+#define BOARD_PIN_RESERVED(p) ((p) >= 26 && (p) <= 37)                              // flash / PSRAM
+#ifndef PIN_OLED_SDA
+#define PIN_OLED_SDA 8 // GP8 -> OLED SDA
+#endif
+#ifndef PIN_OLED_SCL
+#define PIN_OLED_SCL 9 // GP9 -> OLED SCL
+#endif
+#ifndef PIN_OLED_RST
+#define PIN_OLED_RST 10 // GP10 -> OLED RES (optional; -1 if the module has no reset pin)
+#endif
+#ifndef PIN_LED
+#define PIN_LED 21 // the on-board WS2812
+#endif
+#ifndef LED_WS2812
+#define LED_WS2812 1
+#endif
+#ifndef VESC_UART_PORT
+#define VESC_UART_PORT 2 // UART2: UART0 and its TX/RX pads (43/44, where the ROM prints its boot log) stay untouched
+#endif
+#else
+// DFRobot FireBeetle 2 ESP32-C6: the pins to leave alone are in the header comment above.
+#define BOARD_NAME "DFRobot FireBeetle 2 ESP32-C6"
+#define BOARD_GPIO_MAX 30
+#define BOARD_USB_DM 12
+#define BOARD_USB_DP 13
+#define BOARD_BOOT_BUTTON 9
+#define BOARD_CUT_PIN_FORBIDDEN(p) ((p) == 8 || (p) == 9 || (p) == 15) // strapping pins 8/9, JTAG select / LED 15
+#define BOARD_PIN_RESERVED(p) 0                                          // nothing beyond the USB pair
+#ifndef VESC_UART_PORT
+#define VESC_UART_PORT 0 // UART0: UART1 is the GNSS and the C6 has no UART2
+#endif
 #endif
 
 // ============================================================================
@@ -121,8 +181,8 @@
 // ============================================================================
 // VESC over UART (VESC_LINK_UART 1 only; src/uart_vesc.cpp, include/vesc_uart.h)
 // ============================================================================
-// HP UART0 of the C6 (UART1 is the GNSS, the console is USB-Serial/JTAG) on the two pins
-// the CAN transceiver used. 3.3 V logic on both sides, no transceiver, 1 kOhm in series in
+// HP UART VESC_UART_PORT (board block: UART0 on the C6, UART2 on the S3-Zero; UART1 is the
+// GNSS, the console is USB-Serial/JTAG) on the two pins the CAN transceiver used. 3.3 V logic on both sides, no transceiver, 1 kOhm in series in
 // each line. On the VESC: the COMM-header UART, which only runs while App to Use includes
 // UART ("ADC and UART", "PPM and UART" or "UART"). The only thing ever sent is the 6-byte
 // read-only COMM_GET_VALUES request.
@@ -148,7 +208,8 @@
 // ============================================================================
 #ifndef PIN_BUTTON
 #define PIN_BUTTON 7 // silkscreen "7"/INT: momentary button to GND (internal pull-up). -1 = no button.
-                     // 9 = use the on-board BOOT button instead (fine at runtime; holding it during reset enters download mode)
+                     // BOARD_BOOT_BUTTON (9 on the FireBeetle, 0 on the S3-Zero) = use the on-board BOOT button instead
+                     // (fine at runtime; holding it during reset enters download mode)
 #endif
 #ifndef BUTTON_ACTIVE_LOW
 #define BUTTON_ACTIVE_LOW 1 // 1 = pressed reads LOW (button to GND, internal pull-up); 0 = pressed reads HIGH (button to 3V3, internal pull-down)
@@ -455,6 +516,12 @@
 #ifndef PIN_LED
 #define PIN_LED 15 // on-board green LED (active high): 1 Hz blink = VESC data fresh, slow blink = no VESC data
 #endif
+#ifndef LED_WS2812
+#define LED_WS2812 0 // 1 = PIN_LED drives one WS2812 RGB LED (the S3-Zero's on-board one): green blink = fresh, red = no data
+#endif
+#ifndef LED_WS2812_LEVEL
+#define LED_WS2812_LEVEL 16 // WS2812 brightness 1..255: full brightness is blinding on a dashboard at night
+#endif
 
 // ---- Advanced task tunables (defaults are fine; exposed so nothing is hidden in the .cpp files) ----
 #ifndef CAN_TASK_STACK
@@ -672,6 +739,9 @@
 #if VESC_LINK_UART && PIN_VESC_UART_TX == PIN_VESC_UART_RX
 #error "PIN_VESC_UART_TX and PIN_VESC_UART_RX must differ"
 #endif
+#if VESC_LINK_UART && VESC_UART_PORT == 1
+#error "VESC_UART_PORT must not be 1: UART1 is the GNSS"
+#endif
 #if CAN_OWN_ID < 1 || CAN_OWN_ID > 254
 #error "CAN_OWN_ID must be 1..254 (255 is the CAN broadcast id)"
 #endif
@@ -692,7 +762,7 @@
 #error "DEADMAN_ENABLE needs the NimBLE radio that the BMS client brings in: build the 'bms' env (-DBMS_BLE_ENABLE=1)"
 #endif
 #if DEADMAN_ENABLE && PIN_BUTTON < 0
-#error "DEADMAN_ENABLE needs a button: a tripped dead-man's switch latches and can only be cleared by hand (-DPIN_BUTTON=9 uses the BOOT button)"
+#error "DEADMAN_ENABLE needs a button: a tripped dead-man's switch latches and can only be cleared by hand (-DPIN_BUTTON=BOARD_BOOT_BUTTON uses the BOOT button)"
 #endif
 #if DEADMAN_ENABLE && DEADMAN_WARN_MS >= DEADMAN_TIMEOUT_MS
 #error "DEADMAN_WARN_MS must be shorter than DEADMAN_TIMEOUT_MS (it is the on-screen countdown before the cut)"
@@ -712,8 +782,8 @@
 #if DEADMAN_ENABLE && TASK_PRIO_DEADMAN <= TASK_PRIO_CAN
 #error "TASK_PRIO_DEADMAN must stay ABOVE TASK_PRIO_CAN: the cut must never wait behind a CAN burst. This is the deliberate exception to the rule that BMS_TASK_PRIO follows - do not 'fix' it"
 #endif
-#if DEADMAN_ENABLE && (PIN_DEADMAN_CUT == 8 || PIN_DEADMAN_CUT == 9 || PIN_DEADMAN_CUT == 15)
-#error "PIN_DEADMAN_CUT must not be a strapping pin (8/9) or the LED/JTAG pin (15): a glitch low at reset would be a spurious engine cut"
+#if DEADMAN_ENABLE && BOARD_CUT_PIN_FORBIDDEN(PIN_DEADMAN_CUT)
+#error "PIN_DEADMAN_CUT must not be a strapping pin of this board (FireBeetle C6: 8/9 and the LED/JTAG pin 15; S3-Zero: 0/3/45/46): a glitch low at reset would be a spurious engine cut"
 #endif
 #if DEADMAN_ENABLE && (DEADMAN_SCAN_WINDOW_MS > DEADMAN_SCAN_ITVL_MS)
 #error "BLE scan window must not exceed the scan interval"
@@ -736,11 +806,14 @@
 
 #ifndef UNIT_TEST // native host tests only; every firmware build must pass this check
 #include "sdkconfig.h"
-#if !defined(CONFIG_IDF_TARGET_ESP32C6)
-#error "This firmware targets the ESP32-C6 (ESP-IDF). Check platform / board in platformio.ini and sdkconfig.defaults."
+#if BOARD_S3_ZERO && !defined(CONFIG_IDF_TARGET_ESP32S3)
+#error "BOARD_S3_ZERO needs an ESP32-S3 target: use board = waveshare_esp32s3_zero (see env s3zero_deadman_uart in platformio.ini)"
 #endif
-#if VESC_LINK_UART && defined(CONFIG_ESP_CONSOLE_UART)
-#error "VESC_LINK_UART drives UART0, which must not be the console: keep CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG (sdkconfig.defaults)"
+#if !BOARD_S3_ZERO && !defined(CONFIG_IDF_TARGET_ESP32C6)
+#error "This firmware targets the FireBeetle 2 ESP32-C6 unless BOARD_S3_ZERO is set. Check platform / board in platformio.ini."
+#endif
+#if VESC_LINK_UART && defined(CONFIG_ESP_CONSOLE_UART) && CONFIG_ESP_CONSOLE_UART_NUM == VESC_UART_PORT
+#error "VESC_LINK_UART drives VESC_UART_PORT, which must not be the console: keep CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG (sdkconfig.defaults)"
 #endif
 #if BMS_BLE_ENABLE && !defined(CONFIG_BT_NIMBLE_ENABLED)
 #error "BMS_BLE_ENABLE needs the NimBLE host: build the 'bms' env (sdkconfig.defaults.bms), see platformio.ini"
@@ -758,7 +831,7 @@ namespace cfg_check
   constexpr int kLinkTx = PIN_CAN_TX;
   constexpr int kLinkRx = PIN_CAN_RX;
 #endif
-  // Every GPIO in use must be unique and off the USB pair (12/13).
+  // Every GPIO in use must be unique, off the USB pair and off the board's reserved pins.
   constexpr int kPins[] = {
       kLinkTx,
       kLinkRx,
@@ -778,7 +851,8 @@ namespace cfg_check
 #if PIN_OLED_RST >= 0
   static_assert(PIN_OLED_RST != PIN_OLED_SCL && PIN_OLED_RST != PIN_OLED_SDA && PIN_OLED_RST != kLinkTx &&
                     PIN_OLED_RST != kLinkRx && PIN_OLED_RST != PIN_GNSS_RX && PIN_OLED_RST != PIN_GNSS_TX &&
-                    PIN_OLED_RST != PIN_LED && PIN_OLED_RST != 12 && PIN_OLED_RST != 13,
+                    PIN_OLED_RST != PIN_LED && PIN_OLED_RST != BOARD_USB_DM && PIN_OLED_RST != BOARD_USB_DP &&
+                    !BOARD_PIN_RESERVED(PIN_OLED_RST),
                 "PIN_OLED_RST collides with another pin");
 #endif
   constexpr bool allDistinct()
@@ -792,11 +866,19 @@ namespace cfg_check
   constexpr bool noUsbPins()
   {
     for (unsigned i = 0; i < sizeof(kPins) / sizeof(kPins[0]); ++i)
-      if (kPins[i] == 12 || kPins[i] == 13)
+      if (kPins[i] == BOARD_USB_DM || kPins[i] == BOARD_USB_DP)
+        return false;
+    return true;
+  }
+  constexpr bool noReservedPins()
+  {
+    for (unsigned i = 0; i < sizeof(kPins) / sizeof(kPins[0]); ++i)
+      if (BOARD_PIN_RESERVED(kPins[i]))
         return false;
     return true;
   }
   static_assert(allDistinct(), "Two peripherals share a GPIO in config.h");
-  static_assert(noUsbPins(), "GPIO12/13 are the USB D-/D+ pins (Serial console); do not use them");
+  static_assert(noUsbPins(), "BOARD_USB_DM/DP (FireBeetle: GPIO12/13, S3-Zero: GPIO19/20) are the USB pins (Serial console); do not use them");
+  static_assert(noReservedPins(), "a pin in use belongs to the board's flash / PSRAM (S3-Zero: GPIO26..37)");
 } // namespace cfg_check
 #endif

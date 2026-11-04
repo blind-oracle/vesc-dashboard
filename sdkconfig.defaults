@@ -1,7 +1,10 @@
-# vesc-dashboard: ESP-IDF 6.1 defaults for the ESP32-C6 (DFRobot FireBeetle 2).
+# vesc-dashboard: ESP-IDF 6.1 defaults for both boards (ESP32-C6 FireBeetle 2, ESP32-S3-Zero).
 # These reproduce what the Arduino core used to set implicitly. The builder derives
 # sdkconfig.<env> from this file; edit here, never in the generated file.
-CONFIG_IDF_TARGET="esp32c6"
+#
+# No CONFIG_IDF_TARGET here: the target is the board JSON's build.mcu (esp32c6 for the FireBeetle,
+# esp32s3 for the S3-Zero), which the builder passes as -DIDF_TARGET. ESP-IDF then also applies
+# sdkconfig.defaults.<target> right after this file (sdkconfig.defaults.esp32s3).
 
 # Flash: 4 MB, QIO, 80 MHz. The PlatformIO builder checks the size against boards/*.json.
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y

@@ -4,5 +4,6 @@
 sdkconfig.*
 !sdkconfig.defaults
 !sdkconfig.defaults.bms
+!sdkconfig.defaults.esp32s3
 managed_components/
 dependencies.lock

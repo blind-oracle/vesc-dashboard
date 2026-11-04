@@ -4,7 +4,7 @@ Be advised that this whole repo is AI-generated, so take it with a grain of salt
 
 # vesc-dashboard
 
-ESP32-C6 firmware that listens to a VESC motor controller on CAN, polls it once a second for the few values its broadcasts lack (fault code, per-MOSFET temperatures, id/iq, vd/vq, absolute tachometer), reads ground speed and time from a u-blox GNSS receiver at 5 Hz, shows everything on a 128x64 monochrome OLED (SSD1309 controller, I2C) as seven screens cycled by a push button, and integrates speed and energy into a trip log with the boat's efficiency in Wh per nautical mile (or km). Built for the DFRobot FireBeetle 2 ESP32-C6 (DFR1075) with an MCP2551-class CAN transceiver, any 2.42" or 1.54" SSD1309 module switched to I2C mode and any receiver that speaks UBX (u-blox 6/7, M8, M9, M10 or a compatible clone). On the CAN bus the firmware acknowledges frames and transmits exactly one thing: a 7-byte `COMM_GET_VALUES_SELECTIVE` request every `VESC_POLL_MS` (1 s). It never sends a command or a setting; `-DVESC_POLL_MS=0` makes it strictly passive (ACK only). Optionally (`pio run -e bms`) it also reads a JK (Jikong) BMS over Bluetooth LE with the C6's own radio and adds a BMS page and two CELLS pages (ten screens); the BLE link is only held while one of those pages is on screen (`BMS_LINK_ON_DEMAND`), and the default build contains no BLE code at all. The same radio can optionally run a dead-man's switch (`pio run -e deadman`, section 5b): a BLE tag worn by the helmsman, and if it stops advertising the firmware pulls the VESC's own kill-switch input low, in parallel with the boat's mechanical lanyard switch. That path uses a GPIO, not CAN - what the firmware transmits on the bus is unchanged. Without a CAN transceiver, `pio run -e deadman_uart` talks to the VESC over its COMM-header UART instead (section 3b): one `COMM_GET_VALUES` poll every 100 ms replaces both the broadcasts and the CAN poll, and everything except the ADC/PPM row stays available.
+ESP32-C6 firmware that listens to a VESC motor controller on CAN, polls it once a second for the few values its broadcasts lack (fault code, per-MOSFET temperatures, id/iq, vd/vq, absolute tachometer), reads ground speed and time from a u-blox GNSS receiver at 5 Hz, shows everything on a 128x64 monochrome OLED (SSD1309 controller, I2C) as seven screens cycled by a push button, and integrates speed and energy into a trip log with the boat's efficiency in Wh per nautical mile (or km). Built for the DFRobot FireBeetle 2 ESP32-C6 (DFR1075) with an MCP2551-class CAN transceiver, any 2.42" or 1.54" SSD1309 module switched to I2C mode and any receiver that speaks UBX (u-blox 6/7, M8, M9, M10 or a compatible clone). On the CAN bus the firmware acknowledges frames and transmits exactly one thing: a 7-byte `COMM_GET_VALUES_SELECTIVE` request every `VESC_POLL_MS` (1 s). It never sends a command or a setting; `-DVESC_POLL_MS=0` makes it strictly passive (ACK only). Optionally (`pio run -e bms`) it also reads a JK (Jikong) BMS over Bluetooth LE with the C6's own radio and adds a BMS page and two CELLS pages (ten screens); the BLE link is only held while one of those pages is on screen (`BMS_LINK_ON_DEMAND`), and the default build contains no BLE code at all. The same radio can optionally run a dead-man's switch (`pio run -e deadman`, section 5b): a BLE tag worn by the helmsman, and if it stops advertising the firmware pulls the VESC's own kill-switch input low, in parallel with the boat's mechanical lanyard switch. That path uses a GPIO, not CAN - what the firmware transmits on the bus is unchanged. Without a CAN transceiver, `pio run -e deadman_uart` talks to the VESC over its COMM-header UART instead (section 3b): one `COMM_GET_VALUES` poll every 100 ms replaces both the broadcasts and the CAN poll, and everything except the ADC/PPM row stays available. The same UART build also runs on a Waveshare ESP32-S3-Zero (`pio run -e s3zero_deadman_uart`, section 2b).
 
 ## 1. What it does
 
@@ -163,6 +163,33 @@ The optional BMS link (`pio run -e bms`, section 5) uses the ESP32-C6's own Blue
 | 8, 15 | strapping pins (boot mode, JTAG select). MCU-driven outputs are fine (the on-board LED is on 15); never a peripheral-driven input |
 | 4, 5 | strapping only for the SDIO edge, harmless; used for GNSS |
 
+## 2b. Waveshare ESP32-S3-Zero
+
+`pio run -e s3zero_deadman_uart` is the `deadman_uart` build (VESC over UART, JK BMS, dead-man's switch) for a Waveshare ESP32-S3-Zero instead of the FireBeetle (`BOARD_S3_ZERO=1`, board JSON `boards/waveshare_esp32s3_zero.json`). The module is an ESP32-S3FH4R2: 4 MB flash, and 2 MB PSRAM that the firmware leaves unused. It has native USB only (GPIO19/20), a WS2812 RGB LED on GPIO21 and a BOOT button on GPIO0. It is powered through its 5V pin (3.7..6 V in) and has 3V3 out from an ME6217 regulator (800 mA).
+
+Everything uses the FireBeetle's GPIO numbers wherever the module has them. Only the OLED moves (the S3-Zero has no GPIO22/23), and the LED becomes the on-board WS2812:
+
+| S3-Zero pin | Function | FireBeetle GPIO |
+|---|---|---|
+| GP1 | dead-man cut, open drain (section 5b) | 1 |
+| GP2 | VESC UART RX <- 1 kOhm <- VESC TX (section 3b) | 2 |
+| GP3 | VESC UART TX -> 1 kOhm -> VESC RX | 3 |
+| GP4 / GP5 | GNSS RX / TX | 4 / 5 |
+| GP7 | button to GND | 7 |
+| GP8 / GP9 / GP10 | OLED SDA / SCL / RES | 22 / 23 / 14 |
+| GP21 (on board) | WS2812 status LED | 15 (plain LED) |
+
+All of these are front-edge pins. Notes:
+
+- **Status LED:** it blinks green at 1 Hz while VESC data is fresh and red at 0.2 Hz while it is not, at `LED_WS2812_LEVEL` (16 of 255). It is driven by the RMT peripheral (`src/status_led.cpp`).
+- **VESC UART:** the link runs on UART2 (`VESC_UART_PORT`). UART1 is the GNSS, and UART0 is left alone, together with its TX/RX pads (GPIO43/44), where the ROM prints its boot log.
+- **Single core:** `sdkconfig.defaults.esp32s3` (applied automatically for this target) runs the S3 single-core at 160 MHz. The task model was designed and verified on the single-core C6, with strict priorities on one core and the dead-man task above everything, and this keeps it identical.
+- **Pins to leave alone:**
+  - GPIO0, 3, 45 and 46 are the S3's strapping pins. `config.h` refuses them for the dead-man cut. GPIO3 only selects the JTAG source when the `STRAP_JTAG_SEL` eFuse is burned (it is not from the factory), so the VESC TX output there is fine.
+  - GPIO19/20 are USB, and GPIO26..37 are the in-package flash / PSRAM. `config.h` refuses both, as it refuses 12/13 on the C6.
+- **Flashing:** over the USB-C port (USB-Serial/JTAG, which is also the console). If the port does not enumerate, hold BOOT while plugging in.
+- **Overrides:** every pin is still an `#ifndef` default, so `-D` overrides work as on the FireBeetle.
+
 ## 3. VESC configuration (VESC Tool)
 
 A VESC broadcasts nothing on CAN until you enable status messages. Connect VESC Tool to the VESC, then App Settings > General:
@@ -222,7 +249,7 @@ Some values exist only in the reply to a request. Every `VESC_POLL_MS` (1000 ms)
 - The series resistors limit the current through the input protection diodes when only one side is powered. A UART line idles high, so without them an unpowered VESC would be fed from the dashboard's TX, and vice versa.
 - GPIO2/3 are the CAN transceiver's pins. This build does not use CAN, so remove the transceiver or leave it disconnected.
 - RX has the internal pull-up enabled, so an unplugged VESC reads as an idle line.
-- The link runs on the C6's UART0: UART1 is the GNSS, and the console stays on USB-Serial/JTAG (`config.h` refuses a UART console in this build).
+- The link runs on the C6's UART0 (UART2 on the S3-Zero, section 2b): UART1 is the GNSS, and the console stays on USB-Serial/JTAG (`config.h` refuses a UART console in this build).
 
 ### On the VESC (VESC Tool)
 
@@ -586,6 +613,7 @@ Prerequisites: PlatformIO Core (`pio` on the PATH, e.g. `~/.platformio/penv/bin/
 | `pio device monitor` | serial console at 115200 with exception decoder and timestamps |
 | `pio run -e deadman -t upload` | the `bms` build plus the BLE dead-man's switch (section 5b). Both `BMS_BLE_ADDR` and `DEADMAN_BEACON_ADDR` must be set to your hardware first: the placeholders in `platformio.ini` are deliberately obvious, and a tag address that never matches leaves the switch in `NO TAG` for ever |
 | `pio run -e deadman_uart -t upload` | the `deadman` build with the VESC on its COMM-header UART instead of CAN (section 3b): no transceiver; App to Use must include UART |
+| `pio run -e s3zero_deadman_uart -t upload` | `deadman_uart` on a Waveshare ESP32-S3-Zero (section 2b); the first build compiles ESP-IDF for the S3 |
 | `pio test -e native` | host unit tests in nine directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_vesc_uart`, `test/test_ubx`, `test/test_trip`, `test/test_jk_bms`, `test/test_display_strings_oled`, `test/test_deadman`, `test/test_ble_addr`; 247 test cases): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UART link codec (request frame, reassembly through junk, damaged frames and bogus headers, the state update from a reply), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, 32-bit clock wrap), JK BMS codec (command bytes, checksum, the frame assembler under every observed chunking, recorded 24S / 32S / 13S frames, layout detection, device info, alarm names), all OLED screens including BMS and CELLS, and the clock arithmetic; no hardware |
 | `pio run -e demo -t upload` | flash the layout demo (`DISPLAY_DEMO=1` on top of the `bms` env: all ten screens with synthetic data, dimming after 20 s) |
 | `pio run -e bms -t upload` | build and flash with the JK BMS BLE client (`BMS_BLE_ENABLE=1`, NimBLE host from `sdkconfig.defaults.bms`; +349 KB of flash, section 5). `pio run -e bms` alone only builds it |
@@ -677,10 +705,11 @@ build_flags =
 
 Then build with `pio run -e myboat -t upload`. For a boat with a BMS extend `env:bms` (and inherit `${env:bms.build_flags}`) instead, adding `-DBMS_BLE_ADDR='"C8:47:8C:12:34:56"'` to pin your BMS; the NimBLE fragment comes along with the inherited `board_build.cmake_extra_args`, as it does for the `demo` env.
 
-Compile-time checks stop you from using GPIO12/13, from sharing a GPIO between two peripherals (the button pin takes part; `PIN_OLED_RST` is checked separately because it may be -1), from an unsupported CAN bitrate, from a `CAN_OWN_ID` outside 1..254 or equal to `VESC_CAN_ID`, from polling in listen-only mode, from a `GNSS_RATE_MS` outside 50..10000 ms, from an `EFF_WINDOW_S` outside 2..120 s, from a `BMS_CELLS_MAX` outside 1..32 or a `BMS_PROTOCOL` outside 0..2, from a `BMS_TASK_PRIO` at or above `TASK_PRIO_GNSS`, from a BLE scan window longer than its interval and from `BMS_BLE_ENABLE 1` without the NimBLE host in the sdkconfig (`sdkconfig.defaults.bms`), and, with `VESC_LINK_UART 1`, from `VESC_POLL_MS 0`, from equal UART pins and from a UART console in the sdkconfig. `src/gnss_ubx.cpp` adds `static_assert`s that `GNSS_TARGET_BAUD` is 0 or one of `GNSS_BAUDS` and that `GNSS_BAUD_SWITCH_ATTEMPTS` is 1..255. `src/display_oled.cpp` adds `static_assert`s for 128x64, `OLED_ROTATION` 0 or 2, `PIN_OLED_RST` in -1..30, contrast 0..255, `OLED_I2C_ADDR` a 7-bit address, `OLED_I2C_HZ` in 1..1000000, `PIN_BUTTON` in -1..30, `BUTTON_DEBOUNCE_MS` shorter than `BUTTON_LONG_PRESS_MS` and `OLED_BUTTON_POLL_MS` not above `OLED_PERIOD_MS`.
+Compile-time checks stop you from using GPIO12/13 (on the S3-Zero: the USB pins 19/20 and the flash / PSRAM pins 26..37), from a dead-man cut on a strapping pin of the board, from sharing a GPIO between two peripherals (the button pin takes part; `PIN_OLED_RST` is checked separately because it may be -1), from an unsupported CAN bitrate, from a `CAN_OWN_ID` outside 1..254 or equal to `VESC_CAN_ID`, from polling in listen-only mode, from a `GNSS_RATE_MS` outside 50..10000 ms, from an `EFF_WINDOW_S` outside 2..120 s, from a `BMS_CELLS_MAX` outside 1..32 or a `BMS_PROTOCOL` outside 0..2, from a `BMS_TASK_PRIO` at or above `TASK_PRIO_GNSS`, from a BLE scan window longer than its interval and from `BMS_BLE_ENABLE 1` without the NimBLE host in the sdkconfig (`sdkconfig.defaults.bms`), and, with `VESC_LINK_UART 1`, from `VESC_POLL_MS 0`, from equal UART pins and from a UART console in the sdkconfig. `src/gnss_ubx.cpp` adds `static_assert`s that `GNSS_TARGET_BAUD` is 0 or one of `GNSS_BAUDS` and that `GNSS_BAUD_SWITCH_ATTEMPTS` is 1..255. `src/display_oled.cpp` adds `static_assert`s for 128x64, `OLED_ROTATION` 0 or 2, `PIN_OLED_RST` in -1..30, contrast 0..255, `OLED_I2C_ADDR` a 7-bit address, `OLED_I2C_HZ` in 1..1000000, `PIN_BUTTON` in -1..30, `BUTTON_DEBOUNCE_MS` shorter than `BUTTON_LONG_PRESS_MS` and `OLED_BUTTON_POLL_MS` not above `OLED_PERIOD_MS`.
 
 | Group | Defines |
 |---|---|
+| Board | `BOARD_S3_ZERO` (1 = Waveshare ESP32-S3-Zero, set by `[env:s3zero_deadman_uart]`; it moves the OLED / LED defaults and sets `VESC_UART_PORT` 2), `LED_WS2812` (1 = `PIN_LED` is a WS2812), `LED_WS2812_LEVEL` (1..255), `VESC_UART_PORT` (0 on the C6, 2 on the S3; never 1, the GNSS) |
 | Display demo | `DISPLAY_DEMO` (1 = synthetic changing values on every screen, the `demo` env) |
 | OLED | `PIN_OLED_SCL`, `PIN_OLED_SDA`, `PIN_OLED_RST` (-1 = not wired), `OLED_I2C_ADDR`, `OLED_I2C_HZ`, `OLED_WIDTH`, `OLED_HEIGHT`, `OLED_ROTATION`, `OLED_PERIOD_MS`, `OLED_CONTRAST`, `OLED_IDLE_DIM_MS`, `OLED_IDLE_CONTRAST` |
 | Screens, button, clock | `PIN_BUTTON` (-1 = none, 9 = BOOT button), `BUTTON_ACTIVE_LOW`, `BUTTON_DEBOUNCE_MS`, `BUTTON_LONG_PRESS_MS`, `SCREEN_AUTO_RETURN_MS` (0 = stay, the default), `TIME_UTC_OFFSET_MIN` |

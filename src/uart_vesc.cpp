@@ -6,9 +6,11 @@
 //
 // Things this file is built around (see the README, section 3b):
 //
-//  * HP UART0. UART1 is the GNSS and the LP UART's pins are fixed to the GNSS's 4/5;
-//    the console is USB-Serial/JTAG (config.h refuses a UART console), so UART0 is
-//    free once the ROM is done with it. It is routed to the CAN transceiver's old pins.
+//  * HP UART VESC_UART_PORT (config.h board block). FireBeetle C6: UART0 - UART1 is the
+//    GNSS, the LP UART's pins are fixed to the GNSS's 4/5 and the console is USB-Serial/
+//    JTAG (config.h refuses a UART console), so UART0 is free once the ROM is done with
+//    it. S3-Zero: UART2, which leaves UART0 and its ROM boot-log pads alone. Either way
+//    it is routed to the CAN transceiver's old pins.
 //
 //  * The only bytes ever transmitted are the 6-byte COMM_GET_VALUES request. It is
 //    read-only and does not reset the VESC's control timeout, so the dashboard can
@@ -33,6 +35,7 @@
 
 #include <driver/gpio.h>
 #include <driver/uart.h>
+#include <soc/soc_caps.h>
 #include <esp_err.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
@@ -48,7 +51,10 @@
 
 static const char *TAG = "vesc";
 
-constexpr uart_port_t kUart = UART_NUM_0;
+constexpr uart_port_t kUart = (uart_port_t)VESC_UART_PORT;
+
+static_assert(VESC_UART_PORT != 1 && VESC_UART_PORT >= 0 && VESC_UART_PORT < SOC_UART_HP_NUM,
+              "VESC_UART_PORT must be an HP UART of this chip other than UART1 (the GNSS)");
 
 static_assert(VESC_POLL_TIMEOUT_MS > 0, "VESC_POLL_TIMEOUT_MS must be > 0");
 static_assert(VESC_UART_RX_BUFFER > 128, "VESC_UART_RX_BUFFER must exceed the 128-byte hardware FIFO (uart_driver_install)");
@@ -144,16 +150,16 @@ static bool uart_install() {
   if (err == ESP_OK) err = gpio_pullup_en((gpio_num_t)PIN_VESC_UART_RX);
   if (err != ESP_OK) {
     if (have_driver) uart_driver_delete(kUart);
-    ESP_LOGE(TAG, "VESC: UART0 setup failed: %s (tx=GPIO%d rx=GPIO%d, retry in %lu ms)", esp_err_to_name(err),
-             PIN_VESC_UART_TX, PIN_VESC_UART_RX, (unsigned long)CAN_INSTALL_RETRY_MS);
+    ESP_LOGE(TAG, "VESC: UART%d setup failed: %s (tx=GPIO%d rx=GPIO%d, retry in %lu ms)", VESC_UART_PORT,
+             esp_err_to_name(err), PIN_VESC_UART_TX, PIN_VESC_UART_RX, (unsigned long)CAN_INSTALL_RETRY_MS);
     set_link_state(CAN_STATE_UNINSTALLED);
     return false;
   }
   s_installed = true;
   set_link_state(CAN_STATE_RUNNING);
-  ESP_LOGI(TAG, "VESC: UART0 tx=GPIO%d rx=GPIO%d %d baud ring=%u B, COMM_GET_VALUES every %d ms (timeout %d ms)",
-           PIN_VESC_UART_TX, PIN_VESC_UART_RX, VESC_UART_BAUD, (unsigned)VESC_UART_RX_BUFFER, VESC_POLL_MS,
-           VESC_POLL_TIMEOUT_MS);
+  ESP_LOGI(TAG, "VESC: UART%d tx=GPIO%d rx=GPIO%d %d baud ring=%u B, COMM_GET_VALUES every %d ms (timeout %d ms)",
+           VESC_UART_PORT, PIN_VESC_UART_TX, PIN_VESC_UART_RX, VESC_UART_BAUD, (unsigned)VESC_UART_RX_BUFFER,
+           VESC_POLL_MS, VESC_POLL_TIMEOUT_MS);
   return true;
 }
 

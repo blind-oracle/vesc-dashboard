@@ -89,12 +89,12 @@ static const char *TAG = "oled";
 // The layout below is hard-coded for a 128x64 panel in landscape.
 static_assert(OLED_WIDTH == 128 && OLED_HEIGHT == 64, "display_oled.cpp lays out a 128x64 panel");
 static_assert(OLED_ROTATION == 0 || OLED_ROTATION == 2, "OLED_ROTATION must be 0 or 2 (landscape layout)");
-static_assert(PIN_OLED_RST >= -1 && PIN_OLED_RST <= 30, "PIN_OLED_RST must be -1 or an ESP32-C6 GPIO 0..30");
+static_assert(PIN_OLED_RST >= -1 && PIN_OLED_RST <= BOARD_GPIO_MAX, "PIN_OLED_RST must be -1 or a GPIO of this board");
 static_assert(OLED_CONTRAST >= 0 && OLED_CONTRAST <= 255 && OLED_IDLE_CONTRAST >= 0 && OLED_IDLE_CONTRAST <= 255,
               "OLED contrast values are 0..255");
 static_assert(OLED_I2C_HZ >= 1 && OLED_I2C_HZ <= 1000000, "OLED_I2C_HZ must be 1..1000000 (SSD1309 max 400 kHz)");
 static_assert(OLED_I2C_ADDR >= 0x08 && OLED_I2C_ADDR <= 0x77, "OLED_I2C_ADDR is a 7-bit address (0x3C or 0x3D)");
-static_assert(PIN_BUTTON >= -1 && PIN_BUTTON <= 30, "PIN_BUTTON must be -1 (none) or an ESP32-C6 GPIO 0..30");
+static_assert(PIN_BUTTON >= -1 && PIN_BUTTON <= BOARD_GPIO_MAX, "PIN_BUTTON must be -1 (none) or a GPIO of this board");
 static_assert(BUTTON_DEBOUNCE_MS > 0 && BUTTON_DEBOUNCE_MS < BUTTON_LONG_PRESS_MS,
               "BUTTON_DEBOUNCE_MS must be positive and shorter than BUTTON_LONG_PRESS_MS");
 static_assert(SCREEN_AUTO_RETURN_MS >= 0, "SCREEN_AUTO_RETURN_MS must be >= 0 (0 = never)");

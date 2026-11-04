@@ -1,0 +1,15 @@
+# vesc-dashboard: ESP32-S3 additions (Waveshare ESP32-S3-Zero, env s3zero_deadman_uart). ESP-IDF
+# applies this file right after sdkconfig.defaults whenever the target is esp32s3, and after
+# every file in SDKCONFIG_DEFAULTS the matching "<file>.esp32s3" if one exists (the 'bms'
+# fragment needs none). The builder only re-runs CMake when sdkconfig.defaults or
+# sdkconfig.<env> changed: after editing this file run `touch sdkconfig.defaults`.
+#
+# Single core. The task model was designed and verified on the single-core C6: strict
+# priorities on one core (TASK_PRIO_DEADMAN above everything, every worker above the
+# supervisor), ISR counters and heartbeats read without locks. Running the S3 on one core keeps
+# those semantics identical; 160 MHz on one core is far more than this firmware needs.
+CONFIG_FREERTOS_UNICORE=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+
+# sdkconfig.defaults.bms also sets CONFIG_BT_LE_CONTROLLER_TASK_STACK_SIZE, which belongs to
+# the C6's BLE controller; the S3 controller has no such symbol, so it is simply ignored here.

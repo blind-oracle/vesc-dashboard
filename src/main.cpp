@@ -1,10 +1,10 @@
-// vesc-dashboard: ESP32-C6 (DFRobot FireBeetle 2) VESC CAN monitor + SSD1309 OLED dashboard + u-blox GNSS speed
+// vesc-dashboard: ESP32-C6 (DFRobot FireBeetle 2) or ESP32-S3 (Waveshare ESP32-S3-Zero) VESC monitor
+// (CAN or UART) + SSD1309 OLED dashboard + u-blox GNSS speed
 //
 // app_main(): boot banner, shared state, task watchdog, start the worker tasks, then run
 // the supervisor loop forever on the main task (priority 1): it feeds the task watchdog
 // only while every worker heartbeat is fresh, blinks the LED and prints the periodic
 // telemetry / GNSS / trip / system log lines. It never touches the peripherals.
-#include <driver/gpio.h>
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
@@ -18,6 +18,7 @@
 #include "shared_state.h"
 #include "bms_ble.h"
 #include "deadman.h"
+#include "status_led.h"
 #include "trip.h"
 
 static const char *TAG = "main";
@@ -59,8 +60,8 @@ static const char *const kLogTags[] = {"main", "can", "vesc", "gnss", "oled", "t
 static void logConfig()
 {
 #if VESC_LINK_UART
-  ESP_LOGI(TAG, "cfg VESC: uart0 tx=%d rx=%d %d baud poll=%d ms timeout=%d ms poles=%d (no CAN)", PIN_VESC_UART_TX,
-           PIN_VESC_UART_RX, VESC_UART_BAUD, VESC_POLL_MS, VESC_POLL_TIMEOUT_MS, VESC_MOTOR_POLES);
+  ESP_LOGI(TAG, "cfg VESC: uart%d tx=%d rx=%d %d baud poll=%d ms timeout=%d ms poles=%d (no CAN)", VESC_UART_PORT,
+           PIN_VESC_UART_TX, PIN_VESC_UART_RX, VESC_UART_BAUD, VESC_POLL_MS, VESC_POLL_TIMEOUT_MS, VESC_MOTOR_POLES);
 #else
   ESP_LOGI(TAG, "cfg CAN : tx=%d rx=%d %d kbit/s mode=%s rxq=%d vesc_id=%d poles=%d poll=%d ms own_id=%d", PIN_CAN_TX,
            PIN_CAN_RX, CAN_BITRATE_KBPS,
@@ -80,8 +81,6 @@ static void logConfig()
 #endif
 }
 
-static inline void led_set(bool on) { gpio_set_level((gpio_num_t)PIN_LED, on ? 1 : 0); }
-
 static void setup()
 {
   // FIRST, before any delay: put the dead-man's cut line into its boot state. Until this
@@ -97,13 +96,9 @@ static void setup()
   for (const char *tag : kLogTags)
     esp_log_level_set(tag, (esp_log_level_t)LOG_LOCAL_LEVEL);
 
-  gpio_config_t led = {};
-  led.pin_bit_mask = 1ULL << PIN_LED;
-  led.mode = GPIO_MODE_OUTPUT;
-  gpio_config(&led);
-  led_set(false);
+  status_led_init();
 
-  ESP_LOGI(TAG, "vesc-dashboard %s (built %s %s) reset=%s", FW_VERSION, __DATE__, __TIME__,
+  ESP_LOGI(TAG, "vesc-dashboard %s (built %s %s) board=%s reset=%s", FW_VERSION, __DATE__, __TIME__, BOARD_NAME,
            resetReasonStr(esp_reset_reason()));
   logConfig();
 
@@ -189,14 +184,14 @@ static void loop()
              (unsigned long)age_ms(hb_disp, now), (unsigned long)WDT_TIMEOUT_MS);
   }
 
-  // ---- LED: 1 Hz blink when VESC data is fresh, 0.2 Hz otherwise -------------
+  // ---- LED: 1 Hz blink when VESC data is fresh, 0.2 Hz otherwise (a WS2812 also turns red) ----
   const bool vescFresh = vesc_fresh(&s.vesc.t, VESC_IDX_STATUS_1, now, VESC_STALE_R1_MS) ||
                          vesc_fresh(&s.vesc.t, VESC_IDX_STATUS_5, now, VESC_STALE_R1_MS);
   if ((int32_t)(now - nextBlink) >= 0)
   {
     nextBlink = now + (vescFresh ? 500 : 2500);
     led = !led;
-    led_set(led);
+    status_led_set(led, vescFresh);
   }
 
   // ---- periodic logs (deadline based, never "now % period") ------------------
