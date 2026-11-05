@@ -1,0 +1,36 @@
+# vesc-dashboard: second sdkconfig fragment for the dead-man builds (BLE beacon scan). Applied AFTER
+# sdkconfig.defaults via board_build.cmake_extra_args = -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.ble".
+# The builder only re-runs CMake when sdkconfig.defaults or sdkconfig.<env> changed, and a value already in
+# sdkconfig.<env> wins over this file: after editing it delete the generated sdkconfig.<env> of every env that
+# uses it (deadman, deadman_uart, s3zero_deadman_uart). All symbols verified in ESP-IDF 6.1 Kconfig.
+
+# NimBLE host, observer role only: the firmware only ever scans (no connections, no advertising,
+# no GATT, no security/bonding). With central and peripheral off, the connection-related symbols
+# (GATT client/server, MAX_CONNECTIONS, ATT MTU, bonding store) disappear from the generated sdkconfig.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=n
+# No NVS writes from the host (no bonding store): the only BLE-related flash write is the PHY
+# calibration blob at the first controller enable, which happens before the CAN node exists.
+CONFIG_BT_NIMBLE_NVS_PERSIST=n
+# Legacy advertising is what the tags send (extended-advertising beacons stay invisible).
+CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=n
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
+# C6 controller only; the S3 controller has no such symbol and ignores it.
+CONFIG_BT_LE_CONTROLLER_TASK_STACK_SIZE=4096
+# Wi-Fi is never started; drop the software coexistence hooks (CONFIG_ESP_WIFI_ENABLED itself is not settable).
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+
+# Measured (2026-11-05): env deadman firmware.bin 622,576 B vs 292,416 B without BLE (+330 KB); the
+# observer-only host saves ~55 KB against the former central + GATT client configuration.
+# Optional RAM trims (examples/bluetooth/nimble/blecent/sdkconfig.defaults.mini; defaults are 24/24), enable after the first heap measurement:
+# CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6
+# CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
+# CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=12
+# CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=15
+# CONFIG_BT_ALARM_MAX_NUM=15

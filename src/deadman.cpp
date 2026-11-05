@@ -1,8 +1,9 @@
 // Dead-man's switch: the cut line, the task and the closed loop.
 //
 // Three contexts touch this file:
-//   * the NimBLE host task (prio 21) calls deadman_beacon_seen() / deadman_adv_other()
-//     from gap_cb. Volatile stores only: no lock, no log, no allocation;
+//   * the NimBLE host task (prio 21; on the S3 on the radio core) calls deadman_beacon_seen() /
+//     deadman_adv_other() from gap_cb (src/ble_scan.cpp). Volatile stores only: no lock, no
+//     log, no allocation;
 //   * the display task (prio 2) calls deadman_request_reset();
 //   * deadmanTask (TASK_PRIO_DEADMAN, above CAN) owns everything else. It runs the pure
 //     state machine from deadman_logic.h, drives PIN_DEADMAN_CUT and publishes
@@ -30,14 +31,13 @@
 #include <string.h>
 
 #include "ble_addr.h"
-#include "bms_ble.h"
+#include "ble_scan.h"
 #include "deadman_logic.h"
 
 static const char *TAG = "dm";
 
-// bmsTask touches hb_bms every loop (100 ms); allow a few missed ones before calling the
-// radio unhealthy. Shorter than HB_MAX_BMS_MS on purpose: the dead-man wants to know the
-// scan stopped long before the supervisor would consider rebooting for it.
+// The ble task touches hb_ble every loop (100 ms); allow a few missed ones before calling the
+// radio unhealthy. The supervisor never reboots for that task, so this is the only check on it.
 static constexpr uint32_t BLE_HB_MAX_MS = 1000;
 
 static_assert(DEADMAN_TICK_MS >= 5 && DEADMAN_TICK_MS <= 100, "DEADMAN_TICK_MS must be 5..100");
@@ -54,6 +54,9 @@ static_assert(DEADMAN_TIMEOUT_MS >= 1000 && DEADMAN_TIMEOUT_MS <= 60000, "DEADMA
 // ---------------------------------------------------------------- host-task -> task
 // Single writer (the NimBLE host task), single reader (deadmanTask). Plain volatiles:
 // nothing outside deadmanTask derives state from them, and a one-tick-late read is fine.
+// On the dual-core S3 the writer runs on TASK_CORE_RADIO and the reader on TASK_CORE_APP:
+// each value is 32 bits or narrower (one store), and Xtensa GCC brackets volatile accesses
+// with memw, so a read sees either the old or the new value, never a torn one.
 static volatile uint32_t s_beacon_t_ms[DEADMAN_TAGS] = {0};
 static volatile uint32_t s_beacon_reports[DEADMAN_TAGS] = {0};
 static volatile int8_t s_beacon_rssi[DEADMAN_TAGS] = {0};
@@ -107,10 +110,10 @@ static uint8_t s_vesc_status;  // cached one tick, so the loop takes the mutex o
 static bool s_poll_fresh;
 
 // The watchdog is only meaningful while the radio is actually scanning for the tag.
-// hb_bms covers "the BLE task is alive"; bms_ble_scanning() covers "a scan is running".
+// hb_ble covers "the ble task is alive"; ble_scan_active() covers "a scan is running".
 static bool ble_healthy(uint32_t now) {
-  if (!bms_ble_scanning()) return false;
-  const uint32_t hb = hb_bms;
+  if (!ble_scan_active()) return false;
+  const uint32_t hb = hb_ble;
   if (hb == 0) return false;  // the BLE task has never run
   return (int32_t)(now - hb) <= (int32_t)BLE_HB_MAX_MS;
 }
@@ -131,7 +134,7 @@ static void publish_and_sample(uint32_t now) {
     s_pub.tags[i].configured = s_tag_cfg[i];
     s_pub.tags[i].enrolled = s_calc.tag[i].enrolled;
     // The published aggregate is the WORST enrolled tag's own gap, never the union's:
-    // that is the conservative number README section 5b tells you to size the timeout from.
+    // that is the conservative number README section 5 tells you to size the timeout from.
     if (s_calc.tag[i].enrolled && s_calc.tag[i].gap_max_ms > s_pub.gap_max_ms)
       s_pub.gap_max_ms = s_calc.tag[i].gap_max_ms;
   }
@@ -234,7 +237,8 @@ bool deadman_start() {
 
   if (s_disabled) cut_write(true);
 
-  if (xTaskCreate(deadman_task, "deadman", DEADMAN_TASK_STACK, nullptr, TASK_PRIO_DEADMAN, nullptr) != pdPASS) {
+  if (xTaskCreatePinnedToCore(deadman_task, "deadman", DEADMAN_TASK_STACK, nullptr, TASK_PRIO_DEADMAN, nullptr,
+                              TASK_CORE_APP) != pdPASS) {
     ESP_LOGE(TAG, "task create failed: asserting the cut permanently");
     cut_write(true);
     return false;

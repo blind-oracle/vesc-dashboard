@@ -344,7 +344,8 @@ bool can_vesc_start() {
   vesc_uart_rx_reset(&s_rx);
   const bool ok = uart_install();
   s_last_install_try_ms = now_nonzero();
-  if (xTaskCreate(vescUartTask, "vescUart", CAN_TASK_STACK, nullptr, TASK_PRIO_CAN, nullptr) != pdPASS) {
+  if (xTaskCreatePinnedToCore(vescUartTask, "vescUart", CAN_TASK_STACK, nullptr, TASK_PRIO_CAN, nullptr,
+                              TASK_CORE_APP) != pdPASS) {
     ESP_LOGE(TAG, "VESC: xTaskCreate(vescUartTask) failed");
     return false;
   }

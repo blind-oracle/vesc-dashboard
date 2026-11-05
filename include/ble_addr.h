@@ -1,7 +1,7 @@
 // BLE address text <-> bytes, in NimBLE's byte order. Pure and framework-free
-// (<stdint.h>/<stdbool.h> + <stdio.h>), so both src/bms_ble.cpp (the BMS peer) and
-// src/deadman.cpp (the beacon tag) use it and the native tests can cover the parser's
-// edge cases without the NimBLE headers.
+// (<stdint.h>/<stdbool.h> + <stdio.h>), so both src/ble_scan.cpp (matching adverts) and
+// src/deadman.cpp (validating the tag addresses) use it and the native tests can cover
+// the parser's edge cases without the NimBLE headers.
 //
 // Printed order is the human one, "aa:bb:cc:dd:ee:ff", most significant octet first.
 // NimBLE stores the reverse: val[0] is the LAST printed octet. Every conversion here

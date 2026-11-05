@@ -765,7 +765,8 @@ bool gnss_start() {
   ESP_LOGW(TAG, "GNSS: GNSS_RATE_MS %u (> 5 Hz) is not guaranteed on a stock NEO-M8N / NEO-6 / default MAX-M10S", (unsigned)GNSS_RATE_MS);
 #endif
 
-  const BaseType_t ok = xTaskCreate(gnss_task, "gnss", GNSS_TASK_STACK, nullptr, TASK_PRIO_GNSS, nullptr);
+  const BaseType_t ok = xTaskCreatePinnedToCore(gnss_task, "gnss", GNSS_TASK_STACK, nullptr, TASK_PRIO_GNSS, nullptr,
+                                                TASK_CORE_APP);
   if (ok != pdPASS) {
     ESP_LOGE(TAG, "GNSS: xTaskCreate failed (%ld)", (long)ok);
     return false;

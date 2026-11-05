@@ -1,7 +1,7 @@
 // Dead-man's switch: the pure decision logic (no FreeRTOS, no IDF, no I/O).
 //
-// Up to DEADMAN_TAGS BLE tags worn by the crew are watched by the radio the BMS client
-// owns (src/bms_ble.cpp timestamps every matching advert). This header turns those
+// Up to DEADMAN_TAGS BLE tags worn by the crew are watched by the board's radio
+// (src/ble_scan.cpp timestamps every matching advert). This header turns those
 // timestamps into one boolean - "assert the cut" - and the state the screens and the log
 // show. The FreeRTOS task that samples it, drives PIN_DEADMAN_CUT and publishes
 // g_state.deadman lives in src/deadman.cpp.
@@ -141,7 +141,7 @@ inline uint32_t deadman_age(const DeadmanCalc &c, const DeadmanInputs &in, uint3
 }
 
 // The same aggregate over the PUBLISHED state, for consumers outside the task (the screens,
-// the log and the BMS radio gate). Kept next to deadman_age() so the two cannot drift.
+// the log). Kept next to deadman_age() so the two cannot drift.
 inline uint32_t deadman_pub_age(const DeadmanState &d, uint32_t now) {
   uint32_t best = 0xFFFFFFFFu;
   for (unsigned i = 0; i < DEADMAN_TAGS; ++i) {
@@ -290,42 +290,6 @@ inline void deadman_update(DeadmanCalc &c, const DeadmanInputs &in, uint32_t now
 #endif
 
   if (c.state != was) c.state_since_ms = now ? now : 1u;
-}
-
-// ---------------------------------------------------------------- BMS radio gate
-// A BLE connect attempt blinds the beacon watchdog for the whole attempt (NimBLE keeps one
-// master context: ble_gap_connect() and ble_gap_disc() exclude each other). So the BMS may
-// only start one when the motor cannot be running, and when the freshest enrolled tag has
-// enough margin that the blind window cannot itself cause a trip.
-//
-// "Standstill" means no source that is currently reporting says we are moving: a stale VESC
-// or a stale GNSS must not by itself forbid the link, but a fresh one that says "moving"
-// must. Always allowed while TRIPPED or FAULT - the motor is already cut, so reading the
-// BMS then is harmless and useful.
-//
-// Reads the PUBLISHED state (g_state.deadman), not the task's own DeadmanCalc, so
-// src/bms_ble.cpp can call it without reaching into another module's internals. The copy is
-// at most DEADMAN_TICK_MS old, which is nothing against a multi-second margin.
-inline bool deadman_connect_allowed(const SharedState &s, uint32_t now, uint32_t connect_window_ms) {
-  const uint8_t st = s.deadman.state;
-  if (st == DM_TRIPPED || st == DM_FAULT) return true;
-  if (st != DM_ARMED) return false;  // never open a blind window from GRACE: the margin is already shrinking
-
-  const uint32_t age = deadman_pub_age(s.deadman, now);
-  if (age >= (uint32_t)DEADMAN_TIMEOUT_MS) return false;               // includes "nothing enrolled" (UINT32_MAX)
-  if ((uint32_t)DEADMAN_TIMEOUT_MS - age <= connect_window_ms) return false;  // the window would eat the margin
-
-#if DEADMAN_STANDSTILL_ERPM >= 0
-  if (vesc_fresh(&s.vesc.t, VESC_IDX_STATUS_1, now, VESC_STALE_R1_MS)) {
-    const float erpm = s.vesc.t.erpm < 0 ? -s.vesc.t.erpm : s.vesc.t.erpm;
-    if (erpm > (float)DEADMAN_STANDSTILL_ERPM) return false;
-  }
-#endif
-  if (fresh(s.gnss.last_pvt_ms, now, GNSS_STALE_MS) && s.gnss.fix_ok) {
-    const int32_t sp = s.gnss.gspeed_mm_s < 0 ? -s.gnss.gspeed_mm_s : s.gnss.gspeed_mm_s;
-    if (sp > (int32_t)DEADMAN_STANDSTILL_MM_S) return false;
-  }
-  return true;
 }
 
 // ---------------------------------------------------------------- names (log + screens)

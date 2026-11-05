@@ -11,7 +11,7 @@ SharedState g_state{};
 volatile uint32_t hb_can = 0;
 volatile uint32_t hb_gnss = 0;
 volatile uint32_t hb_disp = 0;
-volatile uint32_t hb_bms = 0;
+volatile uint32_t hb_ble = 0;
 #if DEADMAN_ENABLE
 volatile uint32_t hb_deadman = 0;
 #endif

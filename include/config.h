@@ -30,7 +30,8 @@
 // 1 = Waveshare ESP32-S3-Zero (env s3zero_deadman_uart, README section 2b). Same GPIO numbers
 //     as the FireBeetle wherever the module has them: the block below only moves the OLED
 //     (there is no GPIO22/23) and the status LED (the on-board WS2812), and puts the UART
-//     VESC link on UART2. Its pins are #ifndef too, so -D overrides still win.
+//     VESC link on UART2; it also runs both cores (TASK_CORE_*). Its pins are #ifndef too, so
+//     -D overrides still win.
 #ifndef BOARD_S3_ZERO
 #define BOARD_S3_ZERO 0
 #endif
@@ -68,6 +69,12 @@
 #ifndef VESC_UART_PORT
 #define VESC_UART_PORT 2 // UART2: UART0 and its TX/RX pads (43/44, where the ROM prints its boot log) stay untouched
 #endif
+// Two cores (sdkconfig.defaults.esp32s3). Core 0 runs the radio: the BLE controller, the NimBLE
+// host and the ble task. Core 1 runs app_main and every other task of this firmware, so the
+// interrupts they install land there too. The firmware's own tasks therefore share one core with
+// exactly the priorities they have on the single-core C6; only the radio moved away.
+#define TASK_CORE_APP 1
+#define TASK_CORE_RADIO 0
 #else
 // DFRobot FireBeetle 2 ESP32-C6: the pins to leave alone are in the header comment above.
 #define BOARD_NAME "DFRobot FireBeetle 2 ESP32-C6"
@@ -80,6 +87,8 @@
 #ifndef VESC_UART_PORT
 #define VESC_UART_PORT 0 // UART0: UART1 is the GNSS and the C6 has no UART2
 #endif
+#define TASK_CORE_APP 0   // single core: everything on core 0
+#define TASK_CORE_RADIO 0
 #endif
 
 // ============================================================================
@@ -251,62 +260,9 @@
 #endif
 
 // ============================================================================
-// BMS over BLE (JK BMS, NimBLE central; src/bms_ble.cpp, include/jk_bms.h)
-// ============================================================================
-// Reads a Jikong (JK) BMS over Bluetooth LE: service 0xFFE0 / characteristic 0xFFE1,
-// commands 0x97 (device info) and 0x96 (cell info stream). Only built in the 'bms'
-// environment (sdkconfig.defaults.bms enables the NimBLE host). A JK BMS accepts ONE
-// BLE central: the phone app cannot be connected at the same time.
-#ifndef BMS_BLE_ENABLE
-#define BMS_BLE_ENABLE 0 // 1 = build the NimBLE client + bmsTask (needs 'pio run -e bms'); 0 = no BLE code at all
-#endif
-#ifndef BMS_BLE_ADDR
-#define BMS_BLE_ADDR "C8:47:8C:EE:D1:37" // BMS Bluetooth MAC "C8:47:8C:12:34:56" = connect by address (passive scan); "" = match by name prefix / 0xFFE0 (active scan)
-#endif
-#ifndef BMS_BLE_NAME_PREFIX
-#define BMS_BLE_NAME_PREFIX "JK" // advertised name prefix ("JK-..." / "JK_..."); the name is user-editable in the JK app
-#endif
-#ifndef BMS_PROTOCOL
-#define BMS_PROTOCOL 0 // 0 = auto (device-info sw >= 11 or JK-PB -> 32S layout, else 24S; confirmed by a cell-sum check), 1 = force JK02_24S, 2 = force JK02_32S
-#endif
-#ifndef BMS_CELLS_MAX
-#define BMS_CELLS_MAX 24 // 1..32 cells kept in the shared state and shown on ceil(n/12) CELLS pages
-#endif
-#ifndef BMS_CURRENT_SIGN
-#define BMS_CURRENT_SIGN 1 // 1 = discharge-positive on screen (same sign as the BA/PW cells); 0 = JK app convention (charge-positive)
-#endif
-#ifndef BMS_STALE_MS
-#define BMS_STALE_MS 10000 // no decoded cell-info frame for this long -> every BMS value shows "--" (frames arrive every ~0.5 s)
-#endif
-#ifndef BMS_LINK_ON_DEMAND
-#if PIN_BUTTON >= 0
-#define BMS_LINK_ON_DEMAND 1 // 1 = scan/connect/poll ONLY while a BMS screen (BMS or CELLS) is shown and drop the link as soon
-                             // as another screen is selected (the BMS log line then only has data while such a screen is up);
-                             // 0 = hold the link from boot on, whatever is on screen (the behaviour before this option)
-#else
-#define BMS_LINK_ON_DEMAND 0 // PIN_BUTTON -1: no screen can ever be selected, so an on-demand link would never come up at all
-#endif
-#endif
-#ifndef BMS_RECONNECT_MS
-#define BMS_RECONNECT_MS 2000 // first back-off after a disconnect / failed connect ...
-#endif
-#ifndef BMS_RECONNECT_MAX_MS
-#define BMS_RECONNECT_MAX_MS 30000 // ... doubling up to this
-#endif
-#ifndef BMS_RECONNECT_FAILS
-#define BMS_RECONNECT_FAILS 3 // direct reconnects to the last known address before falling back to scanning
-#endif
-#ifndef HB_MAX_BMS_MS
-#define HB_MAX_BMS_MS 0 // 0 = never gate the task watchdog on the BMS task (its heartbeat age is only logged); > 0 = gate like the other tasks
-#endif
-#ifndef LOG_BMS_MS
-#define LOG_BMS_MS 5000 // period of the BMS log line (0 = off)
-#endif
-
-// ============================================================================
 // Dead-man's switch (BLE beacon -> the VESC's own kill-switch input; src/deadman.cpp)
 // ============================================================================
-// A BLE tag worn by the helmsman is watched by the same radio the BMS uses. When its
+// A BLE tag worn by the helmsman is watched by the board's own radio (src/ble_scan.cpp). When its
 // advertisements stop arriving for DEADMAN_TIMEOUT_MS the firmware pulls PIN_DEADMAN_CUT
 // low, which is wired IN PARALLEL with the boat's mechanical kill switch on the VESC's
 // ADC2 input (VESC Tool -> App Settings -> General -> Kill Switch Mode = ADC2 Low).
@@ -318,7 +274,7 @@
 // the state back as VESC_STATUS_KILL_SW, which this firmware already polls and displays,
 // so the cut is verified end to end (DEADMAN_CONFIRM_*). Nothing is sent over CAN.
 #ifndef DEADMAN_ENABLE
-#define DEADMAN_ENABLE 0 // 1 = build the BLE-beacon dead-man's switch (needs BMS_BLE_ENABLE for the radio)
+#define DEADMAN_ENABLE 0 // 1 = build the BLE-beacon dead-man's switch and the NimBLE scan it runs on (needs sdkconfig.defaults.ble, env 'deadman'); 0 = no BLE code at all
 #endif
 #ifndef PIN_DEADMAN_CUT
 #define PIN_DEADMAN_CUT 1 // open-drain output wired in PARALLEL with the mechanical kill switch on VESC ADC2.
@@ -373,12 +329,6 @@
 #endif
 #ifndef DEADMAN_CONFIRM_MS
 #define DEADMAN_CONFIRM_MS 3500 // ... within this long, else state FAULT (wiring, series resistor, or the VESC lost its ADC2 kill-switch config)
-#endif
-#ifndef DEADMAN_STANDSTILL_ERPM
-#define DEADMAN_STANDSTILL_ERPM 300 // the BMS may only connect below this |erpm| (a BLE connect blinds the watchdog); -1 = skip the erpm test (freewheeling prop under sail)
-#endif
-#ifndef DEADMAN_STANDSTILL_MM_S
-#define DEADMAN_STANDSTILL_MM_S 1000 // ... and below this GNSS ground speed (~2 kn)
 #endif
 
 // ============================================================================
@@ -631,59 +581,19 @@
 #ifndef DEADMAN_SCAN_WINDOW_MS
 #define DEADMAN_SCAN_WINDOW_MS 100 // ... and window. Equal = continuous: below ~80 % duty a 300 ms tag is missed too often
 #endif
-#ifndef DEADMAN_BMS_CONNECT_MS
-#define DEADMAN_BMS_CONNECT_MS 2500 // ble_gap_connect() duration while the dead-man is built: this IS the watchdog's
-                                    // blind window (NimBLE cannot scan and initiate at once), so it must fit the margin
-#endif
-#ifndef DEADMAN_CONNECT_RETRY_MS
-#define DEADMAN_CONNECT_RETRY_MS 1000 // a BMS connect the dead-man refused (moving, or too little margin) is retried
-                                      // at this fixed interval: "not now" must not escalate the doubling back-off
-#endif
 #ifndef HB_MAX_DEADMAN_MS
-#define HB_MAX_DEADMAN_MS 1000 // supervisor: a deadman heartbeat older than this stops the WDT feed -> reboot. Unlike
-                               // HB_MAX_BMS_MS this is never 0: the task is safety-relevant and a stall must be caught
+#define HB_MAX_DEADMAN_MS 1000 // supervisor: a deadman heartbeat older than this stops the WDT feed -> reboot. Never 0:
+                               // the task is safety-relevant and a stall must be caught
 #endif
 #ifndef LOG_DEADMAN_MS
 #define LOG_DEADMAN_MS 5000 // period of the DM log line (0 = off)
 #endif
-#ifndef BMS_TASK_PRIO
-#define BMS_TASK_PRIO 4 // bmsTask: between tripTask (3) and gnssTask (5); the NimBLE host/controller tasks run at 21/23 regardless
+#ifndef TASK_PRIO_BLE
+#define TASK_PRIO_BLE 4 // ble task (src/ble_scan.cpp, dead-man builds): keeps the watchdog scan up. Between tripTask (3) and
+                        // gnssTask (5); the NimBLE host / controller tasks run at 21 / 23 regardless (on TASK_CORE_RADIO)
 #endif
-#ifndef BMS_TASK_STACK
-#define BMS_TASK_STACK 4096 // bytes
-#endif
-#ifndef BMS_CONNECT_TIMEOUT_MS
-#define BMS_CONNECT_TIMEOUT_MS 10000 // ble_gap_connect() duration; a peer that does not answer (phone app connected) costs this per attempt
-#endif
-#ifndef BMS_SETUP_TIMEOUT_MS
-#define BMS_SETUP_TIMEOUT_MS 8000 // MTU exchange + service/characteristic/descriptor discovery + CCCD write must finish within this
-#endif
-#ifndef BMS_FIRST_FRAME_TIMEOUT_MS
-#define BMS_FIRST_FRAME_TIMEOUT_MS 15000 // first CRC-valid, plausible cell-info frame after subscribing, else terminate + back-off
-#endif
-#ifndef BMS_POLL_MS
-#define BMS_POLL_MS 5000 // 0x96 re-send period until the unsolicited cell-info stream starts
-#endif
-#ifndef BMS_SCAN_FAST_MS
-#define BMS_SCAN_FAST_MS 30000 // fast scan preset duration after boot / after a disconnect ...
-#endif
-#ifndef BMS_SCAN_FAST_ITVL_MS
-#define BMS_SCAN_FAST_ITVL_MS 60 // ... interval / window of the fast preset (~50 % RX duty)
-#endif
-#ifndef BMS_SCAN_FAST_WINDOW_MS
-#define BMS_SCAN_FAST_WINDOW_MS 30
-#endif
-#ifndef BMS_SCAN_SLOW_ITVL_MS
-#define BMS_SCAN_SLOW_ITVL_MS 1000 // slow preset while the BMS is absent (~3 % RX duty)
-#endif
-#ifndef BMS_SCAN_SLOW_WINDOW_MS
-#define BMS_SCAN_SLOW_WINDOW_MS 30
-#endif
-#ifndef BMS_MSG_BUF_BYTES
-#define BMS_MSG_BUF_BYTES 2048 // NimBLE host -> bmsTask message buffer (a 300-byte frame arrives as 2..15 notifications)
-#endif
-#ifndef BMS_APP_HINT_S
-#define BMS_APP_HINT_S 60 // after this long without a link the BMS screen adds the "app open?" hint
+#ifndef BLE_TASK_STACK
+#define BLE_TASK_STACK 4096 // bytes
 #endif
 
 // ============================================================================
@@ -705,15 +615,12 @@
 #define EFF_DIST_UNIT_STR "km"
 #define EFF_UNIT_STR "Wh/km"
 #endif
-// BMS: the shared state / screens exist when the BLE client is built or in the display demo; CELLS pages hold 12 cells each.
-#define BMS_UI_ENABLE (BMS_BLE_ENABLE || DISPLAY_DEMO)
 // Dead-man's switch: the state struct and its screen exist when the feature is built or in the demo.
 #define DEADMAN_UI_ENABLE (DEADMAN_ENABLE || DISPLAY_DEMO)
 // Tag slots. Fixed at 2 so there is ONE code path: an empty or unparsable DEADMAN_BEACON_ADDR2
 // leaves slot 2 inert (ble_addr_parse zeroes its output, and an all-zero address never matches a
 // real advert), so a single-tag boat behaves exactly as it did before the slot existed.
 #define DEADMAN_TAGS 2
-#define BMS_CELL_PAGES ((BMS_CELLS_MAX + 11) / 12)
 
 // ============================================================================
 // Compile-time sanity checks
@@ -749,18 +656,6 @@
 #error "CAN_OWN_ID must differ from VESC_CAN_ID"
 #endif
 
-#if BMS_CELLS_MAX < 1 || BMS_CELLS_MAX > 32
-#error "BMS_CELLS_MAX must be 1..32"
-#endif
-#if BMS_PROTOCOL < 0 || BMS_PROTOCOL > 2
-#error "BMS_PROTOCOL must be 0 (auto), 1 (JK02_24S) or 2 (JK02_32S)"
-#endif
-#if BMS_BLE_ENABLE && BMS_LINK_ON_DEMAND && PIN_BUTTON < 0
-#error "BMS_LINK_ON_DEMAND 1 needs a button: with PIN_BUTTON -1 no BMS screen can be selected, so the link would never come up (use -DBMS_LINK_ON_DEMAND=0)"
-#endif
-#if DEADMAN_ENABLE && !BMS_BLE_ENABLE
-#error "DEADMAN_ENABLE needs the NimBLE radio that the BMS client brings in: build the 'bms' env (-DBMS_BLE_ENABLE=1)"
-#endif
 #if DEADMAN_ENABLE && PIN_BUTTON < 0
 #error "DEADMAN_ENABLE needs a button: a tripped dead-man's switch latches and can only be cleared by hand (-DPIN_BUTTON=BOARD_BOOT_BUTTON uses the BOOT button)"
 #endif
@@ -780,7 +675,7 @@
 #error "DEADMAN_ARM_RSSI is a dBm value in -110..0"
 #endif
 #if DEADMAN_ENABLE && TASK_PRIO_DEADMAN <= TASK_PRIO_CAN
-#error "TASK_PRIO_DEADMAN must stay ABOVE TASK_PRIO_CAN: the cut must never wait behind a CAN burst. This is the deliberate exception to the rule that BMS_TASK_PRIO follows - do not 'fix' it"
+#error "TASK_PRIO_DEADMAN must stay ABOVE TASK_PRIO_CAN: the cut must never wait behind a CAN burst. This is the deliberate exception to the rule that TASK_PRIO_BLE follows - do not 'fix' it"
 #endif
 #if DEADMAN_ENABLE && BOARD_CUT_PIN_FORBIDDEN(PIN_DEADMAN_CUT)
 #error "PIN_DEADMAN_CUT must not be a strapping pin of this board (FireBeetle C6: 8/9 and the LED/JTAG pin 15; S3-Zero: 0/3/45/46): a glitch low at reset would be a spurious engine cut"
@@ -791,17 +686,11 @@
 #if DEADMAN_ENABLE && (DEADMAN_SCAN_WINDOW_MS * 10 < DEADMAN_SCAN_ITVL_MS * 8)
 #error "the watchdog scan duty cycle must be >= 80 %: below that a 300 ms beacon is missed too often to trust the timeout"
 #endif
-#if DEADMAN_ENABLE && (DEADMAN_BMS_CONNECT_MS >= DEADMAN_TIMEOUT_MS)
-#error "DEADMAN_BMS_CONNECT_MS is the watchdog's blind window (NimBLE cannot scan and initiate at once): it must be shorter than DEADMAN_TIMEOUT_MS"
-#endif
 #if DEADMAN_ENABLE && HB_MAX_DEADMAN_MS == 0
 #error "HB_MAX_DEADMAN_MS must be > 0: the dead-man task is safety-relevant, so a stall has to reboot the board"
 #endif
-#if BMS_BLE_ENABLE && BMS_TASK_PRIO >= TASK_PRIO_GNSS
-#error "BMS_TASK_PRIO must stay below the data producers (TASK_PRIO_GNSS / TASK_PRIO_CAN)"
-#endif
-#if BMS_SCAN_FAST_WINDOW_MS > BMS_SCAN_FAST_ITVL_MS || BMS_SCAN_SLOW_WINDOW_MS > BMS_SCAN_SLOW_ITVL_MS
-#error "BLE scan window must not exceed the scan interval"
+#if DEADMAN_ENABLE && TASK_PRIO_BLE >= TASK_PRIO_GNSS
+#error "TASK_PRIO_BLE must stay below the data producers (TASK_PRIO_GNSS / TASK_PRIO_CAN)"
 #endif
 
 #ifndef UNIT_TEST // native host tests only; every firmware build must pass this check
@@ -815,8 +704,15 @@
 #if VESC_LINK_UART && defined(CONFIG_ESP_CONSOLE_UART) && CONFIG_ESP_CONSOLE_UART_NUM == VESC_UART_PORT
 #error "VESC_LINK_UART drives VESC_UART_PORT, which must not be the console: keep CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG (sdkconfig.defaults)"
 #endif
-#if BMS_BLE_ENABLE && !defined(CONFIG_BT_NIMBLE_ENABLED)
-#error "BMS_BLE_ENABLE needs the NimBLE host: build the 'bms' env (sdkconfig.defaults.bms), see platformio.ini"
+#if DEADMAN_ENABLE && !defined(CONFIG_BT_NIMBLE_ENABLED)
+#error "DEADMAN_ENABLE needs the NimBLE host: build an env with sdkconfig.defaults.ble (env 'deadman'), see platformio.ini"
+#endif
+#if BOARD_S3_ZERO && (defined(CONFIG_FREERTOS_UNICORE) || CONFIG_ESP_MAIN_TASK_AFFINITY != TASK_CORE_APP)
+#error "The S3-Zero runs dual-core with app_main on TASK_CORE_APP: sdkconfig.defaults.esp32s3 sets that (delete the stale sdkconfig.<env>)"
+#endif
+#if BOARD_S3_ZERO && defined(CONFIG_BT_NIMBLE_ENABLED) && \
+    (CONFIG_BT_NIMBLE_PINNED_TO_CORE != TASK_CORE_RADIO || CONFIG_BT_CTRL_PINNED_TO_CORE != TASK_CORE_RADIO)
+#error "The BLE controller and the NimBLE host must run on TASK_CORE_RADIO (sdkconfig.defaults.esp32s3)"
 #endif
 #endif
 

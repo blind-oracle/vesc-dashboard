@@ -137,7 +137,9 @@ static uint32_t s_warn_log_ms = 0;
 
 // Counters written in the TWAI ISR callbacks and read by canTask. Monotonic 32-bit
 // values: the task keeps the value it processed last and acts on the difference.
-// Single core, aligned 32-bit stores are atomic on RV32, so no lock is needed.
+// The ISR and canTask share one core (TASK_CORE_APP: the node is created from app_main or
+// canTask, both there) and aligned 32-bit stores are atomic on RV32 and Xtensa alike, so no
+// lock is needed.
 struct IsrCounters {
   uint32_t rx_dropped;   // on_rx_done: our queue was full, frame lost
   uint32_t bus_off;      // on_state_change -> TWAI_ERROR_BUS_OFF
@@ -918,7 +920,8 @@ bool can_vesc_start() {
   }
   const bool ok = can_install();
   s_last_install_try_ms = now_nonzero();
-  if (xTaskCreate(canTask, "canTask", CAN_TASK_STACK, nullptr, TASK_PRIO_CAN, nullptr) != pdPASS) {
+  if (xTaskCreatePinnedToCore(canTask, "canTask", CAN_TASK_STACK, nullptr, TASK_PRIO_CAN, nullptr,
+                              TASK_CORE_APP) != pdPASS) {
     ESP_LOGE(TAG, "CAN: xTaskCreate(canTask) failed");
     return false;
   }

@@ -26,8 +26,8 @@ bool deadman_start();
 
 // Called from the NimBLE host task for every advert that matches tag slot `tag`
 // (0 = DEADMAN_BEACON_ADDR, 1 = DEADMAN_BEACON_ADDR2). Three volatile stores: no lock, no
-// log, no allocation. Deliberately NOT routed through the BMS message buffer, so the safety
-// timestamp never depends on bmsTask draining a buffer BMS notifications can fill.
+// log, no allocation. Deliberately not routed through the ble task, so the safety
+// timestamp never waits for another task to run.
 void deadman_beacon_seen(uint8_t tag, int8_t rssi, uint32_t now_ms);
 // Called from the same place for every advert that does not match (crowded-marina counter).
 void deadman_adv_other();

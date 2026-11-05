@@ -70,7 +70,8 @@ void fmt_eff(char *buf, size_t n, float eff, bool valid) {
 
 bool trip_start() {
   if (s_started) return true;
-  if (xTaskCreate(trip_task, "trip", TRIP_TASK_STACK, nullptr, TASK_PRIO_TRIP, nullptr) != pdPASS) {
+  if (xTaskCreatePinnedToCore(trip_task, "trip", TRIP_TASK_STACK, nullptr, TASK_PRIO_TRIP, nullptr,
+                              TASK_CORE_APP) != pdPASS) {
     ESP_LOGE(TAG, "trip: xTaskCreate failed");
     return false;
   }

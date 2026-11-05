@@ -1,7 +1,7 @@
 // Native Unity tests (pio test -e native) for the pure dead-man's switch logic in
 // include/deadman_logic.h: arming (burst + RSSI gate), the timeout boundary, the
 // latch and its reset rule, the "no radio" state that must never cut, the closed
-// loop against the VESC kill-switch status bit, the BMS radio gate, and millis()
+// loop against the VESC kill-switch status bit, the published tag age, and millis()
 // wrap-around.
 // Compiles with: -std=c++17 -DUNIT_TEST -Iinclude -DDEADMAN_ENABLE=1 ; Arduino-free.
 //
@@ -344,59 +344,30 @@ static void test_never_seen_tag_is_not_a_fresh_tag() {
   TEST_ASSERT_EQUAL_UINT32(0xFFFFFFFFu, deadman_tag_age(s.in, DEADMAN_TAGS, s.now));
 }
 
-// ---------------------------------------------------------------- BMS radio gate
-static void test_connect_gate() {
+// ---------------------------------------------------------------- published age
+// deadman_pub_age() is what the screens and the log show: the age of the tag that is actually
+// keeping the motor alive (the freshest ENROLLED one), never the stalest one.
+static void test_pub_age_uses_the_freshest_enrolled_tag() {
   const uint32_t now = T0;
-  const uint32_t win = 2500;
-  SharedState st;
-  memset(&st, 0, sizeof st);
-  st.deadman.state = DM_ARMED;
-  st.deadman.enrolled_count = 1;
-  st.deadman.tags[0].configured = true;
-  st.deadman.tags[0].enrolled = true;
-  st.deadman.tags[0].t_ms = now;
-
-  // Armed, tag fresh, nothing reporting movement -> allowed.
-  TEST_ASSERT_TRUE(deadman_connect_allowed(st, now, win));
-
-  // A fresh VESC reporting erpm above the threshold forbids it.
-  st.vesc.t.erpm = (float)DEADMAN_STANDSTILL_ERPM + 1.0f;
-  st.vesc.t.t_ms[VESC_IDX_STATUS_1] = now;
-#if DEADMAN_STANDSTILL_ERPM >= 0
-  TEST_ASSERT_FALSE(deadman_connect_allowed(st, now, win));
-#endif
-  // A STALE VESC must not by itself forbid it: absence of evidence is not evidence of motion.
-  st.vesc.t.t_ms[VESC_IDX_STATUS_1] = now - VESC_STALE_R1_MS - 1;
-  TEST_ASSERT_TRUE(deadman_connect_allowed(st, now, win));
-
-  // A fresh GNSS fix above the speed threshold forbids it.
-  st.gnss.last_pvt_ms = now;
-  st.gnss.fix_ok = true;
-  st.gnss.gspeed_mm_s = DEADMAN_STANDSTILL_MM_S + 1;
-  TEST_ASSERT_FALSE(deadman_connect_allowed(st, now, win));
-  st.gnss.gspeed_mm_s = DEADMAN_STANDSTILL_MM_S;
-  TEST_ASSERT_TRUE(deadman_connect_allowed(st, now, win));
-
-  // Too little margin left before the timeout: the blind window would cause the trip.
-  st.deadman.tags[0].t_ms = now - (DEADMAN_TIMEOUT_MS - win);
-  TEST_ASSERT_FALSE(deadman_connect_allowed(st, now, win));
-
-  // GRACE never opens a window; TRIPPED and FAULT always may (the motor is already cut).
-  st.deadman.tags[0].t_ms = now;
-  st.deadman.state = DM_GRACE;
-  TEST_ASSERT_FALSE(deadman_connect_allowed(st, now, win));
-  st.deadman.state = DM_TRIPPED;
-  TEST_ASSERT_TRUE(deadman_connect_allowed(st, now, win));
-  st.deadman.state = DM_FAULT;
-  TEST_ASSERT_TRUE(deadman_connect_allowed(st, now, win));
-  st.deadman.state = DM_WAIT_TAG;
-  TEST_ASSERT_FALSE(deadman_connect_allowed(st, now, win));
-  st.deadman.state = DM_UNAVAILABLE;
-  TEST_ASSERT_FALSE(deadman_connect_allowed(st, now, win));
-  // A tag that was never seen must never open a window either.
-  st.deadman.state = DM_ARMED;
-  st.deadman.tags[0].t_ms = 0;
-  TEST_ASSERT_FALSE(deadman_connect_allowed(st, now, win));
+  DeadmanState d;
+  memset(&d, 0, sizeof d);
+  // Nothing enrolled (or never seen): "never", not 0.
+  TEST_ASSERT_EQUAL_UINT32(0xFFFFFFFFu, deadman_pub_age(d, now));
+  for (unsigned i = 0; i < 2; ++i) {
+    d.tags[i].configured = true;
+    d.tags[i].enrolled = true;
+  }
+  TEST_ASSERT_EQUAL_UINT32(0xFFFFFFFFu, deadman_pub_age(d, now));  // enrolled, but t_ms 0 = never seen
+  // Tag 1 nearly stale, tag 2 fresh: the age comes from tag 2.
+  d.tags[0].t_ms = now - (DEADMAN_TIMEOUT_MS - 100);
+  d.tags[1].t_ms = now - 40;
+  TEST_ASSERT_EQUAL_UINT32(40u, deadman_pub_age(d, now));
+  // A tag that is NOT enrolled must not lend its freshness.
+  d.tags[1].enrolled = false;
+  TEST_ASSERT_EQUAL_UINT32((uint32_t)DEADMAN_TIMEOUT_MS - 100u, deadman_pub_age(d, now));
+  // A stamp a hair newer than `now` (taken after the caller read the clock) is age 0, not ~49 days.
+  d.tags[0].t_ms = now + 1;
+  TEST_ASSERT_EQUAL_UINT32(0u, deadman_pub_age(d, now));
 }
 
 // ---------------------------------------------------------------- names
@@ -598,31 +569,6 @@ static void test_reset_accepted_with_either_tag() {
   TEST_ASSERT_EQUAL_UINT32(1, s.c.resets);
 }
 
-// The BMS radio gate measures its margin against the tag that is actually keeping the
-// motor alive, not against the stalest one.
-static void test_connect_gate_uses_the_freshest_tag() {
-  const uint32_t now = T0, win = 2500;
-  SharedState st;
-  memset(&st, 0, sizeof st);
-  st.deadman.state = DM_ARMED;
-  st.deadman.enrolled_count = 2;
-  for (unsigned i = 0; i < 2; ++i) {
-    st.deadman.tags[i].configured = true;
-    st.deadman.tags[i].enrolled = true;
-  }
-  // Tag 1 is nearly stale, tag 2 is fresh: the margin comes from tag 2, so this is allowed.
-  st.deadman.tags[0].t_ms = now - (DEADMAN_TIMEOUT_MS - 100);
-  st.deadman.tags[1].t_ms = now;
-  TEST_ASSERT_TRUE(deadman_connect_allowed(st, now, win));
-  // Both nearly stale: no margin for the blind window.
-  st.deadman.tags[1].t_ms = now - (DEADMAN_TIMEOUT_MS - 100);
-  TEST_ASSERT_FALSE(deadman_connect_allowed(st, now, win));
-  // A tag that is NOT enrolled must not lend its freshness.
-  st.deadman.tags[1].enrolled = false;
-  st.deadman.tags[1].t_ms = now;
-  TEST_ASSERT_FALSE(deadman_connect_allowed(st, now, win));
-}
-
 // Everything above, through the 32-bit millis() rollover.
 static void test_two_tags_across_the_wrap() {
   Sim s(2, 0xFFFFF000u);
@@ -660,7 +606,7 @@ int main(int, char **) {
   RUN_TEST(test_gap_max_tracks_the_worst_gap);
   RUN_TEST(test_wraparound_behaves_identically);
   RUN_TEST(test_never_seen_tag_is_not_a_fresh_tag);
-  RUN_TEST(test_connect_gate);
+  RUN_TEST(test_pub_age_uses_the_freshest_enrolled_tag);
   RUN_TEST(test_state_names);
   RUN_TEST(test_two_tags_cannot_share_an_arming_burst);
   RUN_TEST(test_weak_tag_is_not_armed_by_a_strong_one);
@@ -671,7 +617,6 @@ int main(int, char **) {
   RUN_TEST(test_second_tag_joins_inside_the_window);
   RUN_TEST(test_radio_outage_clears_the_enrolment_set);
   RUN_TEST(test_reset_accepted_with_either_tag);
-  RUN_TEST(test_connect_gate_uses_the_freshest_tag);
   RUN_TEST(test_two_tags_across_the_wrap);
   return UNITY_END();
 }

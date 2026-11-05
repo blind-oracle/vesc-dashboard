@@ -7,10 +7,6 @@
 // SCREEN_AUTO_RETURN_MS without a press when that timer is enabled (it is 0 = off by
 // default). PIN_BUTTON -1 compiles no button code at all.
 //
-// Every screen change also tells the BMS task whether BMS data is on the panel
-// (bms_set_active(oled_screen_needs_bms(screen))): with BMS_LINK_ON_DEMAND the BLE
-// client only holds the link to the BMS while the BMS or a CELLS screen is shown.
-//
 // Loop / refresh policy:
 //   * The task loop runs every OLED_BUTTON_POLL_MS (20 ms): it samples the
 //     button (time-based debounce, so the ~30 ms of a frame push does not matter)
@@ -64,7 +60,6 @@
 #include <math.h>
 #include <string.h>
 
-#include "bms_ble.h"
 #include "deadman.h"
 #include "display_strings_oled.h"
 #include "shared_state.h"
@@ -405,73 +400,6 @@ static SharedState demo_state(uint32_t now) {
   s.trip.energy_from_counters = true;
   s.trip.counter_resets = 0;
 
-#if BMS_UI_ENABLE
-  // JK BMS streaming: a 16S pack at ~3.348 V per cell (each cell wanders +-3 mV on
-  // its own slow phase), cell 9 always the lowest (~3.340 V) and cell 14 always the
-  // highest (~3.355 V) so the L/H marks and the lo/hi row have fixed targets; 12.4 A
-  // discharging (JK sign: negative -> "+12.4" on screen with BMS_CURRENT_SIGN 1), SOC
-  // falling 87 -> 80 % over the active 90 s of the cycle, a CELLUV alarm for 10 s per
-  // cycle (seconds 60..69) that replaces the balance current on the last row.
-  // Everything derives from the frozen time like the rest of the demo. Assumes
-  // BMS_CELLS_MAX >= 16 (the default 24); fewer cells are simply not stored.
-  {
-    BmsState &b = s.bms;
-    b.t_ms = stamp;
-    b.link = BMS_LINK_STREAM;
-    b.proto = BMS_PROTO_JK02_32S;
-    b.cell_count = 16;
-    const int stored = 16 < BMS_CELLS_MAX ? 16 : BMS_CELLS_MAX;
-    uint32_t sum = 0;
-    uint16_t mn = 0xFFFFu, mx = 0;
-    uint8_t mni = 0, mxi = 0;
-    for (int i = 0; i < stored; ++i) {
-      float mv = 3348.0f + 3.0f * sinf(t / 31.0f + (float)i * 0.7f);  // 3345..3351
-      if (i == 8) mv = 3340.0f + sinf(t / 41.0f);                     // cell 9: 3339..3341, always the lowest
-      if (i == 13) mv = 3355.0f + sinf(t / 37.0f);                    // cell 14: 3354..3356, always the highest
-      const uint16_t v = (uint16_t)lroundf(mv);
-      b.cell_mv[i] = v;
-      sum += v;
-      if (v < mn) {
-        mn = v;
-        mni = (uint8_t)(i + 1);
-      }
-      if (v > mx) {
-        mx = v;
-        mxi = (uint8_t)(i + 1);
-      }
-    }
-    b.cell_min_mv = mn;
-    b.cell_max_mv = mx;
-    b.cell_avg_mv = (uint16_t)(sum / (uint32_t)stored);
-    b.cell_delta_mv = (uint16_t)(mx - mn);
-    b.cell_min_idx = mni;
-    b.cell_max_idx = mxi;
-    b.pack_mv = sum;
-    b.current_ma = -12400 + (int32_t)(300.0f * sinf(t / 13.0f));  // -12.7..-12.1 A (JK sign: discharging)
-    b.power_mw = (int32_t)(((int64_t)b.pack_mv * (int64_t)b.current_ma) / 1000);
-    b.t1_d = 60;   // 0.1 degC units
-    b.t2_d = 61;
-    b.mos_d = 25;
-    b.soc_pct = (uint8_t)(87u - (tcyc * 7u) / 90u);  // 87 at the start of the cycle, 80 when the hold begins
-    b.soh_pct = 100;
-    b.remaining_mah = 269400;
-    b.nominal_mah = 310000;
-    b.cycle_count = 17;
-    b.balance_ma = 0;
-    b.balance_action = 0;
-    b.chg_mos_on = true;
-    b.dis_mos_on = true;
-    b.errors = (tcyc >= 60u && tcyc < 70u) ? (1u << 11) : 0u;  // CELLUV for 10 s per cycle
-    snprintf(b.model, sizeof b.model, "JK_PB2A16S20P");
-    snprintf(b.sw, sizeof b.sw, "14.20");
-    snprintf(b.addr, sizeof b.addr, "c8:47:8c:12:34:56");
-    b.rssi = -67;
-    b.mtu = 247;
-    b.link_since_ms = 1u;     // streaming since boot (0 would mean "never")
-    b.frames_ok = tsec * 2u;  // one frame per ~0.5 s
-    b.connects = 1;
-  }
-#endif
 
 #if DEADMAN_UI_ENABLE
   // Dead-man's switch: two tags aboard and enrolled, their RSSI wandering on slow
@@ -586,7 +514,6 @@ static void handle_idle(DispCtx &c, uint32_t now) {
   if (next == c.screen) return false;
   c.screen = next;
   c.st.screen = next;
-  bms_set_active(oled_screen_needs_bms(next));  // BMS_LINK_ON_DEMAND: connect / disconnect with the screen
   ESP_LOGI(TAG, "display: screen %u (%s), %s", (unsigned)next, oled_screen_name(next), why);
   return true;
 }
@@ -748,7 +675,6 @@ bool display_start() {
   DispCtx &c = s_ctx;
   c = DispCtx{};  // value-initialised (Button has default member initialisers, so no memset)
   c.screen = SCREEN_MAIN;
-  bms_set_active(oled_screen_needs_bms(c.screen));  // false: the BMS link stays down until a BMS screen is selected
 
 #if PIN_BUTTON >= 0
   gpio_config_t btn = {};
@@ -778,7 +704,8 @@ bool display_start() {
   publish_stats(c.st);
 
   // The task always runs: it retries the init and keeps hb_disp fresh either way.
-  if (xTaskCreate(display_task, "disp", OLED_TASK_STACK, nullptr, TASK_PRIO_DISP, nullptr) != pdPASS) {
+  if (xTaskCreatePinnedToCore(display_task, "disp", OLED_TASK_STACK, nullptr, TASK_PRIO_DISP, nullptr,
+                              TASK_CORE_APP) != pdPASS) {
     ESP_LOGE(TAG, "OLED: xTaskCreate failed");
     return false;
   }

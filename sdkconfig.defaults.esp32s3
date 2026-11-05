@@ -1,15 +1,18 @@
 # vesc-dashboard: ESP32-S3 additions (Waveshare ESP32-S3-Zero, env s3zero_deadman_uart). ESP-IDF
 # applies this file right after sdkconfig.defaults whenever the target is esp32s3, and after
-# every file in SDKCONFIG_DEFAULTS the matching "<file>.esp32s3" if one exists (the 'bms'
-# fragment needs none). The builder only re-runs CMake when sdkconfig.defaults or
-# sdkconfig.<env> changed: after editing this file run `touch sdkconfig.defaults`.
+# every file in SDKCONFIG_DEFAULTS the matching "<file>.esp32s3" if one exists (the 'ble'
+# fragment needs none). A value already in the generated sdkconfig.<env> wins over this file:
+# after editing it delete sdkconfig.s3zero_deadman_uart.
 #
-# Single core. The task model was designed and verified on the single-core C6: strict
-# priorities on one core (TASK_PRIO_DEADMAN above everything, every worker above the
-# supervisor), ISR counters and heartbeats read without locks. Running the S3 on one core keeps
-# those semantics identical; 160 MHz on one core is far more than this firmware needs.
-CONFIG_FREERTOS_UNICORE=y
+# Both cores, split by job (include/config.h checks every value below):
+#   core 0 (TASK_CORE_RADIO): the BLE controller, the NimBLE host and the ble task, plus
+#          ESP-IDF's own system tasks;
+#   core 1 (TASK_CORE_APP): app_main (the supervisor) and every other task of this firmware,
+#          so the UART / I2C / RMT / TWAI interrupts they install land there as well.
+# The firmware's own tasks therefore share one core with exactly the priorities they have on
+# the single-core C6 (TASK_PRIO_DEADMAN above everything, every worker above the supervisor);
+# what moved is the radio, whose tasks at priorities 21 / 23 no longer preempt them.
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1=y
+CONFIG_BT_CTRL_PINNED_TO_CORE_0=y
+CONFIG_BT_NIMBLE_PINNED_TO_CORE_0=y
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
-
-# sdkconfig.defaults.bms also sets CONFIG_BT_LE_CONTROLLER_TASK_STACK_SIZE, which belongs to
-# the C6's BLE controller; the S3 controller has no such symbol, so it is simply ignored here.
