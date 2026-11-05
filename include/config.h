@@ -280,9 +280,11 @@
 #define PIN_DEADMAN_CUT 1 // open-drain output wired in PARALLEL with the mechanical kill switch on VESC ADC2.
                           // High-Z = permit (the mechanical switch drives the line), driven low = kill.
                           // GPIO1, 8 and 18 are the free header pins; NEVER a strapping pin (8/9/15): a glitch
-                          // low at reset would be a spurious engine cut. Needs a series resistor Rs in the
-                          // switch's 3.3 V leg (Rs <= Rpd/2, so the permit level stays clear of the VESC's
-                          // hard 1.65 V threshold, which has no hysteresis). -1 = no pin (logic only, for soak tests).
+                          // low at reset would be a spurious engine cut. Wiring (README section 5), the VESC on
+                          // ADC2 Low either way: a switch CLOSED while running sits in the 3.3 V leg with a series
+                          // resistor Rs <= Rpd/2; one OPEN while running goes from ADC2 to GND with a pull-up
+                          // (1k..2.2k) to the VESC's 3V3. Both keep the permit level clear of the VESC's hard
+                          // 1.65 V threshold, which has no hysteresis. -1 = no pin (logic only, for soak tests).
 #endif
 // Up to two tags. Which of them actually guard the motor is decided ONCE, at the moment
 // protection begins: the first tag to arm opens a DEADMAN_ENROL_MS window, any other tag

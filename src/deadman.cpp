@@ -14,8 +14,10 @@
 // The pin is open drain and wired in PARALLEL with the boat's mechanical kill switch on
 // the VESC's ADC2 input, so this firmware can only ever ADD a kill: high-Z lets the
 // mechanical switch drive the line, low pulls it under the VESC's 1.65 V threshold. A
-// dead, hung or resetting dashboard therefore leaves the motor exactly as the mechanical
-// switch has it - the feature can never strand the boat by failing (fail-passive). The
+// hung or resetting dashboard therefore leaves the motor exactly as the mechanical switch
+// has it - the feature cannot strand the boat by failing (fail-passive). An unpowered
+// one does too only behind an optocoupler or on the VESC's supply: wired straight in, the
+// pad's protection diode can drag the line low (README section 5, "Unpowered dashboard"). The
 // price, stated so nobody has to rediscover it: a hung dashboard silently removes the
 // BLE layer, and a reboot releases a latched cut.
 #include "deadman.h"

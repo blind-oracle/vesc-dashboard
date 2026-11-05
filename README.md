@@ -327,8 +327,13 @@ attenuate heavily. Read the whole section before wiring anything.
 The ESP32 GPIO goes in **parallel** with the boat's existing mechanical kill switch, on the same
 VESC ADC2 input, as an **open-drain** output: high-Z means "permit" and lets the mechanical switch
 drive the line, low means "kill". The firmware can therefore only ever ADD a kill. A dashboard that
-is unpowered, in reset, crashed or unplugged leaves the line exactly as the mechanical switch has
-it, so this feature can never strand the boat by failing.
+is in reset, crashed or unplugged leaves the line exactly as the mechanical switch has it, so this
+feature cannot strand the boat by failing. A dashboard that is **unpowered but still wired in** is
+the exception, unless you use the optocoupler or a shared supply ("Unpowered dashboard" below).
+
+The diagram is for a switch whose contact is **closed while running** (normally closed, NC:
+pulling the lanyard opens it). For one that is open while running, see "Normally-open switch"
+below; the firmware is the same for both.
 
 ```
  3V3 --[ Rs ]--+--------+-- VESC ADC2     Rs is the one change to the harness: without it,
@@ -355,10 +360,68 @@ and confirm the `KILLSW` indicator on the VESC 2/3 page follows both the mechani
 it must never be a strapping pin (8/9) or 15, because a glitch low at reset would be a spurious
 engine cut - `config.h` refuses to build those.
 
+**Normally-open switch.** "Normally open" names the contact's state without the clip, so check
+what yours does with the lanyard attached. Closed while running is electrically the NC case above:
+nothing changes. Open while running, closing when the lanyard is pulled, goes to the **ground
+side** of the line, as a wired-OR with the ESP32 - both of them pull ADC2 to GND:
+
+```
+ VESC 3V3 --[ Rpu ]--+-------------- VESC ADC2     Rpu 1k..2.2k, from the VESC's own 3V3 (never
+                     |                             the dashboard's: unpowered, it would read as kill)
+   mech. NO sw ------+------ GND     closes when the lanyard is pulled -> ADC2 = 0 V -> kill
+                     |
+   ESP32 PIN_DEADMAN_CUT             open drain: high-Z = permit, driven low = kill
+```
+
+- Firmware and VESC: no change. The cut is still "low = kill", the VESC stays on `ADC2 Low`, and
+  the closed loop on `KILLSW` works the same. Remove Rs and the old pull-down; Rpu is the only
+  resistor and also limits what the ESP32 sinks (1.5..3.3 mA).
+- Rpu 1k..2.2k rather than 10k+: the switch contact sees that current when it closes (a marine
+  lanyard contact is rarely gold-plated, and a fraction of a mA through an oxidised one may not
+  register a kill), and a low-impedance line resists motor noise, which matters because the
+  VESC's threshold has no hysteresis.
+- With the switch open and the ESP32 high-Z, ADC2 must read at least 2.5 V. If it does not,
+  something pulls the pin down; the rule is then **Rpu <= Rpd/2**, the mirror of the NC case.
+- **Never** wire a normally-open switch to 3V3 with `Kill Switch Mode = ADC2 High`. An open-drain
+  output can only pull low, which in that mode means "permit": the firmware could never cut, and
+  while it held the line low it would fight the switch through the resistor and could mask the
+  mechanical kill.
+- The trade-off: with a contact that is open while running, a broken wire or an unplugged
+  connector reads as "run". The mechanical kill is then silently gone, and nothing can detect it,
+  because the VESC only reports a kill once the line actually goes low. The NC wiring fails toward
+  a kill instead. If your lanyard switch also has an NC contact (many are SPDT), use that one with
+  the wiring above. Otherwise pull the lanyard at the dock before every outing and check that
+  `KILLSW` appears on VESC 2/3.
+
+**Unpowered dashboard.** The FireBeetle runs from its own USB-C or battery, not from the VESC. When
+it is wired in but unpowered, the line's run level (2.2..3.3 V through Rs or Rpu) meets the GPIO's
+input protection diode into the board's dead 3V3 rail (the same diodes the UART series resistors
+are there for, section 3b). That can drag ADC2 below 1.65 V and **cut the motor** when the
+dashboard's battery or USB supply dies. Commissioning step 5 tests exactly this. Two fixes, neither
+needs a firmware change:
+
+- Power the dashboard from the VESC's 5 V (or the same switched supply), so it is never unpowered
+  while the VESC runs.
+- Or put an optocoupler (PC817 or similar) between the dashboard and ADC2. Its transistor replaces
+  the GPIO on the line, so an unpowered, resetting or hung dashboard leaves it truly untouched, and
+  the cut line becomes galvanically isolated. The polarity is the same as today (GPIO low = LED on =
+  cut):
+
+```
+ dashboard 3V3 --[ 330R ]-->|-- PIN_DEADMAN_CUT (open drain)     PC817 LED, ~6 mA while cutting
+                         LED
+ VESC ADC2 ------------ C   E ------------ VESC GND              PC817 transistor, across the line
+```
+
+  The transistor must be able to sink the line's current: a PC817 (CTR >= 50 % at ~6 mA) sinks at
+  least 3 mA, so use Rpu >= 2.2k with a normally-open switch; Rs 4.7k (about 0.7 mA) with the NC
+  wiring is fine.
+
 ### On the VESC
 
 Nothing to change if the mechanical switch already works: VESC Tool -> App Settings -> General ->
-**Kill Switch Mode** = `ADC2 Low` for a 3.3 V-high "run" line. On the entry edge the VESC's timeout
+**Kill Switch Mode** = `ADC2 Low` for a 3.3 V-high "run" line, which both wirings above produce.
+`ADC2 High` does not work with this design (see "Normally-open switch"). On the entry edge the VESC's timeout
 thread releases the motor immediately (`mc_interface_release_motor_override()`, then
 `mc_interface_ignore_input_both()` re-armed every 10 ms), which overrides the local PPM/ADC
 throttle rather than racing it. **Cut latency is about 10 ms, not the app timeout.** The VESC
@@ -441,7 +504,8 @@ Do this in order; the first step costs nothing and catches most of the mistakes.
    and resets for real without touching the motor. Requirement before connecting the wire: zero
    spurious trips over hours, with the tag carried where it will actually be carried. Watch
    `gapmax` in the `DM` log line - **size `DEADMAN_TIMEOUT_MS` at 5x the worst gap you ever see**,
-   not by guessing.
+   not by guessing. After connecting it, measure ADC2 with a meter: at least 2.5 V while running
+   with the dashboard high-Z, about 0 V with the lanyard pulled.
 2. Connect the line. On the bench, prop out of the water: walk the tag away, confirm the motor
    stops, `St KILLSW` appears on VESC 2/3 within two poll periods and the alarm says `VESC: KILLSW
    ok`. Time "tag gone" to "motor stopped" with a clamp meter.
@@ -450,13 +514,20 @@ Do this in order; the first step costs nothing and catches most of the mistakes.
    it, a broken cut wire looks identical to a working one until the first real trip.
 4. Confirm the mechanical lanyard still works on its own with the dashboard powered off. This is
    the fail-passive property and the single most important test here.
-5. Unplug the dashboard mid-run and force a watchdog reboot: the motor must keep running both times.
+5. Mid-run, pull the dashboard's power (USB / battery) **with the cut line still connected**, then,
+   powered again, force a watchdog reboot: the motor must keep running both times, and ADC2 must
+   stay at least 2.5 V. If it drops with the dashboard unpowered, fit the optocoupler or power the
+   dashboard from the VESC ("Unpowered dashboard" above).
 6. With two tags: check the `enrolment closed` line names both. Walk tag 2 out of range - the motor
    must keep running and the row must show `2: --`. Then walk tag 1 out too: the cut must come
    `DEADMAN_TIMEOUT_MS` after the **second** tag went, not the first. Separately, power up with only
    tag 1 present and then bring tag 2 into range: it must show `off` and never join.
 7. Only then a man-overboard rehearsal: tethered, low speed, open water, warm, a second person at
    the helm, mechanical lanyard still worn.
+
+With a normally-open mechanical switch, add one check before **every** outing: pull the lanyard
+at the dock and confirm that `KILLSW` appears on VESC 2/3. A broken wire to that switch is
+otherwise invisible.
 
 Log line (tag `dm`, every `LOG_DEADMAN_MS`), plus an immediate line on every transition:
 
