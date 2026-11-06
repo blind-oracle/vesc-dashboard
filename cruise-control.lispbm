@@ -1,0 +1,137 @@
+; Cruise control on a spare GPIO for the VESC ADC app in DUTY CYCLE mode
+; Needs firmware 6.02+.
+;
+; How it works
+;   The ADC app's built-in cruise control only runs in current-control modes,
+;   so in duty-cycle mode this script does the hold itself: on engage it
+;   captures the duty cycle you are running at, mutes the ADC app output
+;   (app-disable-output) and keeps commanding that duty. On cancel it hands
+;   the motor back to the ADC app, which then follows the throttle again
+;   (throttle at zero = duty 0, same as releasing the throttle normally).
+;   The reverse button on the PPM pin is untouched and keeps working.
+;
+;   latching = t   tap the button while running, let go of the throttle ->
+;                  speed is held. Tap again, touch the throttle, or switch
+;                  reverse -> cruise off.
+;   latching = nil hold the button -> speed is held while it stays pressed.
+;                  Throttle is ignored while holding.
+;
+; Fail-safes
+;   The ADC app is muted in 200 ms slices that are renewed every 10 ms. If
+;   this script stops or crashes, the throttle is back in control within
+;   200 ms, and with the throttle released the motor stops.
+;   Cruise cancels itself when the kill switch trips (so the motor does not
+;   surge when the lanyard is put back), when a fault is reported, or when
+;   the reverse button changes state.
+;
+; Wiring
+;   Momentary pushbutton between the chosen pin and GND. HALL1/2/3 on the
+;   sensor connector are the nicest choice: RC filtered, pulled up, and GND is
+;   on the same connector.
+;
+; VESC Tool
+;   Nothing to tick in the ADC app for this version. Enable Autostart in the
+;   Lisp tab so the script runs at boot.
+
+;;; ---------------- settings ----------------
+(def cc-pin    'pin-hall3)  ; spare input: 'pin-hall1 'pin-hall2 'pin-hall3 'pin-swdio 'pin-swclk
+(def rev-pin   'pin-ppm)    ; where your reverse button is; only watched for changes
+(def latching  nil)           ; t = tap to toggle cruise, nil = hold the button
+(def hold-mode 'duty)       ; 'duty = hold the captured duty cycle (behaves like a fixed throttle)
+                            ; 'rpm  = hold the captured ERPM with the speed PID (needs tuned PID)
+(def kill-sw   nil)   ; same as App Settings -> General -> Kill Switch Mode:
+                            ; 'adc2-low, 'adc2-high, or nil if you have no kill switch
+(def thr-idle  0.05)        ; decoded throttle (0..1) below this = released
+(def thr-touch 0.12)        ; throttle above this cancels cruise (latching mode)
+(def min-duty  0.05)        ; don't engage below this duty cycle
+(def debounce  3)           ; consecutive identical reads (x 10 ms) before a button change counts
+(def debug     nil)         ; t = print state changes in the REPL
+
+;;; ---------------- setup ----------------
+(gpio-configure cc-pin  'pin-mode-in-pu)
+(gpio-configure rev-pin 'pin-mode-in-pu)
+(app-disable-output 0)      ; make sure the ADC app is in control when we start
+
+; buttons pull the pin to GND when pressed
+(defun pressed (pin) (= (gpio-read pin) 0))
+
+(defun kill-active ()
+    (cond
+        ((eq kill-sw 'adc2-low)  (< (get-adc 1) 1.65))
+        ((eq kill-sw 'adc2-high) (> (get-adc 1) 1.65))
+        (t nil)))
+
+; debounced cruise button
+(def cc-raw-prev nil)
+(def cc-cnt 0)
+(def cc-btn nil)
+
+(defun read-cc () {
+    (var raw (pressed cc-pin))
+    (if (eq raw cc-raw-prev)
+        (setq cc-cnt (+ cc-cnt 1))
+        (setq cc-cnt 0))
+    (setq cc-raw-prev raw)
+    (if (>= cc-cnt debounce) (setq cc-btn raw))
+    cc-btn
+})
+
+;;; ---------------- state ----------------
+(def cruise 'off)           ; 'off | 'armed (engaged, throttle not yet released) | 'on
+(def held-duty 0.0)
+(def held-erpm 0.0)
+(def cc-prev nil)
+(def rev-prev (pressed rev-pin))
+
+(defun set-cruise (s) {
+    (if (and debug (not (eq s cruise))) (print (list 'cruise s 'duty held-duty)))
+    (setq cruise s)
+})
+
+(defun start-cruise () {
+    (setq held-duty (get-duty))
+    (setq held-erpm (get-rpm))
+    (set-cruise 'armed)
+})
+(defun stop-cruise () {
+    (app-disable-output 0)  ; hand the motor back to the ADC app
+    (set-cruise 'off)
+})
+
+;;; ---------------- main loop ----------------
+(loopwhile t {
+    (var cc  (read-cc))
+    (var tap (and cc (not cc-prev)))        ; rising edge = button tapped
+    (setq cc-prev cc)
+
+    (var rev (pressed rev-pin))
+    (var rev-changed (not (eq rev rev-prev)))
+    (setq rev-prev rev)
+
+    (var thr (get-adc-decoded 0))
+
+    (var cancel (or rev-changed
+                    (kill-active)
+                    (not (= (get-fault) 0))
+                    (if latching
+                        (or tap (and (eq cruise 'on) (> thr thr-touch)))
+                        (not cc))))
+
+    (cond
+        ((and (not (eq cruise 'off)) cancel)
+         (stop-cruise))
+        ((and (eq cruise 'off) tap (> (abs (get-duty)) min-duty))
+         (start-cruise))
+        ((and (eq cruise 'armed) (< thr thr-idle))
+         (set-cruise 'on))
+    )
+
+    (if (not (eq cruise 'off)) {
+        (app-disable-output 200)            ; keep the ADC app muted, renewed every loop
+        (if (eq hold-mode 'rpm)
+            (set-rpm held-erpm)
+            (set-duty held-duty))
+    })
+
+    (sleep 0.01)
+})
