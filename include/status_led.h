@@ -1,5 +1,5 @@
 // Status LED on PIN_LED, driven by the supervisor (main.cpp): a 1 Hz blink while VESC
-// data is fresh, 0.2 Hz otherwise. Two kinds of LED (config.h):
+// data is fresh, 0.2 Hz otherwise, 4 Hz (green) in update mode. Two kinds of LED (config.h):
 //   LED_WS2812 0  a plain GPIO LED, active high (FireBeetle 2 C6: the green LED on GPIO15);
 //   LED_WS2812 1  one WS2812 RGB LED (Waveshare ESP32-S3-Zero: on board, GPIO21), which
 //                 also shows the freshness as a colour: green = VESC data fresh, red = none.

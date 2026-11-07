@@ -5,7 +5,7 @@
 //  * 10 MHz RMT resolution; bit 0 = 0.3 us high / 0.9 us low, bit 1 = 0.9 us high /
 //    0.3 us low (the values of Espressif's led_strip example), MSB first, colour order
 //    G-R-B. The line idles low, and the >= 280 us latch gap is implicit: the supervisor
-//    writes the LED at most twice a second.
+//    writes the LED at most eight times a second (the 4 Hz blink of update mode).
 //  * Non-blocking transmit (queue_nonblocking): a full queue skips one blink rather than
 //    stalling the supervisor that feeds the task watchdog.
 //  * status_led_init() sends one "off" frame and waits for it, so no RMT interrupt is in

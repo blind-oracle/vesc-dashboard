@@ -19,7 +19,9 @@
 // one does too only behind an optocoupler or on the VESC's supply: wired straight in, the
 // pad's protection diode can drag the line low (README section 5, "Unpowered dashboard"). The
 // price, stated so nobody has to rediscover it: a hung dashboard silently removes the
-// BLE layer, and a reboot releases a latched cut.
+// BLE layer, and a reboot releases a latched cut. Update mode (src/ota.cpp) runs no
+// dead-man at all and therefore holds the cut for its whole duration; it cannot be
+// entered while the alarm is up, so it never becomes a way around the reset rule.
 #include "deadman.h"
 
 #if DEADMAN_ENABLE
@@ -88,7 +90,7 @@ static inline void cut_write(bool cut) {
   if (s_gpio_ready) gpio_set_level((gpio_num_t)PIN_DEADMAN_CUT, cut ? 0 : 1);
 }
 
-void deadman_gpio_early_init() {
+void deadman_gpio_early_init(bool hold_cut) {
 #if PIN_DEADMAN_CUT >= 0
   gpio_config_t io = {};
   io.pin_bit_mask = 1ULL << PIN_DEADMAN_CUT;
@@ -99,8 +101,8 @@ void deadman_gpio_early_init() {
   if (gpio_config(&io) != ESP_OK) return;
   s_gpio_ready = true;
   // Never gpio_hold_en() this pin: the hold would survive a reset and latch a cut that
-  // no running code owns.
-  gpio_set_level((gpio_num_t)PIN_DEADMAN_CUT, DEADMAN_BOOT_CUT ? 0 : 1);
+  // no running code owns. Update mode (hold_cut) keeps it low until the reboot out of it.
+  gpio_set_level((gpio_num_t)PIN_DEADMAN_CUT, (hold_cut || DEADMAN_BOOT_CUT) ? 0 : 1);
 #endif
 }
 
@@ -201,7 +203,7 @@ bool deadman_start() {
   ESP_LOGW(TAG, "PIN_DEADMAN_CUT -1: the logic runs and the screens work, but NOTHING is actuated (soak-test build)");
 #else
   if (!s_gpio_ready) {
-    deadman_gpio_early_init();  // setup() should have done this already; do not run without it
+    deadman_gpio_early_init(false);  // setup() should have done this already; do not run without it
     if (!s_gpio_ready) {
       s_disabled = true;
       ESP_LOGE(TAG, "GPIO%d setup failed: asserting the cut permanently", (int)PIN_DEADMAN_CUT);

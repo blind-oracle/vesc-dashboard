@@ -32,9 +32,9 @@
 #include <host/util/util.h>
 #include <nimble/nimble_port.h>
 #include <nimble/nimble_port_freertos.h>
-#include <nvs_flash.h>
 
 #include "ble_addr.h"
+#include "nvs_util.h"
 #include "deadman.h"  // deadman_beacon_seen() / deadman_adv_other() from the host task
 #include "shared_state.h"
 
@@ -192,22 +192,14 @@ bool ble_scan_start() {
     }
   }
   // The controller stores its PHY calibration in NVS at the first enable.
-  esp_err_t err = nvs_flash_init();
-  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    ESP_LOGW(TAG, "nvs: erasing (%s)", esp_err_to_name(err));
-    if (nvs_flash_erase() == ESP_OK) err = nvs_flash_init();
-  }
-  if (err != ESP_OK) {
-    ESP_LOGE(TAG, "nvs_flash_init: %s", esp_err_to_name(err));
-    return false;
-  }
+  if (!nvs_bring_up(TAG)) return false;
   // The task exists before the host does, so the first sync can always wake it.
   if (xTaskCreatePinnedToCore(ble_task, "ble", BLE_TASK_STACK, nullptr, TASK_PRIO_BLE, &s_task, TASK_CORE_RADIO) !=
       pdPASS) {
     ESP_LOGE(TAG, "ble task create failed");
     return false;
   }
-  err = nimble_port_init();
+  const esp_err_t err = nimble_port_init();
   if (err != ESP_OK) {
     ESP_LOGE(TAG, "nimble_port_init: %s", esp_err_to_name(err));
     return false;  // the task keeps waiting for a sync that never comes: ble_scan_active() stays false

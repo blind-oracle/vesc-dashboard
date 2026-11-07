@@ -23,7 +23,8 @@ CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4096
 # C6 controller only; the S3 controller has no such symbol and ignores it.
 CONFIG_BT_LE_CONTROLLER_TASK_STACK_SIZE=4096
-# Wi-Fi is never started; drop the software coexistence hooks (CONFIG_ESP_WIFI_ENABLED itself is not settable).
+# No software coexistence: Wi-Fi runs only in update mode (src/ota.cpp), a separate boot in which
+# BLE is never started, so the two radios are never on at the same time.
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
 
 # Measured (2026-11-05): env deadman firmware.bin 622,576 B vs 292,416 B without BLE (+330 KB); the

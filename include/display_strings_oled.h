@@ -1,6 +1,6 @@
 // Pure, deterministic builders of everything shown on the 128x64 OLED: the main
 // dashboard (OledMain), the detail "grid" screens (OledGrid: efficiency, three
-// VESC pages, GNSS, SYS),
+// VESC pages, GNSS, SYS), the overlays (dead-man alarm, FW UPDATE, update refused),
 // the screen enum, the layout constants shared by the renderer and the host tests
 // and the UTC -> local clock arithmetic.
 // Fault-code names come from vesc_getvalues.h (the CAN codec's 34-entry
@@ -39,6 +39,9 @@
 #include "shared_state.h"
 #if DEADMAN_UI_ENABLE
 #include "deadman_logic.h"  // deadman_pub_age(): the freshest enrolled tag, for the main row
+#endif
+#if OTA_ENABLE
+#include "ota_logic.h"  // the refusal wording of the update-mode hold
 #endif
 #include "vesc_getvalues.h"  // vesc_fault_fmt(): "OT_FET" / "F37" (<= 8 chars), Arduino-free
 #include "vesc_status.h"
@@ -201,11 +204,13 @@ struct OledFrame {
   OledGrid grid;    // every other screen, and every overlay
 };
 
-// An overlay takes the whole panel whatever screen is selected. There is exactly one, and
-// it exists because a cut motor must not be something you can page away from.
+// An overlay takes the whole panel whatever screen is selected: a cut motor must not be
+// something you can page away from, and in update mode there is nothing else to show.
 enum OledOverlay : uint8_t {
   OVERLAY_NONE = 0,
-  OVERLAY_DEADMAN,  // the dead-man's switch is holding the motor cut (TRIPPED or FAULT)
+  OVERLAY_DEADMAN,      // the dead-man's switch is holding the motor cut (TRIPPED or FAULT)
+  OVERLAY_OTA,          // update mode: access point, passphrase, upload progress
+  OVERLAY_OTA_REFUSED,  // a hold for update mode was just refused (OTA_REFUSED_SHOW_MS)
 };
 
 // Host-side facts the Arduino-free builders cannot fetch themselves.
@@ -1177,16 +1182,116 @@ inline void oled_build_deadman_alarm(const SharedState &s, uint32_t now, OledGri
 }
 #endif  // DEADMAN_UI_ENABLE
 
+#if OTA_ENABLE
+// FW UPDATE: shown for the whole of update mode (src/ota.cpp publishes g_state.ota).
+//
+//   [FW UPDATE      45%]       the percentage while receiving
+//   AP VESC-DASH-OTA
+//   PASS 48213907
+//   http://192.168.4.1
+//   RX 612K/1105K              or STARTING WI-FI / AP NOT UP - CHECK PWR / WAITING FOR PHONE /
+//                              PHONE JOINED / DONE - REBOOTING / UPLOAD FAILED
+//   new 8ea95aa                the version arriving, else "run <running version>", or why it failed
+//   HOLD BTN: EXIT 4:32        the idle countdown; DO NOT POWER OFF while the image is written
+inline void oled_build_ota(const OtaStatus &o, uint32_t now, OledGrid &g) {
+  using namespace oled_detail;
+  memset(&g, 0, sizeof g);
+  copy_str(g.title, sizeof g.title, "FW UPDATE");
+  g.nrows = kGridRows;
+  char l[40], a[12], b[12];
+
+  if (o.phase == OTA_PHASE_RECEIVING && o.total != 0) {
+    const uint32_t pct = (uint32_t)((uint64_t)o.received * 100u / o.total);
+    snprintf(g.page, sizeof g.page, "%u%%", (unsigned)(pct > 100u ? 100u : pct));
+  } else if (o.phase == OTA_PHASE_DONE) {
+    copy_str(g.page, sizeof g.page, "100%");
+  }
+
+  snprintf(l, sizeof l, "AP %s", o.ssid);
+  row1(g.rows[0], l);
+  snprintf(l, sizeof l, "PASS %s", o.pass[0] ? o.pass : "--");
+  row1(g.rows[1], l);
+  snprintf(l, sizeof l, "http://%s", o.ip[0] ? o.ip : "--");
+  row1(g.rows[2], l);
+
+  switch (o.phase) {
+    case OTA_PHASE_STARTING: row1(g.rows[3], "STARTING WI-FI"); break;
+    case OTA_PHASE_RECEIVING:
+      fmt_count(a, sizeof a, o.received / 1024u, 5);
+      fmt_count(b, sizeof b, o.total / 1024u, 5);
+      snprintf(l, sizeof l, "RX %sK/%sK", a, b);
+      row1(g.rows[3], l);
+      break;
+    case OTA_PHASE_DONE: row1(g.rows[3], "DONE - REBOOTING"); break;
+    case OTA_PHASE_FAILED: row1(g.rows[3], "UPLOAD FAILED"); break;
+    default:  // WAITING
+      if (!o.ap_up) row1(g.rows[3], "AP NOT UP - CHECK PWR");
+      else if (o.stations == 0) row1(g.rows[3], "WAITING FOR PHONE");
+      else row1(g.rows[3], "PHONE JOINED");
+      break;
+  }
+
+  if (o.phase == OTA_PHASE_FAILED && o.detail[0]) {
+    row1(g.rows[4], o.detail);
+  } else {
+    const char *ver = o.new_ver[0] ? o.new_ver : o.run_ver[0] ? o.run_ver : "--";
+    snprintf(l, sizeof l, "%s %s", o.new_ver[0] ? "new" : "run", ver);
+    row1(g.rows[4], l);
+  }
+
+  // Last row: on the panel's last pixel row, so upper case only (no descenders).
+  if (o.phase == OTA_PHASE_RECEIVING || o.phase == OTA_PHASE_DONE) {
+    row1(g.rows[5], "DO NOT POWER OFF");
+  } else if (o.idle_deadline_ms == 0) {
+    row1(g.rows[5], "HOLD BTN: EXIT");
+  } else {
+    const int32_t left = (int32_t)(o.idle_deadline_ms - now);
+    const uint32_t s = left > 0 ? ((uint32_t)left + 999u) / 1000u : 0u;  // round up: "0:00" only at the very end
+    snprintf(l, sizeof l, "HOLD BTN: EXIT %lu:%02lu", (unsigned long)(s / 60u), (unsigned long)(s % 60u));
+    row1(g.rows[5], l);
+  }
+}
+
+// UPDATE REFUSED: what stopped the hold and what to do about it, for OTA_REFUSED_SHOW_MS.
+inline void oled_build_ota_refused(uint8_t reason, OledGrid &g) {
+  using namespace oled_detail;
+  memset(&g, 0, sizeof g);
+  copy_str(g.title, sizeof g.title, "FW UPDATE");
+  copy_str(g.page, sizeof g.page, "!");
+  g.nrows = kGridRows;
+  row1(g.rows[0], "UPDATE REFUSED");
+  row1(g.rows[1], ota_refusal_text(reason));
+  row1(g.rows[2], ota_refusal_hint(reason));
+}
+#endif  // OTA_ENABLE
+
 inline void oled_build_frame(const SharedState &s, uint32_t now, uint8_t screen, const OledSysInfo &info,
                              OledFrame &out) {
   memset(&out, 0, sizeof out);
   out.screen = screen < SCREEN_COUNT ? screen : (uint8_t)SCREEN_MAIN;
+#if OTA_ENABLE
+  // Update mode runs nothing that could feed another screen (and no dead-man: the cut is held).
+  if (s.ota.phase != OTA_PHASE_OFF) {
+    out.overlay = OVERLAY_OTA;
+    oled_build_ota(s.ota, now, out.grid);
+    return;
+  }
+#endif
 #if DEADMAN_UI_ENABLE
   // A cut motor takes the whole panel, whatever page the helmsman had selected, and the
   // long press that would normally go back to MAIN clears the latch instead.
   if (s.deadman.state == DM_TRIPPED || s.deadman.state == DM_FAULT) {
     out.overlay = OVERLAY_DEADMAN;
     oled_build_deadman_alarm(s, now, out.grid);
+    return;
+  }
+#endif
+#if OTA_ENABLE
+  // Signed age: the display task stamps the refusal with its loop clock, which may trail `now`.
+  if (s.disp.ota_refused != OTA_OK && s.disp.ota_refused_ms != 0 &&
+      (int32_t)(now - s.disp.ota_refused_ms) < (int32_t)OTA_REFUSED_SHOW_MS) {
+    out.overlay = OVERLAY_OTA_REFUSED;
+    oled_build_ota_refused(s.disp.ota_refused, out.grid);
     return;
   }
 #endif

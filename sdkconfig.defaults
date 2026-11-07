@@ -11,10 +11,22 @@ CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
-# Partition table: partitions.csv in the project root (2 x 1.25 MB OTA app slots, spiffs, coredump).
+# Partition table: partitions.csv in the project root (2 x 1.94 MB OTA app slots, coredump).
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# Over-the-air update (src/ota.cpp). A freshly written image runs on probation: unless it calls
+# esp_ota_mark_app_valid_cancel_rollback() (after OTA_CONFIRM_MS with every task alive), the next
+# boot goes back to the slot that worked. A panic, a watchdog reset or a power cycle before that
+# point rolls back on its own. This is a BOOTLOADER option: it takes effect with a wired flash.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# Wi-Fi only ever runs in update mode, while the upload erases flash sector by sector. Its hot
+# paths must stay in IRAM (the IDF default) so the radio keeps working with the cache off, and the
+# access point needs SoftAP support (default y as well); both are spelled out so nobody trims them.
+CONFIG_ESP_WIFI_IRAM_OPT=y
+CONFIG_ESP_WIFI_RX_IRAM_OPT=y
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 
 # 1 ms tick (IDF default is 100 Hz): every pdMS_TO_TICKS() delay, the button debounce and the
 # task heartbeats assume millisecond resolution.

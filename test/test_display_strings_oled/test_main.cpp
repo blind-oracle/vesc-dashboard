@@ -1,6 +1,7 @@
 // Unity tests (pio test -e native) for the pure OLED screen builders in
 // include/display_strings_oled.h: main screen cells, clock arithmetic, the grid
-// screens (efficiency, VESC 1-3, GNSS, SYS), the live/latched fault row, freshness
+// screens (efficiency, VESC 1-3, GNSS, SYS), the overlays (dead-man alarm, FW UPDATE,
+// update refused) with the update-mode entry gate (ota_logic.h), the live/latched fault row, freshness
 // rules, character budgets, determinism. Fault names come from vesc_getvalues.h
 // (checked here as used).
 // Compiles with: -std=c++17 -DUNIT_TEST -Iinclude ; includes only Arduino-free headers.
@@ -1812,6 +1813,219 @@ static void test_layout_geometry() {
   TEST_ASSERT_TRUE(sizeof g.rows / sizeof g.rows[0] == (size_t)kGridRows);
 }
 
+#if OTA_ENABLE
+// ---------------------------------------------------------------- firmware update
+// The entry gate refuses only on data that positively shows motion, or on the dead-man alarm;
+// stale and never-received data count as stationary (a VESC switched off at the dock).
+static void test_ota_entry_check() {
+  SharedState s = make_state(NOW);  // motor 2350 rpm and boat 5144 mm/s, both fresh
+  TEST_ASSERT_EQUAL_UINT8(OTA_REFUSED_MOTOR, ota_entry_check(s, NOW));
+  s.vesc.t.erpm = -erpm_for(2350.0f);  // reverse counts too
+  TEST_ASSERT_EQUAL_UINT8(OTA_REFUSED_MOTOR, ota_entry_check(s, NOW));
+  s.vesc.t.erpm = erpm_for((float)OTA_MAX_RPM);  // exactly at the limit: not turning
+  TEST_ASSERT_EQUAL_UINT8(OTA_REFUSED_MOVING, ota_entry_check(s, NOW));
+  s.vesc.t.erpm = erpm_for(2350.0f);
+  s.vesc.t.t_ms[VESC_IDX_STATUS_1] = NOW - VESC_STALE_R1_MS - 1;  // stale: the VESC is off, not turning
+  TEST_ASSERT_EQUAL_UINT8(OTA_REFUSED_MOVING, ota_entry_check(s, NOW));
+
+  // GNSS: only a fresh, usable, accurate fix above the limit refuses.
+  s.gnss.gspeed_mm_s = OTA_MAX_SPEED_MM_S;
+  TEST_ASSERT_EQUAL_UINT8(OTA_OK, ota_entry_check(s, NOW));
+  s.gnss.gspeed_mm_s = -(OTA_MAX_SPEED_MM_S + 1);
+  TEST_ASSERT_EQUAL_UINT8(OTA_REFUSED_MOVING, ota_entry_check(s, NOW));
+  s.gnss.gspeed_mm_s = 5144;
+  s.gnss.sacc_mm_s = GNSS_MAX_SACC_MM_S + 1;  // a poor fix at the dock reports random speeds
+  TEST_ASSERT_EQUAL_UINT8(OTA_OK, ota_entry_check(s, NOW));
+  s.gnss.sacc_mm_s = 300;
+  s.gnss.fix_ok = false;
+  TEST_ASSERT_EQUAL_UINT8(OTA_OK, ota_entry_check(s, NOW));
+  s.gnss.fix_ok = true;
+  s.gnss.last_pvt_ms = NOW - GNSS_STALE_MS - 1;
+  TEST_ASSERT_EQUAL_UINT8(OTA_OK, ota_entry_check(s, NOW));
+
+  TEST_ASSERT_EQUAL_UINT8(OTA_OK, ota_entry_check(never_state(), NOW));
+
+#if DEADMAN_UI_ENABLE
+  // The alarm refuses even at rest: the reboot out of update mode would clear the trip.
+  s = never_state();
+  s.deadman.state = DM_TRIPPED;
+  TEST_ASSERT_EQUAL_UINT8(OTA_REFUSED_DEADMAN, ota_entry_check(s, NOW));
+  s.deadman.state = DM_FAULT;
+  TEST_ASSERT_EQUAL_UINT8(OTA_REFUSED_DEADMAN, ota_entry_check(s, NOW));
+  s.deadman.state = DM_ARMED;
+  TEST_ASSERT_EQUAL_UINT8(OTA_OK, ota_entry_check(s, NOW));
+  s.deadman.state = DM_GRACE;
+  TEST_ASSERT_EQUAL_UINT8(OTA_OK, ota_entry_check(s, NOW));
+#endif
+
+  // Every refusal can be named within one grid row.
+  for (uint8_t r = OTA_REFUSED_MOTOR; r <= OTA_REFUSED_UNCONFIRMED; ++r) {
+    TEST_ASSERT_TRUE(strlen(ota_refusal_text(r)) >= 1 && strlen(ota_refusal_text(r)) <= (size_t)kGridChars);
+    TEST_ASSERT_TRUE(strlen(ota_refusal_hint(r)) >= 1 && strlen(ota_refusal_hint(r)) <= (size_t)kGridChars);
+  }
+}
+
+static OtaStatus ota_status(uint8_t phase) {
+  OtaStatus o;
+  memset(&o, 0, sizeof o);
+  o.phase = phase;
+  o.ap_up = true;
+  snprintf(o.ssid, sizeof o.ssid, "VESC-DASH-OTA");
+  snprintf(o.pass, sizeof o.pass, "48213907");
+  snprintf(o.ip, sizeof o.ip, "192.168.4.1");
+  snprintf(o.run_ver, sizeof o.run_ver, "8ea95aa-dirty");
+  o.idle_deadline_ms = NOW + 272000;  // 4:32 left
+  return o;
+}
+
+static OledFrame ota_frame(const OtaStatus &o, uint8_t screen = SCREEN_GNSS) {
+  SharedState s = make_state(NOW);
+  s.ota = o;
+  OledFrame f;
+  memset(&f, 0xAA, sizeof f);
+  oled_build_frame(s, NOW, screen, kInfo, f);
+  return f;
+}
+
+static void test_ota_overlay_phases() {
+  // Waiting: the overlay replaces every screen and carries everything needed to connect.
+  OtaStatus o = ota_status(OTA_PHASE_WAITING);
+  for (unsigned scr = 0; scr < (unsigned)SCREEN_COUNT; ++scr) {
+    const OledFrame f = ota_frame(o, (uint8_t)scr);
+    TEST_ASSERT_EQUAL_UINT8(OVERLAY_OTA, f.overlay);
+    assert_grid_lengths(f.grid);
+  }
+  OledFrame f = ota_frame(o);
+  TEST_ASSERT_EQUAL_STRING("FW UPDATE", f.grid.title);
+  TEST_ASSERT_EQUAL_STRING("", f.grid.page);
+  TEST_ASSERT_EQUAL_STRING("AP VESC-DASH-OTA", f.grid.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("PASS 48213907", f.grid.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("http://192.168.4.1", f.grid.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("WAITING FOR PHONE", f.grid.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("run 8ea95aa-dirty", f.grid.rows[4]);
+  TEST_ASSERT_EQUAL_STRING("HOLD BTN: EXIT 4:32", f.grid.rows[5]);
+
+  o.stations = 1;
+  TEST_ASSERT_EQUAL_STRING("PHONE JOINED", ota_frame(o).grid.rows[3]);
+  o.ap_up = false;  // AP_START never arrived: say so instead of waiting for a phone that cannot join
+  TEST_ASSERT_EQUAL_STRING("AP NOT UP - CHECK PWR", ota_frame(o).grid.rows[3]);
+
+  // Countdown: rounded up, so "0:00" means it is over.
+  o = ota_status(OTA_PHASE_WAITING);
+  o.idle_deadline_ms = NOW + 1;
+  TEST_ASSERT_EQUAL_STRING("HOLD BTN: EXIT 0:01", ota_frame(o).grid.rows[5]);
+  o.idle_deadline_ms = NOW - 500;
+  TEST_ASSERT_EQUAL_STRING("HOLD BTN: EXIT 0:00", ota_frame(o).grid.rows[5]);
+
+  // Starting: nothing published yet beyond the SSID and passphrase.
+  o = ota_status(OTA_PHASE_STARTING);
+  o.ip[0] = '\0';
+  o.idle_deadline_ms = 0;
+  f = ota_frame(o);
+  TEST_ASSERT_EQUAL_STRING("http://--", f.grid.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("STARTING WI-FI", f.grid.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("HOLD BTN: EXIT", f.grid.rows[5]);
+  assert_grid_lengths(f.grid);
+
+  // Receiving: progress in the bar and in KB, the arriving version, and a warning on the last row.
+  o = ota_status(OTA_PHASE_RECEIVING);
+  o.received = 612u * 1024u;
+  o.total = 1105u * 1024u;
+  snprintf(o.new_ver, sizeof o.new_ver, "1a2b3c4");
+  f = ota_frame(o);
+  TEST_ASSERT_EQUAL_STRING("55%", f.grid.page);
+  TEST_ASSERT_EQUAL_STRING("RX 612K/1105K", f.grid.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("new 1a2b3c4", f.grid.rows[4]);
+  TEST_ASSERT_EQUAL_STRING("DO NOT POWER OFF", f.grid.rows[5]);
+  assert_grid_lengths(f.grid);
+  o.received = o.total;
+  TEST_ASSERT_EQUAL_STRING("100%", ota_frame(o).grid.page);
+
+  o.phase = OTA_PHASE_DONE;
+  f = ota_frame(o);
+  TEST_ASSERT_EQUAL_STRING("100%", f.grid.page);
+  TEST_ASSERT_EQUAL_STRING("DONE - REBOOTING", f.grid.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("DO NOT POWER OFF", f.grid.rows[5]);
+
+  // Failed: the reason replaces the version, and the countdown is back.
+  o = ota_status(OTA_PHASE_FAILED);
+  snprintf(o.detail, sizeof o.detail, "not a firmware image");
+  f = ota_frame(o);
+  TEST_ASSERT_EQUAL_STRING("", f.grid.page);
+  TEST_ASSERT_EQUAL_STRING("UPLOAD FAILED", f.grid.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("not a firmware image", f.grid.rows[4]);
+  TEST_ASSERT_EQUAL_STRING("HOLD BTN: EXIT 4:32", f.grid.rows[5]);
+  assert_grid_lengths(f.grid);
+
+  // Longest values: everything is clipped to the row, and the result is deterministic.
+  o = ota_status(OTA_PHASE_RECEIVING);
+  snprintf(o.ssid, sizeof o.ssid, "ABCDEFGHIJKLMNOPQR");  // 18, the config.h limit
+  snprintf(o.new_ver, sizeof o.new_ver, "v1.2.3-45-gabcdefx");
+  snprintf(o.ip, sizeof o.ip, "255.255.255.255");
+  o.received = 0xFFFFFFFFu;
+  o.total = 0xFFFFFFFFu;
+  f = ota_frame(o);
+  assert_grid_lengths(f.grid);
+  TEST_ASSERT_EQUAL_STRING("AP ABCDEFGHIJKLMNOPQR", f.grid.rows[0]);
+  const OledFrame g2 = ota_frame(o);
+  TEST_ASSERT_EQUAL_MEMORY(&f, &g2, sizeof f);
+
+#if DEADMAN_UI_ENABLE
+  // Update mode runs no dead-man; a stale alarm state must never hide the update screen.
+  SharedState s = make_state(NOW);
+  s.ota = ota_status(OTA_PHASE_WAITING);
+  s.deadman.state = DM_TRIPPED;
+  oled_build_frame(s, NOW, SCREEN_MAIN, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_OTA, f.overlay);
+#endif
+}
+
+// A refused hold says why for OTA_REFUSED_SHOW_MS, below the dead-man alarm in precedence.
+static void test_ota_refused_overlay() {
+  SharedState s = make_state(NOW);
+  OledFrame f;
+  s.disp.ota_refused = OTA_REFUSED_MOTOR;
+  s.disp.ota_refused_ms = NOW - 100;
+  oled_build_frame(s, NOW, SCREEN_VESC_A, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_OTA_REFUSED, f.overlay);
+  TEST_ASSERT_EQUAL_STRING("FW UPDATE", f.grid.title);
+  TEST_ASSERT_EQUAL_STRING("!", f.grid.page);
+  TEST_ASSERT_EQUAL_STRING("UPDATE REFUSED", f.grid.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("motor is turning", f.grid.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("stop the motor", f.grid.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("", f.grid.rows[5]);
+
+  // Stamped by the display loop a moment after this frame's clock: still shown.
+  s.disp.ota_refused_ms = NOW + 5;
+  oled_build_frame(s, NOW, SCREEN_VESC_A, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_OTA_REFUSED, f.overlay);
+
+  // Gone after OTA_REFUSED_SHOW_MS, back to the selected screen.
+  s.disp.ota_refused_ms = NOW - OTA_REFUSED_SHOW_MS;
+  oled_build_frame(s, NOW, SCREEN_VESC_A, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_NONE, f.overlay);
+  TEST_ASSERT_EQUAL_UINT8(SCREEN_VESC_A, f.screen);
+
+  // Never refused (or no time stamp): nothing to show.
+  s.disp.ota_refused_ms = 0;
+  oled_build_frame(s, NOW, SCREEN_VESC_A, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_NONE, f.overlay);
+  s.disp.ota_refused = OTA_OK;
+  s.disp.ota_refused_ms = NOW;
+  oled_build_frame(s, NOW, SCREEN_VESC_A, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_NONE, f.overlay);
+
+#if DEADMAN_UI_ENABLE
+  // The alarm outranks the refusal it caused: a cut motor stays on the panel.
+  s.disp.ota_refused = OTA_REFUSED_DEADMAN;
+  s.disp.ota_refused_ms = NOW;
+  s.deadman.state = DM_TRIPPED;
+  oled_build_frame(s, NOW, SCREEN_MAIN, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_DEADMAN, f.overlay);
+#endif
+}
+#endif  // OTA_ENABLE
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_main_sample_state);
@@ -1862,6 +2076,11 @@ int main(int, char **) {
 #if DEADMAN_UI_ENABLE
   RUN_TEST(test_deadman_alarm_overlay);
   RUN_TEST(test_deadman_main_row);
+#endif
+#if OTA_ENABLE
+  RUN_TEST(test_ota_entry_check);
+  RUN_TEST(test_ota_overlay_phases);
+  RUN_TEST(test_ota_refused_overlay);
 #endif
   RUN_TEST(test_boot_frame);
   RUN_TEST(test_layout_geometry);

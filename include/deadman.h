@@ -15,10 +15,11 @@
 #include "shared_state.h"
 
 #if DEADMAN_ENABLE
-// Puts PIN_DEADMAN_CUT into its boot state (DEADMAN_BOOT_CUT). Call this as the FIRST
-// statement of setup(), before any delay: until it runs the pin is a floating input and
-// the line rests wherever the mechanical switch and its pull-down leave it.
-void deadman_gpio_early_init();
+// Puts PIN_DEADMAN_CUT into its boot state: cut when hold_cut (update mode, which runs no
+// dead-man and holds the cut until it reboots) or DEADMAN_BOOT_CUT, else released. Call this
+// as the FIRST statement of setup(), before any delay: until it runs the pin is a floating
+// input and the line rests wherever the mechanical switch and its pull-down leave it.
+void deadman_gpio_early_init(bool hold_cut);
 
 // Starts deadmanTask (TASK_PRIO_DEADMAN). Returns false if the task could not be created
 // or the beacon address is unusable; the cut is then asserted permanently and logged.
@@ -42,7 +43,7 @@ void deadman_request_reset();
 void deadman_log_events(const SharedState &s, uint32_t now);
 void deadman_log_summary(const SharedState &s, uint32_t now);
 #else
-inline void deadman_gpio_early_init() {}
+inline void deadman_gpio_early_init(bool) {}
 inline bool deadman_start() { return false; }
 inline void deadman_beacon_seen(uint8_t, int8_t, uint32_t) {}
 inline void deadman_adv_other() {}

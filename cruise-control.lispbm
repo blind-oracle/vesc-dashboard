@@ -36,10 +36,10 @@
 ;;; ---------------- settings ----------------
 (def cc-pin    'pin-hall3)  ; spare input: 'pin-hall1 'pin-hall2 'pin-hall3 'pin-swdio 'pin-swclk
 (def rev-pin   'pin-ppm)    ; where your reverse button is; only watched for changes
-(def latching  nil)           ; t = tap to toggle cruise, nil = hold the button
+(def latching  nil)         ; t = tap to toggle cruise, nil = hold the button
 (def hold-mode 'duty)       ; 'duty = hold the captured duty cycle (behaves like a fixed throttle)
                             ; 'rpm  = hold the captured ERPM with the speed PID (needs tuned PID)
-(def kill-sw   nil)   ; same as App Settings -> General -> Kill Switch Mode:
+(def kill-sw   'adc2-low)   ; same as App Settings -> General -> Kill Switch Mode:
                             ; 'adc2-low, 'adc2-high, or nil if you have no kill switch
 (def thr-idle  0.05)        ; decoded throttle (0..1) below this = released
 (def thr-touch 0.12)        ; throttle above this cancels cruise (latching mode)

@@ -41,19 +41,21 @@ Files:
 | `include/vesc_status.h` | header-only VESC STATUS_1..6 decoder (framework-free, unit-tested) |
 | `include/vesc_getvalues.h` | header-only codec for active polling: request builder, `FILL_RX_BUFFER` / `PROCESS_RX_BUFFER` reassembly, CRC-16/XMODEM, mask-ordered `COMM_GET_VALUES(_SELECTIVE)` decoder, the 34-entry fault-code table (framework-free, unit-tested) |
 | `include/ubx_min.h` | header-only UBX frame parser, NAV-PVT / NAV-VELNED decoders and the CFG-PRT / CFG-RATE / VALSET frame builders (framework-free, unit-tested) |
-| `include/shared_state.h`, `src/shared_state.cpp` | `g_state` (`vesc`, `vesc_ext`, `can`, `gnss`, `trip`, `disp`, plus `deadman` with `DEADMAN_UI_ENABLE`), mutex, snapshots, heartbeats, `fresh()` |
+| `include/shared_state.h`, `src/shared_state.cpp` | `g_state` (`vesc`, `vesc_ext`, `can`, `gnss`, `trip`, `disp`, plus `deadman` with `DEADMAN_UI_ENABLE` and `ota` with `OTA_ENABLE`), mutex, snapshots, heartbeats, `fresh()` |
 | `include/can_vesc.h`, `src/can_vesc.cpp` | TWAI node setup (`esp_twai_onchip.h`), ISR callbacks and RX queue, canTask, poll state machine, bus-off recovery |
 | `include/gnss_ubx.h`, `src/gnss_ubx.cpp` | UART1 setup, autobaud, MON-VER detection, baud switch, VALSET/legacy configuration |
 | `include/trip.h`, `src/trip.cpp` | header-only trip integrator (distance, energy sources, `EFF_WINDOW_S` window, efficiency; framework-free, unit-tested) and the 200 ms task that feeds it snapshots and publishes `g_state.trip` |
 | `include/display.h` | `display_start()`, the display task's one entry point (implemented by `src/display_oled.cpp`) |
-| `include/display_strings_oled.h` | pure builders of all OLED screens (seven, plus the dead-man row and alarm of a `deadman` build; character budgets, stale -> `--`, UTC -> local clock), unit-tested |
+| `include/display_strings_oled.h` | pure builders of all OLED screens (seven, plus the dead-man row and alarm of a `deadman` build and the FW UPDATE / UPDATE REFUSED overlays; character budgets, stale -> `--`, UTC -> local clock), unit-tested |
 | `src/display_oled.cpp` | I2C bring-up and presence probe, u8g2 rendering, button debounce, screen switching, change-detected refresh, idle dimming |
 | `include/u8g2_hal_idf.h`, `src/u8g2_hal_idf.cpp` | u8g2 HAL for ESP-IDF: I2C master byte callback, reset GPIO, delays, address probe |
 | `components/u8g2/` | u8g2 library (git submodule, tag 2.37.1): fonts, frame buffer, SSD1309 init sequence; only the referenced fonts are linked |
 | `include/ble_scan.h`, `src/ble_scan.cpp` | the dead-man's radio (the only file that includes NimBLE): NVS + NimBLE host init, the scan callback that timestamps the tags, the `ble` task that keeps the watchdog scan running; inline no-ops when `DEADMAN_ENABLE` is 0 |
-| `src/main.cpp` | `app_main()`: start-up and the supervisor loop |
+| `include/ota.h`, `include/ota_logic.h`, `src/ota.cpp` | over-the-air update (section 7): the reboot request across RTC memory, the update-mode access point and upload server, the probation of a new image; the entry gate (motor turning, boat moving, dead-man alarm) is the framework-free, unit-tested `ota_logic.h`; inline no-ops when `OTA_ENABLE` is 0 |
+| `include/nvs_util.h` | NVS bring-up shared by the BLE controller and update mode's Wi-Fi |
+| `src/main.cpp` | `app_main()`: start-up and the supervisor loop (a smaller one in update mode) |
 | `platformio.ini`, `boards/dfrobot_firebeetle2_esp32c6.json`, `boards/waveshare_esp32s3_zero.json`, `sdkconfig.defaults`, `sdkconfig.defaults.ble`, `sdkconfig.defaults.esp32s3`, `partitions.csv`, `CMakeLists.txt`, `src/CMakeLists.txt` | build: pinned platform and envs, board definitions, ESP-IDF configuration (the `.ble` fragment adds the NimBLE host, observer role only, for the dead-man envs; ESP-IDF applies `.esp32s3` by itself on the S3-Zero), partition table, IDF project files |
-| `test/test_vesc/`, `test/test_vesc_getvalues/`, `test/test_vesc_uart/`, `test/test_ubx/`, `test/test_trip/`, `test/test_display_strings_oled/`, `test/test_deadman/`, `test/test_ble_addr/` | Unity tests (one `test_main.cpp` each, 205 test cases), run on the host with `pio test -e native` |
+| `test/test_vesc/`, `test/test_vesc_getvalues/`, `test/test_vesc_uart/`, `test/test_ubx/`, `test/test_trip/`, `test/test_display_strings_oled/`, `test/test_deadman/`, `test/test_ble_addr/` | Unity tests (one `test_main.cpp` each, 208 test cases), run on the host with `pio test -e native` |
 
 ## 2. Hardware and wiring
 
@@ -484,7 +486,7 @@ both slots pointing at one fob would look armed while guarding half as much.
 
 ### The radio
 
-The radio does exactly one thing: one passive scan (`src/ble_scan.cpp`), continuous
+In normal operation the radio does exactly one thing: one passive scan (`src/ble_scan.cpp`), continuous
 (`DEADMAN_SCAN_ITVL_MS` = `DEADMAN_SCAN_WINDOW_MS` = 100 ms), with `filter_duplicates` off - a
 liveness watchdog needs every advert, not one per scan instance. NimBLE runs in the observer role
 only (`sdkconfig.defaults.ble`): no connections, no advertising, no GATT, so nothing ever
@@ -494,7 +496,8 @@ by address only (`DEADMAN_BEACON_ADDR`, `DEADMAN_BEACON_ADDR2`): there is no dis
 
 Two consequences of the BLE stack as configured: the tag must use **legacy advertising on the 1M
 PHY** (`CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT` is off, so extended-advertising beacons are invisible),
-and a dead tag battery is indistinguishable from a man overboard.
+and a dead tag battery is indistinguishable from a man overboard. (Update mode, section 7, uses
+the radio for Wi-Fi instead, in a separate boot with no BLE and the cut held.)
 
 ### Commissioning
 
@@ -528,6 +531,11 @@ Do this in order; the first step costs nothing and catches most of the mistakes.
 With a normally-open mechanical switch, add one check before **every** outing: pull the lanyard
 at the dock and confirm that `KILLSW` appears on VESC 2/3. A broken wire to that switch is
 otherwise invisible.
+
+Update mode (section 7) runs no dead-man and holds the cut instead. Check that once at the dock
+with the cut line connected: hold the button 5 s; while the FW UPDATE screen is up ADC2 must read
+about 0 V and VESC Tool must show the kill switch active (the dashboard cannot confirm it there:
+update mode has no VESC link). A long press leaves update mode.
 
 Log line (tag `dm`, every `LOG_DEADMAN_MS`), plus an immediate line on every transition:
 
@@ -600,6 +608,8 @@ Seven screens, cycled by the button (section "Button" below); the detail screens
 
 The display task samples `PIN_BUTTON` every `OLED_BUTTON_POLL_MS` (20 ms) and accepts a level once it has been stable for `BUTTON_DEBOUNCE_MS` (30 ms). Releasing before `BUTTON_LONG_PRESS_MS` (1500 ms) is a short press: next screen, wrapping from SYS back to MAIN. Holding for `BUTTON_LONG_PRESS_MS` is a long press: back to MAIN, fired once while the button is still held (the release then does nothing). The selected screen then stays up indefinitely: `SCREEN_AUTO_RETURN_MS` is 0 (off) by default, and setting it to a number of milliseconds brings back the automatic return to MAIN that long after the last button event. Every press counts (`btn` on the SYS screen, `btn=` in the SYS log line), restores the contrast if the panel was dimmed and restarts the idle timer; a screen change is drawn immediately, not at the next tick, and logged as `display: screen 1 (EFF), short press` (screen indices 0..6 = MAIN, EFF, VESC 1/3, VESC 2/3, VESC 3/3, GNSS, SYS; reasons: `short press`, `long press`, `auto-return`). The button works even while no panel answers.
 
+Holding on to `OTA_LONG_PRESS_MS` (5 s; the long press at 1.5 s has already gone back to MAIN by then) asks for update mode, section 7: logged as `display: 5000 ms hold -> update mode requested`. Refused, the panel shows `UPDATE REFUSED` and the reason for `OTA_REFUSED_SHOW_MS` (3 s); accepted, the board reboots. On the dead-man alarm the long press still requests the reset and the 5 s hold is always refused. In update mode a long press leaves it.
+
 Refresh and idle policy (`config.h`):
 
 | Define | Default | Effect |
@@ -613,7 +623,7 @@ Refresh and idle policy (`config.h`):
 | `OLED_I2C_HZ` | 400000 | bus clock; the SSD1309 is specified to 400 kHz. 100000 for long or noisy wiring |
 | `OLED_WIDTH`, `OLED_HEIGHT` | 128, 64 | panel geometry; the layout is hard-coded for it (`static_assert`) |
 
-The panel is probed with a zero-length I2C transaction before every init, so a missing display is reported instead of drawn into blindly: `display_start()` logs `OLED: no response at 0x3C (check wiring/address jumper): ESP_ERR_NOT_FOUND` and the task retries every 5 s (`OLED: still no response at 0x3C (retry N, ESP_ERR_NOT_FOUND)`); while running it re-probes every 5 s and re-initialises a panel that stopped answering (`OLED: lost contact at 0x3C (ESP_ERR_NOT_FOUND), re-initialising`), as it does at once when a frame transfer fails (`OLED: frame transfer failed (ESP_ERR_INVALID_RESPONSE), re-initialising`), so hot-plugging works in both directions. After every (re)init the panel shows the boot frame (main screen, `--` everywhere, `--:--`, `BOOT`, firmware version) and the live frame on the next tick. `-DDISPLAY_DEMO=1` (the `demo` env, the default build plus the demo, no radio) feeds synthetic changing values to all seven screens (the EFFICIENCY page runs a synthetic trip at 3 m/s and ~600 W) with a 30 s hold every 2 min, a live `OT_FET` fault for 10 s per cycle and the latched `LAST OT_FET <age>` row afterwards, so you can check every layout and the idle dimming with no VESC or GNSS attached (`-DOLED_IDLE_DIM_MS=20000` to see the dimming sooner).
+The panel is probed with a zero-length I2C transaction before every init, so a missing display is reported instead of drawn into blindly: `display_start()` logs `OLED: no response at 0x3C (check wiring/address jumper): ESP_ERR_NOT_FOUND` and the task retries every 5 s (`OLED: still no response at 0x3C (retry N, ESP_ERR_NOT_FOUND)`); while running it re-probes every 5 s and re-initialises a panel that stopped answering (`OLED: lost contact at 0x3C (ESP_ERR_NOT_FOUND), re-initialising`), as it does at once when a frame transfer fails (`OLED: frame transfer failed (ESP_ERR_INVALID_RESPONSE), re-initialising`), so hot-plugging works in both directions. After every (re)init the panel shows the boot frame (main screen, `--` everywhere, `--:--`, `BOOT`, firmware version) and the live frame on the next tick. `-DDISPLAY_DEMO=1` (the `demo` env, the default build plus the demo, no BLE) feeds synthetic changing values to all seven screens (the EFFICIENCY page runs a synthetic trip at 3 m/s and ~600 W) with a 30 s hold every 2 min, a live `OT_FET` fault for 10 s per cycle and the latched `LAST OT_FET <age>` row afterwards, so you can check every layout and the idle dimming with no VESC or GNSS attached (`-DOLED_IDLE_DIM_MS=20000` to see the dimming sooner).
 
 ## 7. Building, flashing, testing
 
@@ -628,8 +638,8 @@ Prerequisites: PlatformIO Core (`pio` on the PATH, e.g. `~/.platformio/penv/bin/
 | `pio run -e deadman -t upload` | the default build plus the BLE dead-man's switch (section 5; NimBLE host from `sdkconfig.defaults.ble`). `DEADMAN_BEACON_ADDR` (and `DEADMAN_BEACON_ADDR2` for a second tag) must be set to your hardware first: a tag address that never matches leaves the switch in `NO TAG` for ever |
 | `pio run -e deadman_uart -t upload` | the `deadman` build with the VESC on its COMM-header UART instead of CAN (section 3b): no transceiver; App to Use must include UART |
 | `pio run -e s3zero_deadman_uart -t upload` | `deadman_uart` on a Waveshare ESP32-S3-Zero (section 2b); the first build compiles ESP-IDF for the S3 |
-| `pio test -e native` | host unit tests in eight directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_vesc_uart`, `test/test_ubx`, `test/test_trip`, `test/test_display_strings_oled`, `test/test_deadman`, `test/test_ble_addr`; 205 test cases): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UART link codec (request frame, reassembly through junk, damaged frames and bogus headers, the state update from a reply), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, 32-bit clock wrap), the dead-man state machine (arming, enrolment of two tags, timeout, latch and reset, no radio, the closed loop), BLE address parsing, all OLED screens, and the clock arithmetic; no hardware |
-| `pio run -e demo -t upload` | flash the layout demo (`DISPLAY_DEMO=1` on top of the default env: all seven screens and the dead-man row with synthetic data, dimming after 20 s; no radio) |
+| `pio test -e native` | host unit tests in eight directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_vesc_uart`, `test/test_ubx`, `test/test_trip`, `test/test_display_strings_oled`, `test/test_deadman`, `test/test_ble_addr`; 208 test cases): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UART link codec (request frame, reassembly through junk, damaged frames and bogus headers, the state update from a reply), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, 32-bit clock wrap), the dead-man state machine (arming, enrolment of two tags, timeout, latch and reset, no radio, the closed loop), BLE address parsing, all OLED screens and overlays, the update-mode entry gate, and the clock arithmetic; no hardware |
+| `pio run -e demo -t upload` | flash the layout demo (`DISPLAY_DEMO=1` on top of the default env: all seven screens and the dead-man row with synthetic data, dimming after 20 s; no BLE) |
 | `pio run -t menuconfig` | ESP-IDF menuconfig on the env's generated `sdkconfig`; put lasting changes into `sdkconfig.defaults` |
 | `pio project init --ide vscode` | regenerate IntelliSense after changing `platformio.ini` |
 
@@ -664,6 +674,43 @@ I (10000) main: SYS up=10s reset=POWERON heap=... minheap=... lockfail=0 | can=R
 
 An M9/M10 receiver logs `GNSS: PROTVER 34.10 -> VALSET configuration`, `GNSS: switching UART1 38400 -> 115200 baud (VALSET)` and four `GNSS: VALSET ...: ACK` lines (UART1OUTPROT, MSGOUT, RATE, NAVSPG-DYNMODEL) instead of the CFG-MSG/CFG-RATE ones; one that still runs at 115200 from an earlier boot (backup battery) is found within a second and skips the switch. The first `TRIP` line shows `now=-- avg=--` until the boat has covered `EFF_MIN_DIST_M`. Before a VESC is connected the VESC line prints `never` for every age, `can=RUN` with `frames=0` and `polls=0` (no id to poll yet), the cells show `--` and the CAN line `CAN idle`; that is expected. With `-DVESC_POLL_MS=0` the install line ends in `poll=off` and the VESC line carries `| poll=off` instead of the `| ext:` section. The LED blinks at 1 Hz while VESC data is fresh and slowly otherwise. `OLED: refresh N ms (#N, screen N, stack free min N B)` per frame and `VESC poll: reply 42 B from id 74 in N ms: ...` per reply need `-DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG` in `build_flags` (debug lines of this project's own tags only; the IDF components stay at info).
 
+### Over-the-air update
+
+Every build with a button updates over Wi-Fi (`OTA_ENABLE`, on whenever `PIN_BUTTON` is set). The radio is only ever switched on for this, in a boot of its own:
+
+1. At rest, hold the button for 5 s (`OTA_LONG_PRESS_MS`; the long press at 1.5 s returns to MAIN on the way, keep holding). The board reboots into update mode: the LED blinks at 4 Hz and the OLED shows the FW UPDATE screen with the access point `VESC-DASH-OTA` (`OTA_AP_SSID`), an 8-digit passphrase that is new every time, and `http://192.168.4.1`.
+2. Join that network from a phone or laptop, open the address and pick the `firmware.bin` of the env you run (`.pio/build/<env>/firmware.bin`, copied to the phone beforehand).
+3. Flash firmware. The screen counts `RX 612K/1105K` with the percentage in the title bar, the page shows a progress bar. The image goes into the other app slot, is verified (checksum, SHA-256, chip) and selected, and the board reboots into it.
+4. The new image runs on probation and is confirmed after `OTA_CONFIRM_MS` (60 s) with every task heartbeat fresh, in a dead-man build also with the beacon scan running (`ota: new image confirmed after 60 s with every task alive: rollback cancelled`). A panic, a watchdog reset **or a power cycle** before that boots the previous image again (bootloader rollback), so leave it powered for a minute after an update.
+
+Update mode starts nothing but the display, the button and the Wi-Fi: no VESC link, no GNSS, no trip, no BLE. In a dead-man build **the cut is held** (ADC2 low) from the first milliseconds of the update-mode boot until the reboot out of it, because nothing watches the tags. It ends with a long press (refused while an image is being written), after `OTA_IDLE_TIMEOUT_MS` (5 min) without an upload in progress (the countdown is on the last row), or with the reboot after a successful upload. A power cycle always comes up normally: the request crosses the reboot in RTC memory, is honoured only after a software reset, and only once.
+
+The hold is refused, with the reason on screen for 3 s, while fresh VESC data shows the motor turning (more than `OTA_MAX_RPM`, 100 rpm), a fresh and accurate GNSS fix shows more than `OTA_MAX_SPEED_MM_S` (500 mm/s, about 1 kn), the dead-man alarm is up (the reboot out of update mode would clear a trip without the tag), the running image is still on probation, or the partition table has no second slot. Stale data counts as stationary, so a VESC that is switched off at the dock does not block an update.
+
+Rejected uploads leave the running image untouched and show `UPLOAD FAILED` with the reason: a file that does not start with the image magic (`not a firmware image`), an image of another ESP-IDF project (`not vesc-dashboard fw`, by the project name in its app descriptor), one for the other chip or a truncated one (`image failed checks`), one larger than the slot. Two builds of this project for the same chip look alike, though: a `dfrobot_firebeetle2_esp32c6` image flashed onto a dead-man boat removes the dead-man. Pick the env deliberately.
+
+The first OTA-capable firmware needs one wired flash: the partition table (two 1.94 MB app slots, no filesystem) and the rollback-enabled bootloader only arrive with `pio run -e <env> -t upload` over USB. A wired upload also writes an empty otadata, so it always boots the wired image from app0, whatever the last update selected.
+
+A session in the log (numbers vary):
+
+```
+W (61210) oled: display: 5000 ms hold -> update mode requested
+W (61211) ota: entering update mode: rebooting
+...
+I (1515) ota: running app0 at 0x010000 (1984 KB slot), image undefined, version 8ea95aa, 2 app slots, hold 5000 ms for update mode
+W (1516) main: *** UPDATE MODE: no VESC link, GNSS or BLE, motor cut held; waiting for a firmware upload ***
+I (2610) ota: access point up
+W (2650) ota: update mode: join "VESC-DASH-OTA" with passphrase 48213907, then open http://192.168.4.1
+I (31200) ota: phone joined (aid 1)
+W (45400) ota: receiving 1105 KB into app1
+W (45420) ota: image is 1a2b3c4 (built Nov  7 2026 18:02:11), running 8ea95aa
+W (61800) ota: wrote 1105 KB to app1, rebooting into it
+...
+I (1515) ota: running app1 at 0x200000 (1984 KB slot), image pending-verify, version 1a2b3c4, 2 app slots, hold 5000 ms for update mode
+W (1516) ota: new image on probation: confirmed after 60 s with every task alive; a reset before that rolls back
+W (60100) ota: new image confirmed after 60 s with every task alive: rollback cancelled
+```
+
 ### Troubleshooting
 
 | Symptom | Check |
@@ -687,7 +734,12 @@ An M9/M10 receiver logs `GNSS: PROTVER 34.10 -> VALSET configuration`, `GNSS: sw
 | `GNSS: baud switch to 115200 failed (no reply to 2 MON-VER polls at the new rate, attempt 1/2); redetecting from 9600, redetect #1`, later `GNSS: baud switch to 115200 failed (2 attempts without a reply at the new rate), staying at 9600` | the receiver refused or ignored the new baud (a clone without CFG-PRT / CFG-UART1-BAUDRATE support, or a wiring fault that only shows at 115200): it is configured at the detected baud and works, only slower (5 Hz NAV-PVT is half a 9600 line; do not combine with `GNSS_RATE_MS 100`). A single `attempt 1/2` line followed by `GNSS: UART1 switched to 115200 baud (found there by autobaud after an unconfirmed switch)` is harmless: the switch worked and only its proof was lost. `-DGNSS_TARGET_BAUD=0` disables the switch |
 | EFFICIENCY screen all `--` | trip task not running: the boot log must show `trip: task started (...)` and a `TRIP ...` line every 5 s without a ` (stale ...)` suffix. Only `now --`: fewer than 3 s in the window, less than `EFF_MIN_DIST_M` covered in the last 10 s, speed below `EFF_MIN_SPEED_MM_S`, speed cell `--`, or a gap in the window (CAN or GNSS dropout, VESC reboot). `now --` and `avg --` with a fix and the motor running: not yet `EFF_MIN_DIST_M` of trip distance, or the boat stays below ~1 kn |
 | `NO RADIO` on the dead-man row in a `deadman` build, `started: ... ble=0` | NimBLE init failed: see the `ble:` error lines at boot (`nvs_flash_init`, `nimble_port_init`, task create). `ble=1` but `NO RADIO` later: the log shows `watchdog scan will not start` or `host reset`; the `ble` task retries every 100 ms |
-| `firmware.bin` grew by about 300 KB | expected for the dead-man envs (NimBLE host and controller); it still fits the 1.25 MB OTA slot |
+| `firmware.bin` grew by about 300 KB | expected for the dead-man envs (NimBLE host and controller); Wi-Fi and the update server add more to every build with a button. Everything fits the 1.94 MB app slot |
+| `UPDATE REFUSED` after the 5 s hold | the second row says why: stop the motor or the boat (fresh data above `OTA_MAX_RPM` / `OTA_MAX_SPEED_MM_S`), clear the dead-man alarm first, wait a minute after an update (the new image is not confirmed yet), or `no spare app slot` = the board still has an old partition table: flash once by USB |
+| FW UPDATE shows `AP NOT UP - CHECK PWR`, log `*** the access point did NOT come up ...` | the Wi-Fi start draws the largest current peak on the board: a weak USB port or supply. Better supply, or a lower `OTA_AP_TX_POWER_QDBM` (34 = 8.5 dBm) |
+| The phone does not list `VESC-DASH-OTA`, or keeps leaving it | 2.4 GHz channel 1 only; the AP admits one client at a time; many phones abandon a network without internet: tell it to stay connected, or switch mobile data off for the upload |
+| `UPLOAD FAILED` with `not a firmware image` / `not vesc-dashboard fw` / `image failed checks` | wrong file: upload `firmware.bin` (not `bootloader.bin`, `partitions.bin` or the `.elf`) of this project, built for this board's chip; nothing was changed on the board |
+| The previous version is back after an update (banner `ota: running app0 ... image valid` instead of the new one) | the new image did not survive `OTA_CONFIRM_MS` (a panic or watchdog reset, see `reset=`), or the power was cut before it was confirmed: the bootloader rolled back. Leave it powered for a minute after an update |
 | `fatal error: u8g2.h: No such file or directory` | the submodule is empty: `git submodule update --init` |
 | `#error This firmware targets the ESP32-C6 (ESP-IDF)` | the board or platform in `platformio.ini` was changed, `sdkconfig.defaults` lost `CONFIG_IDF_TARGET`, or the wrong env is selected |
 | A change in `sdkconfig.defaults`, `sdkconfig.defaults.ble` or `sdkconfig.defaults.esp32s3` has no effect | the generated `sdkconfig.<env>` (`sdkconfig.dfrobot_firebeetle2_esp32c6`, `sdkconfig.deadman`, ...) already exists, and a value in it wins over the defaults: delete it and rebuild |
@@ -741,6 +793,7 @@ Notes: the OLED layout is hard-coded for 128x64 in `OLED_ROTATION` 0 or 2. `OLED
 - Displayed and logged power is signed: `v_in x current_in`, negative while regenerating (the water drives the motor); VESC Tool's realtime power stat is an absolute value, so the two can differ in sign, not in magnitude. The cells are EMA-smoothed (`CAN_EMA_ALPHA`) and may be up to `VESC_STALE_R1_MS` old; a fault shows on the VESC 1/3 page only after the next poll (up to `VESC_POLL_MS` later) and only as long as the VESC keeps it or via the latch. With `DEADMAN_ENABLE` 0 (the default) this is a dashboard, not a protection device: rely on the VESC's own limits and a BMS for that. `DEADMAN_ENABLE` 1 adds one GPIO that asserts a kill the VESC already knows how to act on; it still cannot command the motor, change a limit or write a setting.
 - OLED modules are specified for roughly -40..70 C (vendor dependent; some 1.54" boards only -20..60 C), but the glass, the FPC and the boost converter must stay dry: condensation on a boat needs an enclosure or conformal coating. In direct sun a ~110 cd/m2 OLED is hard to read; a sunshade helps more than contrast.
 - Burn-in is the OLED's wear mechanism: a dashboard that shows the same numbers for hours is the worst case. Keep `OLED_IDLE_DIM_MS` enabled and expect the panel to lose brightness over thousands of hours; the detail screens' inverted title bar is the only filled area, and a long press (or `SCREEN_AUTO_RETURN_MS`, off by default) brings the sparse main screen back.
+- Over-the-air update (section 7) is the only time the board transmits over a radio: a WPA2 access point (fresh 8-digit passphrase per session, one client, 13 dBm) and a plain-HTTP upload page, for at most `OTA_IDLE_TIMEOUT_MS` without an upload. It runs in a boot of its own with nothing else of the firmware: no CAN node (the VESC sees no ACK from the board, exactly as with the dashboard switched off), no UART poll, no BLE, and in a dead-man build the cut held for the whole time. Anyone within Wi-Fi range who can read the OLED can flash firmware during that window; nobody else can. It is refused while the motor turns or the boat moves.
 - A hung task reboots the board after `WDT_TIMEOUT_MS` (20 s); the next banner reports `reset=TASK_WDT`. The OLED keeps its last image until the firmware pulses RES about 1.5 s into the reboot, then shows the boot frame.
 - Apart from the CAN transceiver everything is 3.3 V. Nothing on the header tolerates 5 V, and neither does an OLED module whose pull-ups would then sit at 5 V, nor a button wired to anything but GND or 3V3.
 
@@ -748,7 +801,6 @@ Notes: the OLED layout is hard-coded for 128x64 in `OLED_ROTATION` 0 or 2. `OLED
 
 - `CAN_PACKET_PING` / `PONG` discovery so polling can start on a VESC that broadcasts no status frames without pinning `VESC_CAN_ID`, and answering pings so the board shows up in VESC Tool's CAN scan.
 - Burn-in mitigation beyond dimming: `DISPLAYOFF` (0xAE) after a long idle, or shifting the layout by a pixel every few minutes.
-- OTA updates (`partitions.csv` already has two app slots).
 - Deep sleep and the LP-UART for the GNSS receiver.
 - Persisting the trip (distance, energy) across reboots and logging a track; today the trip restarts at every boot and nothing is written to flash.
-- `CONFIG_TWAI_ISR_IN_IRAM` (with `IRAM_ATTR` on the callbacks in `src/can_vesc.cpp`) if flash writes (trip persistence, OTA) are ever added, so CAN reception continues while the flash cache is disabled.
+- `CONFIG_TWAI_ISR_IN_IRAM` (with `IRAM_ATTR` on the callbacks in `src/can_vesc.cpp`) if regular flash writes (trip persistence) are ever added, so CAN reception continues while the flash cache is disabled. Today the only flash write in normal operation is the one otadata sector that confirms a new image, once, a minute after an update (a few CAN frames may be dropped then); the upload itself happens in update mode, where no CAN node exists.

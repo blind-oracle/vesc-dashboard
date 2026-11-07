@@ -148,7 +148,38 @@ struct DisplayStats
   bool init_ok; // controller answered at init
   uint8_t screen;                // currently shown screen index (0 = main)
   uint32_t button_presses;       // debounced presses seen
+  uint8_t ota_refused;           // OtaRefusal of the last refused update-mode hold (0 = none)
+  uint32_t ota_refused_ms;       // when it was refused (0 = never): the refusal shows for OTA_REFUSED_SHOW_MS
 };
+
+#if OTA_ENABLE
+// ---------------------------------------------------------------- firmware update (update mode)
+// Written by src/ota.cpp (its HTTP handler, the Wi-Fi event handler and ota_tick()) while the
+// board is in update mode; read by the FW UPDATE screen and the supervisor's log line. All
+// zero (OTA_PHASE_OFF) in normal operation.
+enum OtaPhase : uint8_t {
+  OTA_PHASE_OFF = 0,    // normal operation
+  OTA_PHASE_STARTING,   // update mode: bringing up Wi-Fi
+  OTA_PHASE_WAITING,    // access point started (or failed to: ap_up), no upload in progress
+  OTA_PHASE_RECEIVING,  // an upload is being written to the spare slot
+  OTA_PHASE_DONE,       // written, verified and selected for boot: rebooting into it
+  OTA_PHASE_FAILED,     // the last upload was rejected (detail says why); another one may follow
+};
+
+struct OtaStatus {
+  uint8_t phase;              // OtaPhase
+  bool ap_up;                 // WIFI_EVENT_AP_START seen, no AP_STOP since
+  uint8_t stations;           // phones joined right now (the AP admits one)
+  char ssid[20];              // OTA_AP_SSID
+  char pass[9];               // this session's 8-digit WPA2 passphrase
+  char ip[16];                // "192.168.4.1"
+  char run_ver[18];           // version of the running image (esp_app_desc, i.e. git describe)
+  char new_ver[18];           // version of the image being received ("" until its header arrived)
+  char detail[24];            // why the last upload failed
+  uint32_t received, total;   // bytes of the upload in progress (or the last one)
+  uint32_t idle_deadline_ms;  // update mode reboots to normal at this state_now_ms() unless an upload runs
+};
+#endif
 
 #if DEADMAN_UI_ENABLE
 // ---------------------------------------------------------------- dead-man's switch
@@ -211,6 +242,9 @@ struct SharedState
   TripState trip;
 #if DEADMAN_UI_ENABLE
   DeadmanState deadman;
+#endif
+#if OTA_ENABLE
+  OtaStatus ota;
 #endif
   DisplayStats disp;
   uint32_t lock_failures; // state_lock() timeouts (should stay 0)

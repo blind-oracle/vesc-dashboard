@@ -238,6 +238,50 @@
 #endif
 
 // ============================================================================
+// Over-the-air firmware update (src/ota.cpp, README section 7)
+// ============================================================================
+// Holding the button for OTA_LONG_PRESS_MS reboots into UPDATE MODE: the dashboard brings up
+// its own WPA2 access point (a fresh 8-digit passphrase per session, shown on the OLED), serves
+// an upload page at http://192.168.4.1 and writes the posted .bin to the spare app slot. Update
+// mode starts nothing but the OLED, the button and the Wi-Fi: no VESC link, no GNSS, no BLE, and
+// in a dead-man build the cut is HELD for its whole duration (nothing watches the tags then).
+// It is refused while the motor turns, the boat moves or the dead-man alarm is up.
+#ifndef OTA_ENABLE
+#if PIN_BUTTON >= 0
+#define OTA_ENABLE 1 // the hold is the only way in, so no button = no OTA
+#else
+#define OTA_ENABLE 0
+#endif
+#endif
+#ifndef OTA_LONG_PRESS_MS
+#define OTA_LONG_PRESS_MS 5000 // hold time; the long press (BUTTON_LONG_PRESS_MS) of the same hold fires first
+#endif
+#ifndef OTA_AP_SSID
+#define OTA_AP_SSID "VESC-DASH-OTA" // access point name (<= 18 chars: it shares an OLED row with "AP ")
+#endif
+#ifndef OTA_AP_TX_POWER_QDBM
+#define OTA_AP_TX_POWER_QDBM 52 // 0.25 dBm units, 8..84; the driver quantises (52 = 13 dBm). Wi-Fi at full power is the
+                                // largest current peak on the board, and a phone at the boat needs little margin
+#endif
+#ifndef OTA_IDLE_TIMEOUT_MS
+#define OTA_IDLE_TIMEOUT_MS 300000 // update mode reboots back to normal after this long without an upload in progress
+#endif
+#ifndef OTA_CONFIRM_MS
+#define OTA_CONFIRM_MS 60000 // a freshly flashed image is on probation: it is marked valid once it has run this long with
+                             // every task heartbeat fresh. A panic, a watchdog reset or a power cycle before that boots
+                             // the previous image again (bootloader rollback)
+#endif
+#ifndef OTA_MAX_RPM
+#define OTA_MAX_RPM 100 // update mode is refused while fresh VESC data shows more than this (mechanical rpm)
+#endif
+#ifndef OTA_MAX_SPEED_MM_S
+#define OTA_MAX_SPEED_MM_S 500 // ... or a fresh, accurate GNSS fix shows more than this (500 mm/s = ~1 kn)
+#endif
+#ifndef OTA_REFUSED_SHOW_MS
+#define OTA_REFUSED_SHOW_MS 3000 // how long the "UPDATE REFUSED" screen stays up after a refused hold
+#endif
+
+// ============================================================================
 // Trip / efficiency (src/trip.cpp, EFFICIENCY screen)
 // ============================================================================
 // Distance = GNSS ground speed integrated while moving; energy = VESC watt-hour
@@ -694,6 +738,24 @@
 #if DEADMAN_ENABLE && TASK_PRIO_BLE >= TASK_PRIO_GNSS
 #error "TASK_PRIO_BLE must stay below the data producers (TASK_PRIO_GNSS / TASK_PRIO_CAN)"
 #endif
+#if OTA_ENABLE && PIN_BUTTON < 0
+#error "OTA_ENABLE needs a button: holding it is the only way into update mode"
+#endif
+#if OTA_ENABLE && OTA_LONG_PRESS_MS <= BUTTON_LONG_PRESS_MS
+#error "OTA_LONG_PRESS_MS must be longer than BUTTON_LONG_PRESS_MS (the same hold passes the long press first)"
+#endif
+#if OTA_ENABLE && (OTA_AP_TX_POWER_QDBM < 8 || OTA_AP_TX_POWER_QDBM > 84)
+#error "OTA_AP_TX_POWER_QDBM must be 8..84 (2..20 dBm in 0.25 dBm units)"
+#endif
+#if OTA_ENABLE && OTA_IDLE_TIMEOUT_MS < 30000
+#error "OTA_IDLE_TIMEOUT_MS must be >= 30 s: time to join the access point and pick a file"
+#endif
+// hbOk() counts a heartbeat that was never touched as fresh for its first max_age ms, so a
+// confirmation earlier than every HB_MAX_* would vouch for tasks that may never have started.
+#if OTA_ENABLE && (OTA_CONFIRM_MS <= HB_MAX_CAN_MS || OTA_CONFIRM_MS <= HB_MAX_GNSS_MS || OTA_CONFIRM_MS <= HB_MAX_DISP_MS || \
+                   OTA_CONFIRM_MS <= WDT_TIMEOUT_MS)
+#error "OTA_CONFIRM_MS must exceed every HB_MAX_*_MS and WDT_TIMEOUT_MS, else a broken image can be confirmed"
+#endif
 
 #ifndef UNIT_TEST // native host tests only; every firmware build must pass this check
 #include "sdkconfig.h"
@@ -778,5 +840,8 @@ namespace cfg_check
   static_assert(allDistinct(), "Two peripherals share a GPIO in config.h");
   static_assert(noUsbPins(), "BOARD_USB_DM/DP (FireBeetle: GPIO12/13, S3-Zero: GPIO19/20) are the USB pins (Serial console); do not use them");
   static_assert(noReservedPins(), "a pin in use belongs to the board's flash / PSRAM (S3-Zero: GPIO26..37)");
+#if OTA_ENABLE
+  static_assert(sizeof(OTA_AP_SSID) >= 2 && sizeof(OTA_AP_SSID) <= 19, "OTA_AP_SSID must be 1..18 characters");
+#endif
 } // namespace cfg_check
 #endif

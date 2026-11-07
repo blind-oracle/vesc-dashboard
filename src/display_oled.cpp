@@ -5,7 +5,8 @@
 // VESC 2/3, VESC 3/3, GNSS, SYS. A short press of PIN_BUTTON shows the next screen
 // (wrapping), a long press (>= BUTTON_LONG_PRESS_MS) returns to MAIN, and so does
 // SCREEN_AUTO_RETURN_MS without a press when that timer is enabled (it is 0 = off by
-// default). PIN_BUTTON -1 compiles no button code at all.
+// default). Holding on to OTA_LONG_PRESS_MS asks for update mode (src/ota.cpp); in update
+// mode a long press leaves it. PIN_BUTTON -1 compiles no button code at all.
 //
 // Loop / refresh policy:
 //   * The task loop runs every OLED_BUTTON_POLL_MS (20 ms): it samples the
@@ -62,6 +63,7 @@
 
 #include "deadman.h"
 #include "display_strings_oled.h"
+#include "ota.h"
 #include "shared_state.h"
 #include "u8g2_hal_idf.h"
 
@@ -235,19 +237,21 @@ static void draw_frame(const OledFrame &f) {
 
 // ---------------------------------------------------------------- button
 #if PIN_BUTTON >= 0
-enum class ButtonEvent : uint8_t { None, Short, Long };
+enum class ButtonEvent : uint8_t { None, Short, Long, VeryLong };
 
 // Polled push button: the raw level must be stable for BUTTON_DEBOUNCE_MS before
 // it is accepted (time based, so the poll jitter of a frame push is harmless),
 // then the debounced level is edge-detected. Long fires ONCE while the button
 // is still held (at BUTTON_LONG_PRESS_MS) and the release after it produces no
-// Short. All stamps are state_now_ms(); the differences are unsigned (wrap-safe).
+// Short; VeryLong fires once more if the same hold reaches OTA_LONG_PRESS_MS.
+// All stamps are state_now_ms(); the differences are unsigned (wrap-safe).
 struct Button {
   bool raw_last = false;     // last raw sample (true = pressed)
   uint32_t raw_since = 0;    // time of the last raw change
   bool pressed = false;      // debounced level
   uint32_t pressed_at = 0;   // debounced press time
   bool long_fired = false;
+  bool very_long_fired = false;
   uint32_t presses = 0;      // debounced presses (-> DisplayStats.button_presses)
 
   ButtonEvent update(bool raw_pressed, uint32_t now) {
@@ -260,6 +264,7 @@ struct Button {
       if (pressed) {
         pressed_at = now;
         long_fired = false;
+        very_long_fired = false;
         ++presses;
       } else if (!long_fired) {
         ev = ButtonEvent::Short;  // release after a short press
@@ -269,6 +274,12 @@ struct Button {
       long_fired = true;
       ev = ButtonEvent::Long;  // fires while still held
     }
+#if OTA_ENABLE
+    else if (pressed && long_fired && !very_long_fired && (uint32_t)(now - pressed_at) >= (uint32_t)OTA_LONG_PRESS_MS) {
+      very_long_fired = true;
+      ev = ButtonEvent::VeryLong;  // the same hold, still held (OTA_LONG_PRESS_MS > BUTTON_LONG_PRESS_MS)
+    }
+#endif
     return ev;
   }
 };
@@ -532,6 +543,25 @@ static bool poll_button(DispCtx &c, uint32_t now) {
     c.st.last_change_ms = now;
     restore_contrast(c, "button");
     if (ev == ButtonEvent::Short) changed = set_screen(c, (uint8_t)((c.screen + 1u) % SCREEN_COUNT), "short press");
+#if OTA_ENABLE
+    // The rest of a hold whose long press (1.5 s in) already went back to MAIN or asked the
+    // dead-man for a reset. In update mode it means nothing more. Accepted, this does not
+    // return (the board reboots); refused, the reason takes the panel for OTA_REFUSED_SHOW_MS.
+    else if (ev == ButtonEvent::VeryLong) {
+      if (!ota_update_mode_active()) {
+        ESP_LOGW(TAG, "display: %u ms hold -> update mode requested", (unsigned)OTA_LONG_PRESS_MS);
+        c.st.ota_refused = (uint8_t)ota_request_update_mode();
+        c.st.ota_refused_ms = now ? now : 1u;
+        changed = true;  // render the refusal at once
+      }
+    }
+    // In update mode the long press leaves it (ota_tick() refuses while an image is written).
+    // Keyed off the mode, not the overlay, so it works with no panel attached as well.
+    else if (ota_update_mode_active()) {
+      ESP_LOGW(TAG, "display: long press in update mode -> exit requested");
+      ota_request_cancel();
+    }
+#endif
 #if DEADMAN_UI_ENABLE
     // While the dead-man alarm owns the panel a long press means "clear the latch", not
     // "back to MAIN": the alarm is the only thing on screen, so the gesture is unambiguous,

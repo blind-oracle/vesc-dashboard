@@ -7,6 +7,10 @@
 // telemetry / GNSS / trip / system log lines. It never touches the peripherals.
 // Every task this firmware starts runs on TASK_CORE_APP, the main task included (on the
 // dual-core S3 that is core 1, via CONFIG_ESP_MAIN_TASK_AFFINITY); the radio has core 0.
+//
+// A boot asked for by the long button hold (src/ota.cpp) is UPDATE MODE instead: only the
+// display task and the Wi-Fi upload server run, the dead-man's cut is held, and a smaller
+// supervisor (loopUpdateMode) feeds the watchdog on the display heartbeat alone.
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
@@ -20,6 +24,7 @@
 #include "shared_state.h"
 #include "ble_scan.h"
 #include "deadman.h"
+#include "ota.h"
 #include "status_led.h"
 #include "trip.h"
 
@@ -28,7 +33,7 @@ static const char *TAG = "main";
 // Log tags of this project. Their runtime level is raised to the compile-time level of the
 // project sources (LOG_LOCAL_LEVEL; platformio.ini may set -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG),
 // so the debug lines can be switched on without touching the IDF components' own tags.
-static const char *const kLogTags[] = {"main", "can", "vesc", "gnss", "oled", "trip", "ble", "dm"};
+static const char *const kLogTags[] = {"main", "can", "vesc", "gnss", "oled", "trip", "ble", "dm", "ota"};
 
 [[maybe_unused]] static const char *resetReasonStr(esp_reset_reason_t r)
 { // log-only
@@ -77,13 +82,16 @@ static void logConfig()
            SPEED_UNIT_STR, GNSS_RX_BUFFER);
 }
 
-static void setup()
+// Returns true in update mode.
+static bool setup()
 {
   // FIRST, before any delay: put the dead-man's cut line into its boot state. Until this
   // runs the pin is a floating input, so the motor is governed purely by the mechanical
   // kill switch - which is the correct fail-passive behaviour, but the window should be
-  // milliseconds, not the SERIAL_BOOT_DELAY_MS below.
-  deadman_gpio_early_init();
+  // milliseconds, not the SERIAL_BOOT_DELAY_MS below. Update mode holds the cut instead:
+  // nothing watches the tags while it runs. Reading the request is one RTC RAM word.
+  const bool updateMode = ota_boot_is_update_mode();
+  deadman_gpio_early_init(updateMode);
 
   // The console is the USB-Serial/JTAG port (sdkconfig): nothing to open, and its output is
   // dropped rather than blocked while no host is attached. The delay gives a host time to
@@ -97,7 +105,12 @@ static void setup()
   ESP_LOGI(TAG, "vesc-dashboard %s (built %s %s) board=%s cores=%d app=%d radio=%d reset=%s", FW_VERSION, __DATE__,
            __TIME__, BOARD_NAME, CONFIG_FREERTOS_NUMBER_OF_CORES, TASK_CORE_APP, TASK_CORE_RADIO,
            resetReasonStr(esp_reset_reason()));
-  logConfig();
+  ota_log_boot_state();
+  if (updateMode)
+    ESP_LOGW(TAG, "*** UPDATE MODE: no VESC link, GNSS or BLE%s; waiting for a firmware upload ***",
+             DEADMAN_ENABLE ? ", motor cut held" : "");
+  else
+    logConfig();
 
   state_init();
 
@@ -118,6 +131,20 @@ static void setup()
   if (err != ESP_OK)
     ESP_LOGE(TAG, "task WDT add failed: %s", esp_err_to_name(err));
 
+  if (updateMode)
+  {
+    // The display first, so the FW UPDATE screen (fed by g_state.ota) shows the start-up.
+    [[maybe_unused]] const bool dispOk = display_start();
+    if (!ota_update_mode_start())
+    {
+      ESP_LOGE(TAG, "update mode could not start: rebooting to normal operation");
+      vTaskDelay(pdMS_TO_TICKS(150));
+      esp_restart();
+    }
+    ESP_LOGI(TAG, "started: display=%d ota=1 heap=%lu", dispOk, (unsigned long)esp_get_free_heap_size());
+    return true;
+  }
+
   // BLE first: the first controller enable may store the PHY calibration blob in NVS, and the TWAI
   // ISR is not cache-safe, so the CAN node must not exist yet while that flash write happens.
   [[maybe_unused]] const bool bleOk = ble_scan_start();
@@ -130,6 +157,7 @@ static void setup()
   [[maybe_unused]] const bool tripOk = trip_start();
   ESP_LOGI(TAG, "started: can=%d gnss=%d display=%d trip=%d ble=%d deadman=%d", canOk, gnssOk, dispOk, tripOk, bleOk,
            (int)(DEADMAN_ENABLE ? dmOk : 0));
+  return false;
 }
 
 // A heartbeat that was never touched counts as fresh during the first max_age ms
@@ -169,7 +197,8 @@ static void loop()
 #else
   const bool dmAlive = true;
 #endif
-  if (canAlive && gnssAlive && dispAlive && dmAlive)
+  const bool allAlive = canAlive && gnssAlive && dispAlive && dmAlive;
+  if (allAlive)
   {
     esp_task_wdt_reset();
   }
@@ -180,6 +209,11 @@ static void loop()
              (unsigned long)age_ms(hb_can, now), (unsigned long)age_ms(hb_gnss, now),
              (unsigned long)age_ms(hb_disp, now), (unsigned long)WDT_TIMEOUT_MS);
   }
+
+  // A freshly updated image is on probation until it has run OTA_CONFIRM_MS with every task
+  // alive - in a dead-man build with the beacon scan running too, since an image whose radio
+  // never comes up must not become the one a reset falls back to.
+  ota_confirm_if_healthy(allAlive && (!DEADMAN_ENABLE || ble_scan_active()), now);
 
   // ---- LED: 1 Hz blink when VESC data is fresh, 0.2 Hz otherwise (a WS2812 also turns red) ----
   const bool vescFresh = vesc_fresh(&s.vesc.t, VESC_IDX_STATUS_1, now, VESC_STALE_R1_MS) ||
@@ -237,9 +271,62 @@ static void loop()
   vTaskDelay(pdMS_TO_TICKS(100));
 }
 
+// Update mode: the display task and the upload server are the only things running, so the
+// watchdog is fed on the display heartbeat alone (the CAN / GNSS / dead-man heartbeats never
+// start and would reboot the board after HB_MAX_*_MS). ota_tick() ends the mode on a button
+// exit or after OTA_IDLE_TIMEOUT_MS; a finished upload reboots from the server task.
+static void loopUpdateMode()
+{
+  static uint32_t nextLog = 0, nextBlink = 0, nextStaleLog = 0;
+  static bool led = false;
+
+  const SharedState s = state_snapshot();
+  const uint32_t now = state_now_ms();
+
+  if (hbOk(hb_disp, now, HB_MAX_DISP_MS))
+    esp_task_wdt_reset();
+  else if ((int32_t)(now - nextStaleLog) >= 0)
+  {
+    nextStaleLog = now + 1000;
+    ESP_LOGE(TAG, "heartbeat stale: disp=%lu ms (reboot in <= %lu ms)", (unsigned long)age_ms(hb_disp, now),
+             (unsigned long)WDT_TIMEOUT_MS);
+  }
+
+  ota_tick(now);
+
+  // ---- LED: 4 Hz blink, unmistakable for either normal-mode rate ----
+  if ((int32_t)(now - nextBlink) >= 0)
+  {
+    nextBlink = now + 125;
+    led = !led;
+    status_led_set(led, true);
+  }
+
+#if OTA_ENABLE
+  if (LOG_SYS_MS && (int32_t)(now - nextLog) >= 0)
+  {
+    nextLog = now + LOG_SYS_MS;
+    ESP_LOGI(TAG, "OTA up=%lus phase=%s ap=%d sta=%u rx=%lu/%lu heap=%lu minheap=%lu lockfail=%lu",
+             (unsigned long)(now / 1000), ota_phase_name(s.ota.phase), s.ota.ap_up, (unsigned)s.ota.stations,
+             (unsigned long)s.ota.received, (unsigned long)s.ota.total, (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)esp_get_minimum_free_heap_size(), (unsigned long)s.lock_failures);
+  }
+#else
+  (void)s;
+  (void)nextLog;
+#endif
+
+  vTaskDelay(pdMS_TO_TICKS(100));
+}
+
 extern "C" void app_main()
 {
-  setup();
+  const bool updateMode = setup();
   for (;;)
-    loop();
+  {
+    if (updateMode)
+      loopUpdateMode();
+    else
+      loop();
+  }
 }
