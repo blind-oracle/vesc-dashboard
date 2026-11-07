@@ -13,6 +13,7 @@
 #include <stdint.h>
 
 #include "config.h"
+#include "vesc_mcconf.h"
 #include "vesc_status.h"
 
 // ---------------------------------------------------------------- VESC / CAN
@@ -181,6 +182,60 @@ struct OtaStatus {
 };
 #endif
 
+#if PUMP_ENABLE
+// ---------------------------------------------------------------- coolant pump
+// The VESC's temperature limits as the link task (canTask / vescUartTask, the only writer)
+// last read them with COMM_GET_MCCONF (include/vesc_mcconf.h). The pump task uses them only
+// with result == MCCONF_OK and falls back to the PUMP_DEFAULT_* values otherwise.
+struct VescLimitsState {
+  VescTempLimits lim;  // valid with result == MCCONF_OK
+  uint8_t result;      // VescMcconfResult of the last reply (MCCONF_NONE = never answered)
+  uint32_t sig;        // MCCONF_SIGNATURE of the last reply (0 = none)
+  char fw[8];          // firmware label of a known layout ("6.06"), "" otherwise
+  uint32_t t_ms;       // when the last reply arrived (0 = never)
+  uint32_t requests;   // COMM_GET_MCCONF requests sent
+};
+
+// Written by the pump task (src/pump.cpp); read by the PUMP screen and the log. The decision
+// logic is pure and lives in include/pump_logic.h.
+enum PumpMode : uint8_t {
+  PUMP_MODE_OFF = 0,  // stopped: no VESC temperatures since boot, or cool, still and the after-run over
+  PUMP_MODE_RUN,      // closed loop, PUMP_MIN_DUTY_PCT..100 %
+  PUMP_MODE_FULL,     // a temperature reached the VESC's derating start: 100 %
+  PUMP_MODE_BLIND,    // temperatures were seen, then went stale (or none reads plausibly): PUMP_BLIND_DUTY_PCT
+  PUMP_MODE_FORCED,   // PUMP_FORCE_DUTY_PCT (commissioning)
+  PUMP_MODE_FAULT,    // the PWM output could not be set up: the pin floats, the hardware runs the pump flat out
+};
+
+// Why the pump is in its mode (log line and screen).
+enum PumpWhy : uint8_t {
+  PUMP_WHY_NONE = 0,
+  PUMP_WHY_NO_DATA,    // OFF: no VESC temperatures since boot (VESC off at the dock)
+  PUMP_WHY_COOL,       // OFF: cool, motor still, after-run over
+  PUMP_WHY_WARM,       // RUN: a temperature is within PUMP_ON_BAND_C of its target, or above it
+  PUMP_WHY_TURNING,    // RUN: the motor turns
+  PUMP_WHY_AFTER_RUN,  // RUN: neither, but the after-run / hysteresis keeps it going
+  PUMP_WHY_DERATE,     // FULL: at or above the VESC's derating start
+  PUMP_WHY_STALE,      // BLIND: the temperatures stopped arriving
+  PUMP_WHY_NO_SENSOR,  // BLIND: fresh data, but neither temperature is plausible
+  PUMP_WHY_FORCED,     // FORCED
+  PUMP_WHY_PWM,        // FAULT
+};
+
+struct PumpStatus {
+  uint8_t mode;                  // PumpMode
+  uint8_t why;                   // PumpWhy
+  bool limits_vesc;              // targets from the VESC's limits (false = the PUMP_DEFAULT_* values)
+  bool have_err;                 // err_c is meaningful (fresh, plausible temperatures)
+  float duty_pct;                // commanded duty, 0..100
+  float err_c;                   // max over the plausible sensors of (temperature - target), C
+  float integ;                   // integral term, % duty
+  float tgt_mot, tgt_fet;        // targets, C
+  float derate_mot, derate_fet;  // where the VESC starts cutting acceleration current, C
+  uint32_t t_ms;                 // last pump task tick (0 = never)
+};
+#endif  // PUMP_ENABLE
+
 #if DEADMAN_UI_ENABLE
 // ---------------------------------------------------------------- dead-man's switch
 // Written by deadmanTask (src/deadman.cpp) from the beacon timestamps the BLE host
@@ -246,6 +301,10 @@ struct SharedState
 #if OTA_ENABLE
   OtaStatus ota;
 #endif
+#if PUMP_ENABLE
+  VescLimitsState vesc_limits;
+  PumpStatus pump;
+#endif
   DisplayStats disp;
   uint32_t lock_failures; // state_lock() timeouts (should stay 0)
 };
@@ -271,6 +330,9 @@ extern volatile uint32_t hb_disp;
 extern volatile uint32_t hb_ble;   // ble task, dead-man builds (logged and checked by the dead-man; never gates the watchdog)
 #if DEADMAN_ENABLE
 extern volatile uint32_t hb_deadman;  // deadmanTask: safety-relevant, so it ALWAYS gates the watchdog (HB_MAX_DEADMAN_MS)
+#endif
+#if PUMP_ENABLE
+extern volatile uint32_t hb_pump;  // pumpTask (HB_MAX_PUMP_MS)
 #endif
 
 // Milliseconds since boot (32-bit, wraps like millis() did); esp_timer underneath, so headers stay framework-free.

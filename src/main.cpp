@@ -9,8 +9,9 @@
 // dual-core S3 that is core 1, via CONFIG_ESP_MAIN_TASK_AFFINITY); the radio has core 0.
 //
 // A boot asked for by the long button hold (src/ota.cpp) is UPDATE MODE instead: only the
-// display task and the Wi-Fi upload server run, the dead-man's cut is held, and a smaller
-// supervisor (loopUpdateMode) feeds the watchdog on the display heartbeat alone.
+// display task and the Wi-Fi upload server run, the dead-man's cut is held, the coolant pump
+// is held stopped, and a smaller supervisor (loopUpdateMode) feeds the watchdog on the display
+// heartbeat alone.
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_task_wdt.h>
@@ -25,6 +26,7 @@
 #include "ble_scan.h"
 #include "deadman.h"
 #include "ota.h"
+#include "pump.h"
 #include "status_led.h"
 #include "trip.h"
 
@@ -33,7 +35,7 @@ static const char *TAG = "main";
 // Log tags of this project. Their runtime level is raised to the compile-time level of the
 // project sources (LOG_LOCAL_LEVEL; platformio.ini may set -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG),
 // so the debug lines can be switched on without touching the IDF components' own tags.
-static const char *const kLogTags[] = {"main", "can", "vesc", "gnss", "oled", "trip", "ble", "dm", "ota"};
+static const char *const kLogTags[] = {"main", "can", "vesc", "gnss", "oled", "trip", "ble", "dm", "ota", "pump"};
 
 [[maybe_unused]] static const char *resetReasonStr(esp_reset_reason_t r)
 { // log-only
@@ -92,6 +94,9 @@ static bool setup()
   // nothing watches the tags while it runs. Reading the request is one RTC RAM word.
   const bool updateMode = ota_boot_is_update_mode();
   deadman_gpio_early_init(updateMode);
+  // The pump pin floats until here, which the MOSFET stage turns into full speed: stop it
+  // until the pump task decides (update mode never starts that task, so it stays stopped).
+  pump_gpio_early_init();
 
   // The console is the USB-Serial/JTAG port (sdkconfig): nothing to open, and its output is
   // dropped rather than blocked while no host is attached. The delay gives a host time to
@@ -107,8 +112,8 @@ static bool setup()
            resetReasonStr(esp_reset_reason()));
   ota_log_boot_state();
   if (updateMode)
-    ESP_LOGW(TAG, "*** UPDATE MODE: no VESC link, GNSS or BLE%s; waiting for a firmware upload ***",
-             DEADMAN_ENABLE ? ", motor cut held" : "");
+    ESP_LOGW(TAG, "*** UPDATE MODE: no VESC link, GNSS or BLE%s%s; waiting for a firmware upload ***",
+             DEADMAN_ENABLE ? ", motor cut held" : "", PUMP_ENABLE ? ", pump stopped" : "");
   else
     logConfig();
 
@@ -153,10 +158,11 @@ static bool setup()
   [[maybe_unused]] const bool dmOk = deadman_start();
   [[maybe_unused]] const bool canOk = can_vesc_start(); // log-only
   [[maybe_unused]] const bool gnssOk = gnss_start();
+  [[maybe_unused]] const bool pumpOk = pump_start();
   [[maybe_unused]] const bool dispOk = display_start();
   [[maybe_unused]] const bool tripOk = trip_start();
-  ESP_LOGI(TAG, "started: can=%d gnss=%d display=%d trip=%d ble=%d deadman=%d", canOk, gnssOk, dispOk, tripOk, bleOk,
-           (int)(DEADMAN_ENABLE ? dmOk : 0));
+  ESP_LOGI(TAG, "started: can=%d gnss=%d display=%d trip=%d ble=%d deadman=%d pump=%d", canOk, gnssOk, dispOk, tripOk,
+           bleOk, (int)(DEADMAN_ENABLE ? dmOk : 0), (int)(PUMP_ENABLE ? pumpOk : 0));
   return false;
 }
 
@@ -175,8 +181,8 @@ static bool hbOk(uint32_t hb, uint32_t now, uint32_t max_age)
 
 static void loop()
 {
-  static uint32_t nextVescLog = 0, nextGnssLog = 0, nextTripLog = 0, nextDmLog = 0, nextSysLog = 0, nextStaleLog = 0,
-                  nextBlink = 0;
+  static uint32_t nextVescLog = 0, nextGnssLog = 0, nextTripLog = 0, nextDmLog = 0, nextPumpLog = 0, nextSysLog = 0,
+                  nextStaleLog = 0, nextBlink = 0;
   static bool led = false;
 
   // Snapshot BEFORE reading the clock: every timestamp inside s must be <= now,
@@ -197,7 +203,13 @@ static void loop()
 #else
   const bool dmAlive = true;
 #endif
-  const bool allAlive = canAlive && gnssAlive && dispAlive && dmAlive;
+#if PUMP_ENABLE
+  // A hung pump task freezes the duty wherever it was; the reboot releases the pin (full speed).
+  const bool pumpAlive = hbOk(hb_pump, now, HB_MAX_PUMP_MS);
+#else
+  const bool pumpAlive = true;
+#endif
+  const bool allAlive = canAlive && gnssAlive && dispAlive && dmAlive && pumpAlive;
   if (allAlive)
   {
     esp_task_wdt_reset();
@@ -205,9 +217,10 @@ static void loop()
   else if ((int32_t)(now - nextStaleLog) >= 0)
   {
     nextStaleLog = now + 1000;
-    ESP_LOGE(TAG, "heartbeat stale: can=%lu ms gnss=%lu ms disp=%lu ms (reboot in <= %lu ms)",
+    ESP_LOGE(TAG, "heartbeat stale: can=%lu ms gnss=%lu ms disp=%lu ms%s%s (reboot in <= %lu ms)",
              (unsigned long)age_ms(hb_can, now), (unsigned long)age_ms(hb_gnss, now),
-             (unsigned long)age_ms(hb_disp, now), (unsigned long)WDT_TIMEOUT_MS);
+             (unsigned long)age_ms(hb_disp, now), dmAlive ? "" : " deadman STALE", pumpAlive ? "" : " pump STALE",
+             (unsigned long)WDT_TIMEOUT_MS);
   }
 
   // A freshly updated image is on probation until it has run OTA_CONFIRM_MS with every task
@@ -249,6 +262,13 @@ static void loop()
   {
     nextDmLog = now + LOG_DEADMAN_MS;
     deadman_log_summary(s, now);
+  }
+  // Same split for the pump (no-ops without PUMP_ENABLE).
+  pump_log_events(s, now);
+  if (LOG_PUMP_MS && PUMP_ENABLE && (int32_t)(now - nextPumpLog) >= 0)
+  {
+    nextPumpLog = now + LOG_PUMP_MS;
+    pump_log_summary(s, now);
   }
   if (LOG_SYS_MS && (int32_t)(now - nextSysLog) >= 0)
   {

@@ -66,6 +66,9 @@
 #ifndef LED_WS2812
 #define LED_WS2812 1
 #endif
+#ifndef PIN_PUMP_PWM
+#define PIN_PUMP_PWM 6 // GP6 (front edge, next to GP5) -> the coolant pump's transistor stage; -1 = no pump
+#endif
 #ifndef VESC_UART_PORT
 #define VESC_UART_PORT 2 // UART2: UART0 and its TX/RX pads (43/44, where the ROM prints its boot log) stay untouched
 #endif
@@ -131,7 +134,8 @@
 #define CAN_LISTEN_ONLY 0
 #endif
 #ifndef CAN_RX_QUEUE_LEN
-#define CAN_RX_QUEUE_LEN 64 // RX queue between the TWAI ISR and canTask (frames). 6 status frames arrive as a burst every 20 ms.
+#define CAN_RX_QUEUE_LEN 128 // RX queue between the TWAI ISR and canTask (frames). 6 status frames arrive as a burst every 20 ms;
+                             // the pump's COMM_GET_MCCONF reply is ~76 frames in ~25 ms (16 B each, 2 KB in all)
 #endif
 #ifndef VESC_CAN_ID
 #define VESC_CAN_ID -1 // -1 = accept any VESC id and lock onto the first one seen; 0..254 = only this id (VESC Tool "VESC ID")
@@ -162,7 +166,8 @@
 // temperatures, id/iq, vd/vq and the absolute tachometer are only available by
 // asking the VESC (CAN_PACKET_PROCESS_SHORT_BUFFER carrying COMM_GET_VALUES_SELECTIVE,
 // answered as FILL_RX_BUFFER/PROCESS_RX_BUFFER frames). This is the ONLY place the
-// firmware transmits on the bus. Set VESC_POLL_MS 0 for a strictly passive (ACK-only) node.
+// firmware transmits on the bus; the coolant pump's COMM_GET_MCCONF (just as read-only) borrows
+// one of its slots now and then. Set VESC_POLL_MS 0 for a strictly passive (ACK-only) node.
 #ifndef VESC_POLL_MS
 #if VESC_LINK_UART
 #define VESC_POLL_MS 100 // UART: the poll is the ONLY data source (79-byte reply, ~7 ms at 115200), so 10 Hz; must be > 0
@@ -193,8 +198,8 @@
 // HP UART VESC_UART_PORT (board block: UART0 on the C6, UART2 on the S3-Zero; UART1 is the
 // GNSS, the console is USB-Serial/JTAG) on the two pins the CAN transceiver used. 3.3 V logic on both sides, no transceiver, 1 kOhm in series in
 // each line. On the VESC: the COMM-header UART, which only runs while App to Use includes
-// UART ("ADC and UART", "PPM and UART" or "UART"). The only thing ever sent is the 6-byte
-// read-only COMM_GET_VALUES request.
+// UART ("ADC and UART", "PPM and UART" or "UART"). The only things ever sent are the 6-byte
+// read-only COMM_GET_VALUES request and, for the coolant pump, the 6-byte COMM_GET_MCCONF.
 #ifndef PIN_VESC_UART_TX
 #define PIN_VESC_UART_TX 3 // GPIO3 -> 1k -> VESC RX (COMM header; PB11 on the 75_300)
 #endif
@@ -375,6 +380,111 @@
 #endif
 #ifndef DEADMAN_CONFIRM_MS
 #define DEADMAN_CONFIRM_MS 3500 // ... within this long, else state FAULT (wiring, series resistor, or the VESC lost its ADC2 kill-switch config)
+#endif
+
+// ============================================================================
+// Coolant pump (Kamoer KDLP1200-B12-T, PWM speed input; src/pump.cpp, README section 7)
+// ============================================================================
+// A PID loop on the VESC's motor and MOSFET temperatures sets the pump's speed. Its targets
+// follow the VESC's own temperature limits, read with COMM_GET_MCCONF (include/vesc_mcconf.h)
+// at every link-up: the VESC starts cutting acceleration current - for a boat all forward
+// thrust - at start - accel_dec * (start - 25), 76 C with the defaults 85/100/0.15, and the
+// pump aims PUMP_TARGET_MARGIN_C below that. The pump's PWM wire wants a 5 V signal, so
+// PIN_PUMP_PWM drives a logic-level N-MOSFET (or an NPN such as BC337) that pulls the wire,
+// pulled up to 5 V, low (README section 2). That inverts (PUMP_PWM_INVERT) and makes a dead,
+// resetting or hung dashboard run the pump at FULL speed. No VESC data since boot: stopped. Data that stops
+// after it was seen: PUMP_BLIND_DUTY_PCT. Motor turning: at least PUMP_MIN_DUTY_PCT. OTA update
+// mode holds the pump stopped (nothing heats up while the motor cannot be driven).
+#ifndef PIN_PUMP_PWM
+#define PIN_PUMP_PWM 18 // silkscreen "18": gate/base of the pump's transistor stage (README section 2). -1 = no pump at all
+#endif
+#ifndef PUMP_ENABLE
+#if PIN_PUMP_PWM >= 0
+#define PUMP_ENABLE 1 // pump task, PUMP screen and the COMM_GET_MCCONF read
+#else
+#define PUMP_ENABLE 0
+#endif
+#endif
+#ifndef PUMP_PWM_FREQ_HZ
+#define PUMP_PWM_FREQ_HZ 25000 // Kamoer: 10..30 kHz (25 kHz is also above hearing)
+#endif
+#ifndef PUMP_PWM_INVERT
+#define PUMP_PWM_INVERT 1 // 1 = the N-MOSFET / NPN stage (GPIO high pulls the PWM wire low = slower); 0 = a non-inverting 5 V buffer
+#endif
+#ifndef PUMP_PWM_RES_BITS
+#define PUMP_PWM_RES_BITS 10 // LEDC duty resolution, 8..11 (frequency x 2^bits must fit the 80 MHz timer clock)
+#endif
+#ifndef PUMP_MIN_DUTY_PCT
+#define PUMP_MIN_DUTY_PCT 20 // lowest running duty. Kamoer: 0..10 % = stopped, 11..100 % = speed range (measure yours)
+#endif
+#ifndef PUMP_BLIND_DUTY_PCT
+#define PUMP_BLIND_DUTY_PCT 100 // temperatures seen, then lost (link down, VESC off): the motor may still be working hard
+#endif
+#ifndef PUMP_FORCE_DUTY_PCT
+#define PUMP_FORCE_DUTY_PCT -1 // commissioning: 0..100 fixes the duty and bypasses the loop (find the dead band); -1 = normal
+#endif
+#ifndef PUMP_PERIOD_MS
+#define PUMP_PERIOD_MS 500 // control loop period
+#endif
+#ifndef PUMP_KP
+#define PUMP_KP 8.0f // proportional gain: % duty per degC above target
+#endif
+#ifndef PUMP_KI
+#define PUMP_KI 0.1f // integral gain: % duty per degC per second (1 C over target for 100 s adds 10 %)
+#endif
+#ifndef PUMP_KD
+#define PUMP_KD 0.0f // derivative gain: % duty per degC/s of rising error. 0 = PI: the readings move slowly in 0.1 C steps
+#endif
+#ifndef PUMP_D_ALPHA
+#define PUMP_D_ALPHA 0.2f // low-pass on the derivative, (0, 1]; only matters with PUMP_KD > 0
+#endif
+#ifndef PUMP_TARGET_MARGIN_C
+#define PUMP_TARGET_MARGIN_C 10 // target = the VESC's derating start minus this (66 C with the VESC defaults)
+#endif
+#ifndef PUMP_ON_BAND_C
+#define PUMP_ON_BAND_C 15 // a stopped pump starts once a temperature is within this of its target (51 C) ...
+#endif
+#ifndef PUMP_HYST_C
+#define PUMP_HYST_C 5 // ... and stops again only below target - band - this (46 C), motor still, after-run over
+#endif
+#ifndef PUMP_MIN_RUN_MS
+#define PUMP_MIN_RUN_MS 60000 // after-run: keeps going this long after the motor last turned / it was last warm.
+                              // Fewer starts: Kamoer warns that frequent start/stop wears the pump
+#endif
+#ifndef PUMP_TURNING_RPM
+#define PUMP_TURNING_RPM 100 // fresh mechanical rpm above this = the motor turns = at least PUMP_MIN_DUTY_PCT
+#endif
+#ifndef PUMP_LIMITS_FROM_VESC
+#define PUMP_LIMITS_FROM_VESC 1 // 1 = read the limits with COMM_GET_MCCONF (needs the poll); 0 = always the defaults below
+#endif
+// Used until (and unless) the VESC answers: the VESC's own factory defaults.
+#ifndef PUMP_DEFAULT_TEMP_FET_START
+#define PUMP_DEFAULT_TEMP_FET_START 85.0f // l_temp_fet_start, C
+#endif
+#ifndef PUMP_DEFAULT_TEMP_FET_END
+#define PUMP_DEFAULT_TEMP_FET_END 100.0f // l_temp_fet_end, C
+#endif
+#ifndef PUMP_DEFAULT_TEMP_MOTOR_START
+#define PUMP_DEFAULT_TEMP_MOTOR_START 85.0f // l_temp_motor_start, C
+#endif
+#ifndef PUMP_DEFAULT_TEMP_MOTOR_END
+#define PUMP_DEFAULT_TEMP_MOTOR_END 100.0f // l_temp_motor_end, C
+#endif
+#ifndef PUMP_DEFAULT_TEMP_ACCEL_DEC
+#define PUMP_DEFAULT_TEMP_ACCEL_DEC 0.15f // l_temp_accel_dec, 0..1
+#endif
+#ifndef VESC_MCCONF_TIMEOUT_MS
+#if VESC_LINK_UART
+#define VESC_MCCONF_TIMEOUT_MS 300 // the ~480-byte reply takes ~42 ms at 115200 baud, plus the VESC's own time
+#else
+#define VESC_MCCONF_TIMEOUT_MS 500 // ~76 frames, ~25 ms at 500 kbit/s
+#endif
+#endif
+#ifndef VESC_MCCONF_RETRY_MS
+#define VESC_MCCONF_RETRY_MS 10000 // after a lost or broken reply
+#endif
+#ifndef VESC_MCCONF_REFRESH_MS
+#define VESC_MCCONF_REFRESH_MS 600000 // re-read while connected, so limits changed in VESC Tool arrive; 0 = only at link-up
 #endif
 
 // ============================================================================
@@ -641,6 +751,19 @@
 #ifndef BLE_TASK_STACK
 #define BLE_TASK_STACK 4096 // bytes
 #endif
+#ifndef TASK_PRIO_PUMP
+#define TASK_PRIO_PUMP 3 // pump task: next to tripTask, below the data producers (a few comparisons every PUMP_PERIOD_MS)
+#endif
+#ifndef PUMP_TASK_STACK
+#define PUMP_TASK_STACK 3072 // bytes; the task never logs (the supervisor does)
+#endif
+#ifndef HB_MAX_PUMP_MS
+#define HB_MAX_PUMP_MS 5000 // supervisor: a pump heartbeat older than this stops the WDT feed -> reboot (the floating pin
+                            // runs the pump at full speed meanwhile)
+#endif
+#ifndef LOG_PUMP_MS
+#define LOG_PUMP_MS 5000 // period of the PUMP log line (0 = off)
+#endif
 
 // ============================================================================
 // Derived values (do not edit)
@@ -667,6 +790,8 @@
 // leaves slot 2 inert (ble_addr_parse zeroes its output, and an all-zero address never matches a
 // real advert), so a single-tag boat behaves exactly as it did before the slot existed.
 #define DEADMAN_TAGS 2
+// The pump's targets come from COMM_GET_MCCONF only where a request can be sent at all.
+#define PUMP_READS_MCCONF (PUMP_ENABLE && PUMP_LIMITS_FROM_VESC && VESC_POLL_MS > 0 && !CAN_LISTEN_ONLY)
 
 // ============================================================================
 // Compile-time sanity checks
@@ -750,10 +875,43 @@
 #if OTA_ENABLE && OTA_IDLE_TIMEOUT_MS < 30000
 #error "OTA_IDLE_TIMEOUT_MS must be >= 30 s: time to join the access point and pick a file"
 #endif
+#if PUMP_ENABLE && PIN_PUMP_PWM < 0
+#error "PUMP_ENABLE needs PIN_PUMP_PWM (the gate of the pump's MOSFET stage)"
+#endif
+#if PUMP_ENABLE && BOARD_CUT_PIN_FORBIDDEN(PIN_PUMP_PWM)
+#error "PIN_PUMP_PWM must not be a strapping pin of this board (FireBeetle C6: 8/9/15; S3-Zero: 0/3/45/46): the MOSFET's gate pull-down holds it low through reset (GPIO8 low blocks the C6's download mode)"
+#endif
+#if PUMP_ENABLE && (PUMP_PWM_FREQ_HZ < 10000 || PUMP_PWM_FREQ_HZ > 30000)
+#error "PUMP_PWM_FREQ_HZ must be 10000..30000 (Kamoer's PWM input range)"
+#endif
+#if PUMP_ENABLE && (PUMP_PWM_RES_BITS < 8 || PUMP_PWM_RES_BITS > 11)
+#error "PUMP_PWM_RES_BITS must be 8..11: PUMP_PWM_FREQ_HZ x 2^bits must fit the 80 MHz LEDC timer clock"
+#endif
+#if PUMP_ENABLE && (PUMP_MIN_DUTY_PCT < 12 || PUMP_MIN_DUTY_PCT > 100)
+#error "PUMP_MIN_DUTY_PCT must be 12..100: the pump does not turn at 0..10 % duty"
+#endif
+#if PUMP_ENABLE && (PUMP_BLIND_DUTY_PCT < PUMP_MIN_DUTY_PCT || PUMP_BLIND_DUTY_PCT > 100)
+#error "PUMP_BLIND_DUTY_PCT must be PUMP_MIN_DUTY_PCT..100: the pump must actually run while blind"
+#endif
+#if PUMP_ENABLE && PUMP_FORCE_DUTY_PCT > 100
+#error "PUMP_FORCE_DUTY_PCT must be -1 (normal control) or 0..100"
+#endif
+#if PUMP_ENABLE && (PUMP_PERIOD_MS < 100 || PUMP_PERIOD_MS > 5000)
+#error "PUMP_PERIOD_MS must be 100..5000"
+#endif
+#if PUMP_ENABLE && HB_MAX_PUMP_MS <= 2 * PUMP_PERIOD_MS
+#error "HB_MAX_PUMP_MS must exceed two PUMP_PERIOD_MS, else one late tick reboots the board"
+#endif
+#if PUMP_ENABLE && (PUMP_TARGET_MARGIN_C < 0 || PUMP_ON_BAND_C <= 0 || PUMP_HYST_C < 0)
+#error "PUMP_TARGET_MARGIN_C and PUMP_HYST_C must be >= 0, PUMP_ON_BAND_C > 0"
+#endif
+#if PUMP_ENABLE && TASK_PRIO_PUMP >= TASK_PRIO_GNSS
+#error "TASK_PRIO_PUMP must stay below the data producers (TASK_PRIO_GNSS / TASK_PRIO_CAN)"
+#endif
 // hbOk() counts a heartbeat that was never touched as fresh for its first max_age ms, so a
 // confirmation earlier than every HB_MAX_* would vouch for tasks that may never have started.
 #if OTA_ENABLE && (OTA_CONFIRM_MS <= HB_MAX_CAN_MS || OTA_CONFIRM_MS <= HB_MAX_GNSS_MS || OTA_CONFIRM_MS <= HB_MAX_DISP_MS || \
-                   OTA_CONFIRM_MS <= WDT_TIMEOUT_MS)
+                   OTA_CONFIRM_MS <= WDT_TIMEOUT_MS || (PUMP_ENABLE && OTA_CONFIRM_MS <= HB_MAX_PUMP_MS))
 #error "OTA_CONFIRM_MS must exceed every HB_MAX_*_MS and WDT_TIMEOUT_MS, else a broken image can be confirmed"
 #endif
 
@@ -805,6 +963,9 @@ namespace cfg_check
 #endif
 #if DEADMAN_ENABLE && PIN_DEADMAN_CUT >= 0
       PIN_DEADMAN_CUT,
+#endif
+#if PUMP_ENABLE
+      PIN_PUMP_PWM,
 #endif
   };
 // PIN_OLED_RST is optional (-1); guard it separately.

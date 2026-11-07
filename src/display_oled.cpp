@@ -411,6 +411,33 @@ static SharedState demo_state(uint32_t now) {
   s.trip.energy_from_counters = true;
   s.trip.counter_resets = 0;
 
+#if PUMP_ENABLE
+  // Coolant pump: limits read from a 6.06 VESC; the synthetic temperatures stay well below
+  // their targets, so the loop holds the minimum flow while the motor turns.
+  {
+    VescLimitsState &vl = s.vesc_limits;
+    vl.lim = pump_default_limits();
+    vl.result = MCCONF_OK;
+    vl.sig = 0x2EFD0142u;
+    snprintf(vl.fw, sizeof vl.fw, "6.06");
+    vl.t_ms = stamp;
+    vl.requests = 1u + tsec / 600u;
+    const PumpTargets tg = pump_targets(vl.lim);
+    PumpStatus &p = s.pump;
+    p.mode = PUMP_MODE_RUN;
+    p.why = rpm > (float)PUMP_TURNING_RPM ? PUMP_WHY_TURNING : PUMP_WHY_AFTER_RUN;
+    p.duty_pct = (float)PUMP_MIN_DUTY_PCT;
+    p.limits_vesc = true;
+    p.have_err = true;
+    p.err_c = fmaxf(s.vesc.t.temp_motor - tg.tgt_mot, s.vesc.t.temp_fet - tg.tgt_fet);
+    p.tgt_mot = tg.tgt_mot;
+    p.tgt_fet = tg.tgt_fet;
+    p.derate_mot = tg.derate_mot;
+    p.derate_fet = tg.derate_fet;
+    p.t_ms = stamp;
+  }
+#endif
+
 
 #if DEADMAN_UI_ENABLE
   // Dead-man's switch: two tags aboard and enrolled, their RSSI wandering on slow

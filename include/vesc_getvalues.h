@@ -170,6 +170,14 @@ static inline size_t vesc_build_getvalues_request(uint8_t *out8, uint8_t own_id,
   return n;
 }
 
+// Same frame for a command without arguments (COMM_GET_MCCONF): [own_id, 0, cmd], DLC 3.
+static inline size_t vesc_build_short_request(uint8_t *out8, uint8_t own_id, uint8_t cmd) {
+  out8[0] = own_id;  // rx_buffer_last_id on the VESC: the reply is addressed to this id
+  out8[1] = 0;       // send = 0: process the command, answer over CAN with send = 1
+  out8[2] = cmd;
+  return 3;
+}
+
 // True for the four packet ids a reply to our request can arrive with (5..8).
 static inline bool vesc_is_getvalues_reply_pkt(uint32_t packet_id) {
   return packet_id >= VESC_CAN_PACKET_FILL_RX_BUFFER && packet_id <= VESC_CAN_PACKET_PROCESS_SHORT_BUFFER;

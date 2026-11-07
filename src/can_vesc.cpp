@@ -7,11 +7,13 @@
 //
 //  * Normal mode: the controller asserts the ACK bit. With VESC_POLL_MS == 0 no
 //    transmit call exists in the binary (strictly passive node); with VESC_POLL_MS > 0
-//    the ONLY frames this node ever transmits are the COMM_GET_VALUES_SELECTIVE
-//    requests built in poll_tick(). The ACK matters either way: the VESC's bxCAN has
-//    no automatic-retransmission limit, so with a non-ACKing listener as the only
-//    other node it goes error-passive and repeats ONE stale STATUS frame forever
-//    ("lonely VESC"). CAN_LISTEN_ONLY=1 (true listen-only, no ACK, no polling) is
+//    the ONLY frames this node ever transmits are the requests built in poll_tick():
+//    COMM_GET_VALUES_SELECTIVE, and - for the coolant pump's thresholds - a COMM_GET_MCCONF
+//    in one poll slot at link-up and every VESC_MCCONF_REFRESH_MS (both read-only).
+//    The ACK matters either way: the VESC's bxCAN has no automatic-retransmission
+//    limit, so with a non-ACKing listener as the only other node it goes
+//    error-passive and repeats ONE stale STATUS frame forever ("lonely VESC").
+//    CAN_LISTEN_ONLY=1 (true listen-only, no ACK, no polling) is
 //    only safe when another ACKing node exists on the bus.
 //
 //  * Polling is the mirror image of that trap: the node is configured single-shot
@@ -53,9 +55,11 @@
 #include <string.h>
 
 #include "config.h"
+#include "pump.h"
 #include "shared_state.h"
 #include "vesc_getvalues.h"
 #include "vesc_log_fmt.h"
+#include "vesc_mcconf.h"
 #include "vesc_status.h"
 
 static const char *TAG = "can";
@@ -175,6 +179,12 @@ static twai_frame_t s_tx_frame;
 static volatile bool s_tx_in_flight = false;      // set before twai_node_transmit(), cleared by on_tx_done
 // The fault latch itself (last non-zero code + time) lives in g_state.vesc_ext.last_fault / last_fault_ms
 // so that every consumer gets it with the snapshot; can_vesc_last_fault() is a convenience reader.
+static bool s_any_reply = false;                  // a GET_VALUES reply was stored since boot
+// The pump's COMM_GET_MCCONF read (include/vesc_mcconf.h). Dead code unless PUMP_READS_MCCONF.
+static constexpr bool kReadMcconf = PUMP_READS_MCCONF;
+static VescMcconfSched s_mc;
+static bool s_out_is_mc = false;                  // the outstanding request is COMM_GET_MCCONF, not GET_VALUES
+static uint32_t s_mc_to_log_ms = 0;
 #endif
 
 // state_now_ms() with 0 mapped to 1 so that 0 keeps meaning "never" in every timestamp field.
@@ -511,10 +521,20 @@ static void handle_events(uint32_t now) {
 // COMM_PRINT whose fragment got lost, a late reply after the timeout that already
 // counted): they must not push the poller into its slow period. Unsolicited packets
 // with other packet ids never get here.
+// Ends an outstanding COMM_GET_MCCONF that went unanswered or broken: the read scheduler
+// retries it, and it never counts towards the GET_VALUES back-off. False if the outstanding
+// request was a GET_VALUES poll.
+static bool end_mcconf_request(uint32_t now) {
+  if (!s_out_is_mc) return false;
+  s_out_is_mc = false;
+  mcconf_sched_on_timeout(s_mc, now);
+  return true;
+}
+
 static void reply_bad(uint32_t now, [[maybe_unused]] const char *why, [[maybe_unused]] unsigned len) {
   if (s_poll_outstanding) {
     s_poll_outstanding = false;
-    if (s_consec_fail != 0xFFFFFFFFu) s_consec_fail++;
+    if (!end_mcconf_request(now) && s_consec_fail != 0xFFFFFFFFu) s_consec_fail++;
   }
   if (state_lock()) {
     g_state.vesc_ext.replies_bad++;
@@ -571,7 +591,16 @@ static void handle_reply_frame(const CanFrame &m, uint32_t pkt, uint32_t now) {
   // commands_process_packet() on the VESC points its global send_func at the CAN reply
   // path, so after our first request every unsolicited packet (COMM_PRINT from
   // commands_printf / LispBM print, terminal output) travels the same way. Only the
-  // two GET_VALUES packet ids are ours; anything else is neither good nor bad.
+  // two GET_VALUES packet ids are ours, plus COMM_GET_MCCONF when the pump asked for it;
+  // anything else is neither good nor bad.
+  if (kReadMcconf && payload[0] == VESC_COMM_GET_MCCONF) {
+    if (s_out_is_mc) {  // the answer to the outstanding request (a late one only reschedules)
+      s_out_is_mc = false;
+      s_poll_outstanding = false;
+    }
+    mcconf_sched_on_result(s_mc, pump_mcconf_reply(payload, len, now), now);
+    return;
+  }
   if (!vesc_is_getvalues_payload(payload, len)) {
     ESP_LOGD(TAG, "VESC poll: unsolicited packet id %u (%u B) from id %u ignored", (unsigned)payload[0], (unsigned)len,
              (unsigned)m.data[0]);
@@ -606,8 +635,9 @@ static void handle_reply_frame(const CanFrame &m, uint32_t pkt, uint32_t now) {
              (unsigned)vesc_getvalues_expected_len(payload[0] == VESC_COMM_GET_VALUES ? 0u : mask), (unsigned long)mask);
   }
   [[maybe_unused]] const uint32_t latency = s_poll_outstanding ? (uint32_t)(now - s_poll_sent_ms) : 0u;
-  s_poll_outstanding = false;  // the reply did arrive, whatever happens to the store below
+  if (!s_out_is_mc) s_poll_outstanding = false;  // the reply did arrive (a late one leaves a COMM_GET_MCCONF in flight)
   s_consec_fail = 0;
+  s_any_reply = true;
   ext.t_ms = now ? now : 1u;
   ext.replies_ok++;
   if (ext.fault_code != 0) {  // latch: the VESC clears the live byte after its fault stop time
@@ -645,7 +675,18 @@ static void handle_reply_frame(const CanFrame &m, uint32_t pkt, uint32_t now) {
 // would answer and their fragments would interleave in one buffer): a target id must be
 // known, either pinned (VESC_CAN_ID) or locked from the status frames.
 static void poll_tick(uint32_t now) {
-  if (s_poll_outstanding && (uint32_t)(now - s_poll_sent_ms) >= VESC_POLL_TIMEOUT_MS) {
+  if (s_poll_outstanding && s_out_is_mc && (uint32_t)(now - s_poll_sent_ms) >= VESC_MCCONF_TIMEOUT_MS) {
+    end_mcconf_request(now);
+    s_poll_outstanding = false;
+    vesc_rx_reset(&s_rx);
+    if (due(now, s_mc_to_log_ms, VESC_POLL_LOG_MIN_MS)) {
+      s_mc_to_log_ms = now ? now : 1u;
+      ESP_LOGW(TAG, "VESC: no complete answer to COMM_GET_MCCONF within %d ms (rx queue overflow? rxmiss counts it); "
+                    "pump limits unchanged, retry in %d s",
+               VESC_MCCONF_TIMEOUT_MS, VESC_MCCONF_RETRY_MS / 1000);
+    }
+  }
+  if (s_poll_outstanding && !s_out_is_mc && (uint32_t)(now - s_poll_sent_ms) >= VESC_POLL_TIMEOUT_MS) {
     s_poll_outstanding = false;
     vesc_rx_reset(&s_rx);
     if (s_consec_fail != 0xFFFFFFFFu) s_consec_fail++;
@@ -678,7 +719,11 @@ static void poll_tick(uint32_t now) {
   if (target < 0 || cs != CAN_STATE_RUNNING) return;  // no VESC known yet / bus not usable: try again next period
   s_last_poll_ms = now ? now : 1u;
 
-  const uint8_t len = (uint8_t)vesc_build_getvalues_request(s_tx_buf, (uint8_t)CAN_OWN_ID, VESC_GETVALUES_MASK);
+  // The pump's limits read borrows this slot at link-up (the VESC answered the last poll) and
+  // every VESC_MCCONF_REFRESH_MS; the ~76-frame answer needs CAN_RX_QUEUE_LEN >= ~100.
+  const bool mc = kReadMcconf && mcconf_sched_due(s_mc, s_any_reply && s_consec_fail == 0, now);
+  const uint8_t len = mc ? (uint8_t)vesc_build_short_request(s_tx_buf, (uint8_t)CAN_OWN_ID, (uint8_t)VESC_COMM_GET_MCCONF)
+                         : (uint8_t)vesc_build_getvalues_request(s_tx_buf, (uint8_t)CAN_OWN_ID, VESC_GETVALUES_MASK);
   s_tx_frame = twai_frame_t{};
   s_tx_frame.header.id = VESC_GETVALUES_REQUEST_EID(target);
   s_tx_frame.header.ide = 1;  // the VESC only decodes 29-bit ids
@@ -703,7 +748,11 @@ static void poll_tick(uint32_t now) {
   s_poll_outstanding = true;
   s_poll_sent_ms = now ? now : 1u;
   vesc_rx_reset(&s_rx);
-  if (state_lock()) {
+  s_out_is_mc = mc;
+  if (mc) {
+    mcconf_sched_on_sent(s_mc);
+    pump_mcconf_sent();
+  } else if (state_lock()) {
     g_state.vesc_ext.polls_sent++;
     state_unlock();
   }

@@ -1,6 +1,6 @@
 // Pure, deterministic builders of everything shown on the 128x64 OLED: the main
 // dashboard (OledMain), the detail "grid" screens (OledGrid: efficiency, three
-// VESC pages, GNSS, SYS), the overlays (dead-man alarm, FW UPDATE, update refused),
+// VESC pages, the coolant pump, GNSS, SYS), the overlays (dead-man alarm, FW UPDATE, update refused),
 // the screen enum, the layout constants shared by the renderer and the host tests
 // and the UTC -> local clock arithmetic.
 // Fault-code names come from vesc_getvalues.h (the CAN codec's 34-entry
@@ -43,6 +43,9 @@
 #if OTA_ENABLE
 #include "ota_logic.h"  // the refusal wording of the update-mode hold
 #endif
+#if PUMP_ENABLE
+#include "pump_logic.h"  // pump_mode_str / pump_why_str / pump_limits
+#endif
 #include "vesc_getvalues.h"  // vesc_fault_fmt(): "OT_FET" / "F37" (<= 8 chars), Arduino-free
 #include "vesc_status.h"
 
@@ -63,6 +66,9 @@ enum OledScreen : uint8_t {
   SCREEN_VESC_A,    // "VESC 1/3": fault (live, or the last latched one with its age), live electrical values, temperatures, Ah/Wh
   SCREEN_VESC_B,    // "VESC 2/3": polled values (MOSFET 1 temp, avg input current, id/iq, vd/vq, tacho abs, status)
   SCREEN_VESC_C,    // "VESC 3/3": inputs (PPM/ADC/PID) and CAN / poll counters
+#if PUMP_ENABLE
+  SCREEN_PUMP,      // "PUMP": mode / duty / reason, temperatures against their targets, the VESC's limits, PID terms
+#endif
   SCREEN_GNSS,      // fix, position, accuracies, speed/heading, UTC date-time
   SCREEN_SYS,       // firmware, uptime, heap, CAN/GNSS driver state, button/lock counters
   SCREEN_COUNT
@@ -75,6 +81,9 @@ inline const char *oled_screen_name(uint8_t screen) {
     case SCREEN_VESC_A: return "VESC 1/3";
     case SCREEN_VESC_B: return "VESC 2/3";
     case SCREEN_VESC_C: return "VESC 3/3";
+#if PUMP_ENABLE
+    case SCREEN_PUMP: return "PUMP";
+#endif
     case SCREEN_GNSS: return "GNSS";
     case SCREEN_SYS: return "SYS";
     default: return "?";
@@ -403,9 +412,7 @@ inline void fmt_eff(char *buf, size_t n, float v, size_t max_chars) {
   fmt_num(buf, n, v, fabsf(v) < 99.95f ? 1 : 0, max_chars);
 }
 
-// Temperatures outside -40..200 C mean "no sensor" (a VESC without a motor NTC
-// reports a few hundred degrees or a large negative value).
-inline bool temp_plausible(float t) { return t >= -40.0f && t <= 200.0f; }
+inline bool temp_plausible(float t) { return vesc_temp_plausible(t); }
 
 // ---- freshness ----------------------------------------------------------------
 struct VescFresh {
@@ -1083,6 +1090,68 @@ inline void oled_build_eff(const SharedState &s, uint32_t now, OledGrid &g) {
 }
 
 
+#if PUMP_ENABLE
+// "PUMP" (every row <= 21 chars):
+//   RUN 62% warm            mode, commanded duty, reason ("--" while the pump task is silent)
+//   Tmot 58.3  tgt 66.0     motor temperature ("--" stale, "n/a" no sensor) and its target
+//   Tfet 41.0  tgt 66.0     MOSFET temperature and its target
+//   Lim M85/100 F85/100     the VESC's l_temp_motor/fet_start/end in use
+//   dec 0.15 VESC 6.06      l_temp_accel_dec and where the limits came from: the VESC (its
+//                           firmware), or DEF = PUMP_DEFAULT_* (wait / cfg / new FW / bad ...)
+//   err +7.7   int 12.0     the loop's error (C over target, max of both sensors) and I term
+inline void oled_build_pump(const SharedState &s, uint32_t now, OledGrid &g) {
+  using namespace oled_detail;
+  grid_begin(g, "PUMP", SCREEN_PUMP);
+  const PumpStatus &p = s.pump;
+  const VescFresh f = vesc_freshness(s, now);
+  const bool live = fresh(p.t_ms, now, HB_MAX_PUMP_MS);
+  char l[32], r[32], buf[40];
+
+  if (live) snprintf(buf, sizeof buf, "%s %.0f%% %s", pump_mode_str(p.mode), (double)p.duty_pct, pump_why_str(p.why));
+  else fmt_dashes(buf, sizeof buf);
+  row1(g.rows[0], buf);
+
+  const float temps[2] = {s.vesc.t.temp_motor, s.vesc.t.temp_fet};
+  const float tgts[2] = {p.tgt_mot, p.tgt_fet};
+  const char *const labels[2] = {"Tmot", "Tfet"};
+  for (int i = 0; i < 2; ++i) {
+    if (f.s4 && !temp_plausible(temps[i])) snprintf(l, sizeof l, "%s n/a", labels[i]);
+    else labeled(l, sizeof l, labels[i], f.s4, temps[i], 1, 5);
+    labeled(r, sizeof r, "tgt", p.t_ms != 0, tgts[i], 1, 5);
+    row2(g.rows[1 + i], l, r);
+  }
+
+  bool from_vesc = false;
+  const VescTempLimits lim = pump_limits(s.vesc_limits, &from_vesc);
+  snprintf(buf, sizeof buf, "Lim M%.0f/%.0f F%.0f/%.0f", (double)lim.mot_start, (double)lim.mot_end,
+           (double)lim.fet_start, (double)lim.fet_end);
+  row1(g.rows[3], buf);
+
+  char src[16];
+  if (from_vesc) {
+    copy_str(src, sizeof src, "VESC ");
+    append_str(src, sizeof src, s.vesc_limits.fw);
+  } else {
+    switch (s.vesc_limits.result) {
+      case MCCONF_NONE: copy_str(src, sizeof src, PUMP_READS_MCCONF ? "DEF wait" : "DEF cfg"); break;
+      case MCCONF_UNKNOWN_SIG: copy_str(src, sizeof src, "DEF new FW"); break;
+      case MCCONF_IMPLAUSIBLE: copy_str(src, sizeof src, "DEF bad lim"); break;
+      default: copy_str(src, sizeof src, "DEF bad rep"); break;
+    }
+  }
+  snprintf(buf, sizeof buf, "dec %.2f %s", (double)lim.accel_dec, src);
+  row1(g.rows[4], buf);
+
+  char num[8];
+  if (live && p.have_err) fmt_num(num, sizeof num, p.err_c, 1, 5);
+  else fmt_dashes(num, sizeof num);
+  copy_str(l, sizeof l, live && p.have_err && p.err_c > 0.0f ? "err +" : "err ");
+  append_str(l, sizeof l, num);
+  labeled(r, sizeof r, "int", live, p.integ, 1, 5);
+  row2(g.rows[5], l, r);
+}
+#endif  // PUMP_ENABLE
+
 // Builds the frame for `screen` (unknown indices fall back to the main screen).
 #if DEADMAN_UI_ENABLE
 // The dead-man alarm: shown INSTEAD of whatever page is selected, for as long as the
@@ -1300,6 +1369,9 @@ inline void oled_build_frame(const SharedState &s, uint32_t now, uint8_t screen,
     case SCREEN_VESC_A: oled_build_vesc_a(s, now, out.grid); break;
     case SCREEN_VESC_B: oled_build_vesc_b(s, now, out.grid); break;
     case SCREEN_VESC_C: oled_build_vesc_c(s, now, out.grid); break;
+#if PUMP_ENABLE
+    case SCREEN_PUMP: oled_build_pump(s, now, out.grid); break;
+#endif
     case SCREEN_GNSS: oled_build_gnss(s, now, out.grid); break;
     case SCREEN_SYS: oled_build_sys(s, now, info, out.grid); break;
     default: oled_build_main(s, now, out.main); break;

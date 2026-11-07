@@ -151,6 +151,10 @@ static inline float vesc_revolutions(const vesc_telemetry_t *t, int motor_poles)
 }
 static inline float vesc_wh_net(const vesc_telemetry_t *t) { return t->watt_hours - t->watt_hours_charged; }
 
+// Temperatures outside -40..200 C mean "no sensor": the motor NTC input floats when nothing
+// is wired, and the VESC then reports a few hundred degrees or a large negative value.
+static inline bool vesc_temp_plausible(float t) { return t >= -40.0f && t <= 200.0f; }
+
 // True if STATUS message idx (0..5) was received and is at most max_age_ms old.
 // Uses unsigned arithmetic so it is correct across the 49.7-day millis() wrap.
 static inline bool vesc_fresh(const vesc_telemetry_t *t, int idx, uint32_t now_ms, uint32_t max_age_ms) {

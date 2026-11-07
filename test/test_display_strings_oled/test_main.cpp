@@ -1,6 +1,6 @@
 // Unity tests (pio test -e native) for the pure OLED screen builders in
 // include/display_strings_oled.h: main screen cells, clock arithmetic, the grid
-// screens (efficiency, VESC 1-3, GNSS, SYS), the overlays (dead-man alarm, FW UPDATE,
+// screens (efficiency, VESC 1-3, PUMP, GNSS, SYS), the overlays (dead-man alarm, FW UPDATE,
 // update refused) with the update-mode entry gate (ota_logic.h), the live/latched fault row, freshness
 // rules, character budgets, determinism. Fault names come from vesc_getvalues.h
 // (checked here as used).
@@ -719,7 +719,13 @@ static void test_fmt_age_short() {
 }
 
 static void test_screen_names_and_count() {
+#if PUMP_ENABLE
+  TEST_ASSERT_EQUAL_INT(8, (int)SCREEN_COUNT);
+  TEST_ASSERT_EQUAL_INT(5, (int)SCREEN_PUMP);  // right after the VESC pages it belongs to
+  TEST_ASSERT_EQUAL_STRING("PUMP", oled_screen_name(SCREEN_PUMP));
+#else
   TEST_ASSERT_EQUAL_INT(7, (int)SCREEN_COUNT);
+#endif
   TEST_ASSERT_EQUAL_INT(0, (int)SCREEN_MAIN);
   TEST_ASSERT_EQUAL_INT(1, (int)SCREEN_EFF);  // right after MAIN: one short press from the dashboard
   TEST_ASSERT_EQUAL_INT(2, (int)SCREEN_VESC_A);
@@ -1748,6 +1754,127 @@ static void test_deadman_main_row() {
 
 #endif  // DEADMAN_UI_ENABLE
 
+#if PUMP_ENABLE
+// ---------------------------------------------------------------- PUMP screen
+// make_state() plus the pump task's view: RUN at 62 % on a warm motor (58.3 C against 66 C),
+// limits read from a 6.06 VESC (the defaults 85/100, accel_dec 0.15).
+static SharedState pump_state() {
+  SharedState s = make_state(NOW);
+  s.vesc.t.temp_motor = 58.3f;
+  s.vesc.t.temp_fet = 41.0f;
+  s.vesc_limits.result = MCCONF_OK;
+  s.vesc_limits.lim = pump_default_limits();
+  s.vesc_limits.sig = 0x2EFD0142u;
+  snprintf(s.vesc_limits.fw, sizeof s.vesc_limits.fw, "6.06");
+  s.vesc_limits.t_ms = NOW - 5000;
+  const PumpTargets tg = pump_targets(s.vesc_limits.lim);
+  s.pump.mode = PUMP_MODE_RUN;
+  s.pump.why = PUMP_WHY_WARM;
+  s.pump.duty_pct = 62.0f;
+  s.pump.limits_vesc = true;
+  s.pump.have_err = true;
+  s.pump.err_c = -7.7f;
+  s.pump.integ = 12.0f;
+  s.pump.tgt_mot = tg.tgt_mot;
+  s.pump.tgt_fet = tg.tgt_fet;
+  s.pump.derate_mot = tg.derate_mot;
+  s.pump.derate_fet = tg.derate_fet;
+  s.pump.t_ms = NOW - 200;
+  return s;
+}
+
+static void test_pump_rows() {
+  SharedState s = pump_state();
+  OledGrid g = build_grid(SCREEN_PUMP, s, NOW);
+  char pg[8];
+  TEST_ASSERT_EQUAL_STRING("PUMP", g.title);
+  TEST_ASSERT_EQUAL_STRING(expect_page(pg, sizeof pg, SCREEN_PUMP), g.page);
+  TEST_ASSERT_EQUAL_STRING("RUN 62% warm", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("Tmot 58.3  tgt 66.0", g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("Tfet 41.0  tgt 66.0", g.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("Lim M85/100 F85/100", g.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("dec 0.15 VESC 6.06", g.rows[4]);
+  TEST_ASSERT_EQUAL_STRING("err -7.7   int 12.0", g.rows[5]);
+  assert_grid_lengths(g);
+
+  // Over target: the sign is explicit.
+  s.pump.err_c = 12.34f;
+  s.pump.integ = 40.5f;
+  g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("err +12.3  int 40.5", g.rows[5]);
+
+  // Blind on a lost link, and the other modes' wording.
+  s.pump.mode = PUMP_MODE_BLIND;
+  s.pump.why = PUMP_WHY_NO_SENSOR;
+  s.pump.duty_pct = 100.0f;
+  g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("BLIND 100% no sensor", g.rows[0]);
+  assert_grid_lengths(g);
+  s.pump.mode = PUMP_MODE_OFF;
+  s.pump.why = PUMP_WHY_NO_DATA;
+  s.pump.duty_pct = 0.0f;
+  g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("OFF 0% no data", g.rows[0]);
+}
+
+static void test_pump_stale_and_missing() {
+  // No motor NTC, then no STATUS_4 at all: "n/a" and "--", never a stale number.
+  SharedState s = pump_state();
+  s.vesc.t.temp_motor = -273.0f;
+  OledGrid g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("Tmot n/a   tgt 66.0", g.rows[1]);
+  s.vesc.t.t_ms[VESC_IDX_STATUS_4] = NOW - VESC_STALE_R1_MS - 1;
+  g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("Tmot --    tgt 66.0", g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("Tfet --    tgt 66.0", g.rows[2]);
+
+  // The pump task went quiet: its own values turn to "--" (the limits stay: they are the link's).
+  s = pump_state();
+  s.pump.t_ms = NOW - HB_MAX_PUMP_MS - 1;
+  g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("--", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("err --     int --", g.rows[5]);
+  TEST_ASSERT_EQUAL_STRING("Lim M85/100 F85/100", g.rows[3]);
+  assert_grid_lengths(g);
+
+  // Fresh boot: nothing from the pump task or the VESC yet.
+  s = never_state();
+  g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("--", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("Tmot --    tgt --", g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("dec 0.15 DEF wait", g.rows[4]);
+  assert_grid_lengths(g);
+}
+
+static void test_pump_limit_sources() {
+  SharedState s = pump_state();
+  s.vesc_limits.result = MCCONF_UNKNOWN_SIG;  // a firmware this build does not know: the defaults
+  s.vesc_limits.lim.mot_start = 95.0f;        // whatever was stored before is not shown
+  OledGrid g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("dec 0.15 DEF new FW", g.rows[4]);
+  TEST_ASSERT_EQUAL_STRING("Lim M85/100 F85/100", g.rows[3]);
+  s.vesc_limits.result = MCCONF_IMPLAUSIBLE;
+  g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("dec 0.15 DEF bad lim", g.rows[4]);
+  s.vesc_limits.result = MCCONF_SHORT;
+  g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("dec 0.15 DEF bad rep", g.rows[4]);
+
+  // The longest firmware label and the widest limits still fit the row.
+  s.vesc_limits.result = MCCONF_OK;
+  snprintf(s.vesc_limits.fw, sizeof s.vesc_limits.fw, "6.00/02");
+  s.vesc_limits.lim.mot_start = 149.0f;
+  s.vesc_limits.lim.mot_end = 150.0f;
+  s.vesc_limits.lim.fet_start = 120.0f;
+  s.vesc_limits.lim.fet_end = 250.0f;
+  s.vesc_limits.lim.accel_dec = 1.0f;
+  g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("Lim M149/150 F120/250", g.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("dec 1.00 VESC 6.00/02", g.rows[4]);
+  assert_grid_lengths(g);
+}
+#endif  // PUMP_ENABLE
+
 static void test_boot_frame() {
   OledFrame f;
   memset(&f, 0x55, sizeof f);
@@ -2081,6 +2208,11 @@ int main(int, char **) {
   RUN_TEST(test_ota_entry_check);
   RUN_TEST(test_ota_overlay_phases);
   RUN_TEST(test_ota_refused_overlay);
+#endif
+#if PUMP_ENABLE
+  RUN_TEST(test_pump_rows);
+  RUN_TEST(test_pump_stale_and_missing);
+  RUN_TEST(test_pump_limit_sources);
 #endif
   RUN_TEST(test_boot_frame);
   RUN_TEST(test_layout_geometry);

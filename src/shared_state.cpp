@@ -15,6 +15,9 @@ volatile uint32_t hb_ble = 0;
 #if DEADMAN_ENABLE
 volatile uint32_t hb_deadman = 0;
 #endif
+#if PUMP_ENABLE
+volatile uint32_t hb_pump = 0;
+#endif
 
 static SemaphoreHandle_t s_mutex = nullptr;
 static SharedState s_last_snapshot{};

@@ -12,9 +12,11 @@
 //    it. S3-Zero: UART2, which leaves UART0 and its ROM boot-log pads alone. Either way
 //    it is routed to the CAN transceiver's old pins.
 //
-//  * The only bytes ever transmitted are the 6-byte COMM_GET_VALUES request. It is
-//    read-only and does not reset the VESC's control timeout, so the dashboard can
-//    never keep a motor alive. One request is in flight at a time.
+//  * The only bytes ever transmitted are the 6-byte COMM_GET_VALUES request and, for the
+//    coolant pump's thresholds (PUMP_READS_MCCONF), a 6-byte COMM_GET_MCCONF in one poll
+//    slot at link-up and every VESC_MCCONF_REFRESH_MS. Both are read-only and neither resets
+//    the VESC's control timeout, so the dashboard can never keep a motor alive. One request
+//    is in flight at a time.
 //
 //  * Replies are reassembled from whatever uart_read_bytes() returns (vesc_uart_rx_*).
 //    A read that returns nothing for VESC_UART_RX_WAIT_MS means the line is idle: a
@@ -44,9 +46,11 @@
 #include <stdio.h>
 
 #include "config.h"
+#include "pump.h"
 #include "shared_state.h"
 #include "vesc_getvalues.h"
 #include "vesc_log_fmt.h"
+#include "vesc_mcconf.h"
 #include "vesc_uart.h"
 
 static const char *TAG = "vesc";
@@ -83,6 +87,13 @@ static uint32_t s_seen_junk = 0, s_seen_bad = 0;              // s_rx counters a
 static uint32_t s_to_pending = 0, s_to_log_ms = 0;            // reply timeouts
 static uint32_t s_bad_pending = 0, s_bad_log_ms = 0;          // bad frames / unknown layouts
 static uint32_t s_tx_err_pending = 0, s_tx_err_log_ms = 0;    // uart_write_bytes() failed
+// The pump's COMM_GET_MCCONF read (include/vesc_mcconf.h). Dead code unless PUMP_READS_MCCONF.
+static constexpr bool kReadMcconf = PUMP_READS_MCCONF;
+static uint8_t s_req_mc[VESC_UART_CMD_REQUEST_LEN];
+static size_t s_req_mc_len = 0;
+static VescMcconfSched s_mc;
+static bool s_out_is_mc = false;              // the outstanding request is COMM_GET_MCCONF, not GET_VALUES
+static uint32_t s_mc_to_log_ms = 0;
 
 // state_now_ms() with 0 mapped to 1 so that 0 keeps meaning "never" in every timestamp field.
 static inline uint32_t now_nonzero() {
@@ -169,10 +180,20 @@ static bool uart_install() {
 // n unusable replies (stop byte / CRC mismatch, or a GET_VALUES layout the decoder
 // rejects): count them, warn rate-limited and - only while a request is actually
 // outstanding - end that request and count the failure towards the back-off.
+// Ends an outstanding COMM_GET_MCCONF that went unanswered or broken: the read scheduler
+// retries it, and it never counts towards the GET_VALUES back-off. False if the outstanding
+// request was a GET_VALUES poll.
+static bool end_mcconf_request(uint32_t now) {
+  if (!s_out_is_mc) return false;
+  s_out_is_mc = false;
+  mcconf_sched_on_timeout(s_mc, now);
+  return true;
+}
+
 static void reply_bad(uint32_t now, uint32_t n, [[maybe_unused]] const char *why) {
   if (s_poll_outstanding) {
     s_poll_outstanding = false;
-    if (s_consec_fail != 0xFFFFFFFFu) s_consec_fail++;
+    if (!end_mcconf_request(now) && s_consec_fail != 0xFFFFFFFFu) s_consec_fail++;
   }
   if (state_lock()) {
     g_state.vesc_ext.replies_bad += n;
@@ -188,6 +209,15 @@ static void reply_bad(uint32_t now, uint32_t n, [[maybe_unused]] const char *why
 }
 
 static void handle_packet(const uint8_t *payload, uint16_t len, uint32_t now) {
+  if (kReadMcconf && len >= 1 && payload[0] == VESC_COMM_GET_MCCONF) {
+    if (s_out_is_mc) {  // the answer to the outstanding request (a late one only reschedules)
+      s_out_is_mc = false;
+      s_poll_outstanding = false;
+    }
+    mcconf_sched_on_result(s_mc, pump_mcconf_reply(payload, len, now), now);
+    return;
+  }
+
   VescState v;
   VescExt x;
   if (!state_lock()) return;  // lock timeout (counted by state_lock): the next reply is VESC_POLL_MS away
@@ -215,7 +245,7 @@ static void handle_packet(const uint8_t *payload, uint16_t len, uint32_t now) {
   }
   [[maybe_unused]] const uint32_t latency = s_poll_outstanding ? (uint32_t)(now - s_poll_sent_ms) : 0u;
   const uint32_t fails = s_consec_fail;
-  s_poll_outstanding = false;  // the reply did arrive, whatever happens to the store below
+  if (!s_out_is_mc) s_poll_outstanding = false;  // the reply did arrive (a late one leaves a COMM_GET_MCCONF in flight)
   s_consec_fail = 0;
 
   // Store first, then log the fault edge against the value actually stored: a lock
@@ -266,7 +296,16 @@ static void publish_rx_errors(uint32_t now) {
 // Called every loop iteration (<= VESC_UART_RX_WAIT_MS apart): times out a stale
 // request, then writes the next one when due.
 static void poll_tick(uint32_t now) {
-  if (s_poll_outstanding && (uint32_t)(now - s_poll_sent_ms) >= VESC_POLL_TIMEOUT_MS) {
+  const uint32_t timeout = s_out_is_mc ? (uint32_t)VESC_MCCONF_TIMEOUT_MS : (uint32_t)VESC_POLL_TIMEOUT_MS;
+  if (s_poll_outstanding && (uint32_t)(now - s_poll_sent_ms) >= timeout && end_mcconf_request(now)) {
+    s_poll_outstanding = false;
+    if (due(now, s_mc_to_log_ms, VESC_POLL_LOG_MIN_MS)) {
+      s_mc_to_log_ms = now;
+      ESP_LOGW(TAG, "VESC: no complete answer to COMM_GET_MCCONF within %d ms; pump limits unchanged, retry in %d s",
+               VESC_MCCONF_TIMEOUT_MS, VESC_MCCONF_RETRY_MS / 1000);
+    }
+  }
+  if (s_poll_outstanding && !s_out_is_mc && (uint32_t)(now - s_poll_sent_ms) >= VESC_POLL_TIMEOUT_MS) {
     s_poll_outstanding = false;
     if (s_consec_fail != 0xFFFFFFFFu) s_consec_fail++;
     if (state_lock()) {
@@ -286,11 +325,16 @@ static void poll_tick(uint32_t now) {
 
   const uint32_t period = s_consec_fail >= VESC_POLL_BACKOFF_AFTER ? (uint32_t)VESC_POLL_SLOW_MS : (uint32_t)VESC_POLL_MS;
   if (!due(now, s_last_poll_ms, period)) return;
-  if (s_poll_outstanding) return;  // only when VESC_POLL_TIMEOUT_MS > VESC_POLL_MS
+  if (s_poll_outstanding) return;  // VESC_POLL_TIMEOUT_MS > VESC_POLL_MS, or a COMM_GET_MCCONF in flight
   s_last_poll_ms = now;
 
-  const int w = uart_write_bytes(kUart, s_req, s_req_len);
-  if (w != (int)s_req_len) {
+  // The pump's limits read borrows this slot at link-up (the VESC answered the last poll) and
+  // every VESC_MCCONF_REFRESH_MS.
+  const bool mc = kReadMcconf && mcconf_sched_due(s_mc, s_seen_reply && s_consec_fail == 0, now);
+  const uint8_t *req = mc ? s_req_mc : s_req;
+  const size_t req_len = mc ? s_req_mc_len : s_req_len;
+  const int w = uart_write_bytes(kUart, req, req_len);
+  if (w != (int)req_len) {
     s_tx_err_pending++;
     if (due(now, s_tx_err_log_ms, VESC_POLL_LOG_MIN_MS)) {
       s_tx_err_log_ms = now;
@@ -301,6 +345,12 @@ static void poll_tick(uint32_t now) {
   }
   s_poll_outstanding = true;
   s_poll_sent_ms = now;
+  s_out_is_mc = mc;
+  if (mc) {
+    mcconf_sched_on_sent(s_mc);
+    pump_mcconf_sent();
+    return;
+  }
   if (state_lock()) {
     g_state.vesc_ext.polls_sent++;
     state_unlock();
@@ -341,6 +391,8 @@ static void vescUartTask(void *) {
 bool can_vesc_start() {
   if (s_task_started) return s_installed;
   s_req_len = vesc_uart_build_getvalues_request(s_req);
+  s_req_mc_len = vesc_uart_build_cmd_request(s_req_mc, (uint8_t)VESC_COMM_GET_MCCONF);
+  mcconf_sched_init(s_mc);
   vesc_uart_rx_reset(&s_rx);
   const bool ok = uart_install();
   s_last_install_try_ms = now_nonzero();

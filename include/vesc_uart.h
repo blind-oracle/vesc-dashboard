@@ -80,6 +80,13 @@ static inline size_t vesc_uart_build_getvalues_request(uint8_t *out) {
   return vesc_uart_frame(out, VESC_UART_GETVALUES_REQUEST_LEN, &id, 1);
 }
 
+// A request frame carrying the one-byte command cmd (COMM_GET_MCCONF: 02 01 0E crc crc 03);
+// out must hold VESC_UART_CMD_REQUEST_LEN bytes.
+#define VESC_UART_CMD_REQUEST_LEN 6u
+static inline size_t vesc_uart_build_cmd_request(uint8_t *out, uint8_t cmd) {
+  return vesc_uart_frame(out, VESC_UART_CMD_REQUEST_LEN, &cmd, 1);
+}
+
 // ---------------------------------------------------------------- reassembly
 // The VESC's own decoder works on a buffer, not a byte-wise state machine, and so does
 // this one: a frame is only accepted once it is complete and its stop byte and CRC

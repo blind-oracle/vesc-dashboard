@@ -25,7 +25,7 @@ inline void fmt_age(char *buf, size_t n, uint32_t t_ms, uint32_t now) {
 // (often -273 or > 200): show "n/a" outside a physically plausible range.
 inline void fmt_tmot(char *buf, size_t n, const vesc_telemetry_t &t) {
   const bool have = t.t_ms[VESC_IDX_STATUS_4] != 0;
-  if (!have || t.temp_motor < -40.0f || t.temp_motor > 200.0f) snprintf(buf, n, "n/a");
+  if (!have || !vesc_temp_plausible(t.temp_motor)) snprintf(buf, n, "n/a");
   else snprintf(buf, n, "%.1fC", t.temp_motor);
 }
 
