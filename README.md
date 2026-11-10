@@ -172,14 +172,71 @@ The pump is a 12 V brushless diaphragm pump with four wires: red +12 V, black GN
 
 - The stage inverts (GPIO high = MOSFET on = wire low = slower). The firmware undoes that with the LEDC channel's `output_invert` (`PUMP_PWM_INVERT 1`); a non-inverting 5 V buffer (74AHCT1G125 at 5 V) would need `PUMP_PWM_INVERT 0`.
 - It fails safe: whenever the firmware is not driving the pin (unpowered, in reset, the bootloader, a crash, a failed PWM setup) the 10 k pull-down keeps the MOSFET off and the wire is pulled high, so the pump runs at **full speed**. The 10 k (not 100 k) also outweighs the pin's own weak pull-ups at reset. On power-up the pump therefore runs flat out for the ~0.3 s until `setup()` stops it.
-- **A BC337 (or another small NPN) instead of the MOSFET** works the same way, inverting and failing to full speed, with no firmware change, but with two different resistors and a different pinout:
-  - Base resistor **4.7 kOhm** (up to 10 kOhm) in place of the 100 Ohm. 100 Ohm into a base would pull ~26 mA out of the GPIO; 4.7 kOhm gives ~0.55 mA, of which ~0.4 mA reaches the base past the pull-down, which saturates the transistor hard for the 1..3 mA the pull-ups carry (wire low at ~0.1 V, well under the pump's 0.5 V stop level).
-  - **Keep the 10 kOhm from base to emitter (GND).** Without it the pin's weak pull-up during reset (~45 kOhm) feeds ~50 uA into the base, which turns the transistor on, holds the wire low and STOPS the pump while the ESP32 resets - the opposite of the fail-safe.
-  - TO-92 pinout, flat face towards you, legs down: **C B E**. Collector to the white wire, emitter to GND.
-  - Its turn-off delay (storage time, ~0.5 us saturated) stretches each low pulse by about 1 % of the 40 us period: the pump runs a hair slower than commanded, which the temperature loop absorbs; the commissioning sweep sizes `PUMP_MIN_DUTY_PCT` on the real stage either way.
+- A BC337 (or another small NPN) can replace the MOSFET with no firmware change, but with different resistor values and a different pinout: see "BC337 instead of the MOSFET" below.
 - PWM: 25 kHz (`PUMP_PWM_FREQ_HZ`, inside Kamoer's range and above hearing), 10-bit LEDC. The pump draws up to ~1.7 A (20 W): feed it from the boat's 12 V through its own fuse, never from the dashboard's 5 V.
 - Before wiring it up, measure the white wire against black with the pump powered and nothing connected: 0 V = no pull-up of its own, 5 V or 12 V = there is one (fine for this stage). Then use `PUMP_FORCE_DUTY_PCT` to find where it really starts (section 7, "Coolant pump").
 - S3-Zero: the same stage on GP6 (section 2b).
+
+**BC337 instead of the MOSFET.** The stage works the same way: it inverts (`PUMP_PWM_INVERT 1` stays), and it fails to full speed. You need the transistor and three 4.7 kOhm resistors (1/4 W is plenty: none of them dissipates more than ~30 mW).
+
+```
+                                            +5 V  (VESC 5 V pin, or the pump's fused +12 V)
+                                            |
+                                        [R3 4.7k]   pull-up
+                                            |
+                                            +-------------------> pump white (PWM)
+                                            |
+                                            |  C (leg 1)
+                                          |/
+ GPIO18 ---[R1 4.7k]---+------------------|           Q1: BC337, NPN, TO-92
+ (PIN_PUMP_PWM)        |        B (leg 2) |\
+ S3-Zero: GP6          |                    v  E (leg 3)
+                   [R2 4.7k]                |
+                       |                    |
+ GND ------------------+--------------------+-------------------> pump black, boat 12 V negative
+                                                                  (one common ground)
+
+ boat +12 V --[fuse 2 A]----------------------------------------> pump red
+                                                                  pump yellow (FG): not connected
+```
+
+On the legs (TO-92, flat printed face towards you, legs down: **C B E** from left to right):
+
+```
+            .-----------.
+            |   BC337   |   flat, printed face towards you, legs down
+            |    -25    |
+            '-----------'
+              |   |   |
+              C   B   E
+              |   |   |
+              |   |   +----------+------------- GND: ESP32 GND, pump black, boat 12 V negative
+              |   |              |
+              |   +---[R2 4.7k]--+     R2 straight across legs B and E
+              |   |
+              |   +---[R1 4.7k]---------------- GPIO18 (PIN_PUMP_PWM; S3-Zero GP6)
+              |
+              +-------[R3 4.7k]---------------- +5 V (VESC 5 V pin) or the pump's fused +12 V
+              |
+              +-------------------------------- pump white (PWM)
+```
+
+| State | GPIO18 | Base (leg 2) | BC337 | White wire | Pump |
+|---|---|---|---|---|---|
+| Firmware running, pin high (the inverted "off" part of each period) | 3.3 V, sources ~0.55 mA | ~0.7 V, ~0.4 mA in | saturated | ~0.1 V | reads "stop" for that part |
+| Firmware running, pin low (the commanded duty) | 0 V | 0 V | off | +5 V through R3 | reads "run" for that part |
+| Unpowered, in reset, bootloader, crash, failed PWM setup | open, or the internal ~45 kOhm pull-up | 0..0.29 V | off | +5 V | **full speed** (fail-safe) |
+
+- **R1, base resistor, 4.7 kOhm** (2.2..4.7 kOhm; never the MOSFET's 100 Ohm, which would pull ~26 mA out of the pin). With the pin high, R1 carries (3.3 - 0.7) V / 4.7 kOhm = 0.55 mA. R2 takes 0.15 mA of that, so ~0.4 mA flows into the base. That saturates the BC337 hard (hFE 100 or more) for the 1.1 mA through R3, or 2.6 mA with a 12 V pull-up, and still covers a few mA from a pull-up inside the pump. The wire then sits at ~0.1 V, well under the pump's 0.5 V stop level.
+- **R2, base to emitter, 4.7 kOhm, soldered right at the legs. Do not leave it out or raise it to 10 kOhm.** During reset, the pin's ~45 kOhm internal pull-up, R1 and R2 form a divider. With 4.7 kOhm the base sits at 3.3 V x 4.7 / (45 + 4.7 + 4.7) = 0.29 V, far below conduction. With 10 kOhm it sits at 0.55 V. A BC337 already conducts some current there, and its turn-on voltage falls ~2 mV per degree C. In a warm engine room that can pull the 1 mA pull-up part or all of the way down, so the pump slows or stops while the ESP32 resets, the opposite of the fail-safe. With no R2 at all, the pull-up's ~50 uA turns the transistor fully on.
+- **R3, pull-up, 4.7 kOhm.** Connect it to the VESC's 5 V pin (the same rail as the CAN transceiver) or to the pump's fused +12 V (Kamoer's input takes 12 V: 2.6 mA, 31 mW).
+- **Other NPNs:** BC338, BC547 and BC548 have the same **C B E** pinout and work with the same values. 2N3904, 2N2222A and PN2222A are **E B C**: same circuit, but the legs are mirrored.
+- **Two small delays:** the BC337's turn-off delay (storage time, ~0.5 us when saturated) and the rise of the white wire through R3 (4.7 kOhm times the cable's capacitance, ~0.5 us per metre). Both shorten each high pulse, by ~1..3 % of the 40 us period in total, so the pump runs a hair slower than commanded. The temperature loop absorbs that, and the commissioning sweep (section 7) sizes `PUMP_MIN_DUTY_PCT` on the real stage either way. Mount the stage at the dashboard end, so the GPIO trace is short and only the white wire runs to the pump.
+- **Ground:** the white wire's level is measured against the pump's black wire. Run the pump's red and black wires straight to the boat's 12 V supply, and join the dashboard's GND to that same negative. That way the pump's 1.7 A does not flow through the dashboard's ground wire, where its voltage drop would add to the 0.1 V low level.
+- **Bench checks before the first run:**
+  1. Before soldering, use the meter's diode test with the red probe on B: black on E and black on C both read 0.6..0.7 V (B-E a little higher). Every other pair reads open.
+  2. ESP32 not connected (R1's free end open), pump on 12 V: the white wire reads ~5 V and the pump runs at full speed. Touch R1's free end to 3V3: the wire drops below 0.2 V and the pump stops.
+  3. Everything connected: hold the board's RST button. The pump must go to full speed and stay there until you release it. This is the check that R2 is right.
 
 ### Pins to leave alone
 
@@ -773,7 +830,7 @@ Every build with `PIN_PUMP_PWM` set (GPIO18 on the FireBeetle, GP6 on the S3-Zer
 The loop works on one error: the larger of (motor - motor target) and (MOSFET - MOSFET target) over the sensors that read plausibly (a motor without an NTC reads `n/a` and is left out). `u = PUMP_KP * err + I + PUMP_KD * d(err)/dt`, defaults Kp 8 %/C, Ki 0.1 %/(C s), Kd 0: while it is cool the minimum flow holds (`u` below 20 %); 4 C over target gives 32 % at once and another 40 % over 100 s from the integral. The integral stays within 0..100 and stops growing while the duty is pinned at 100 % (no windup); coming back from `FULL` or `BLIND` the integral is preloaded so the duty continues from where it was and eases down. A temperature at 0.1 C resolution that changes over minutes needs no D term; raise `PUMP_KD` only with a reason.
 
 **Commissioning.**
-1. Measure the pump's PWM wire first (section 2), then wire the MOSFET stage. With the ESP32 unplugged and the pump on 12 V, it must run at full speed.
+1. Measure the pump's PWM wire first (section 2), then wire the MOSFET (or BC337) stage. With the ESP32 unplugged and the pump on 12 V, it must run at full speed.
 2. Build with `-DPUMP_FORCE_DUTY_PCT=30` (and 0, 15, 50 ...): the log says `pump FORCED to 30 %`; the pump runs at that speed regardless of temperatures. Note the lowest duty that turns it reliably and set `PUMP_MIN_DUTY_PCT` a few percent above (default 20; `#error` below 12). Remove the override.
 3. Normal build: at link-up the log shows `VESC temp limits (mcconf FW 6.06): motor 85/100 C, MOSFET 85/100 C, accel_dec 0.15 -> the VESC derates from motor 76.0 / MOSFET 76.0 C`; the PUMP page shows `VESC 6.06`. Spin the motor: `pump RUN (turning) at 20 %`.
 4. Pull the CAN or UART plug: within `VESC_STALE_R1_MS` (2 s) `pump BLIND (no link): 100 %`. Plug it back: `RUN` again.
