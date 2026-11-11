@@ -16,6 +16,9 @@
 //           may still be working and we cannot see it, so PUMP_BLIND_DUTY_PCT (100 %)
 //   FULL    a temperature at or above its derating start: 100 % (a backstop; the PID is
 //           normally there already)
+//   FULL    the pump should run but its tach says it does not turn (STALL / NO_SIGNAL,
+//           include/pump_tach.h): PUMP_TACH_STALL_DUTY_PCT. Only the duty changes: the
+//           start / stop decisions below still apply, so a cool, still motor stops it
 //   RUN     the PID, clamped to PUMP_MIN_DUTY_PCT..100 %. A stopped pump starts when the
 //           motor turns or the error rises above -PUMP_ON_BAND_C; it stops again only with
 //           the motor still, the error below -(PUMP_ON_BAND_C + PUMP_HYST_C) and
@@ -34,6 +37,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "pump_tach.h"
 #include "shared_state.h"
 #include "vesc_mcconf.h"
 #include "vesc_status.h"
@@ -68,6 +72,8 @@ inline const char *pump_why_str(uint8_t w) {
     case PUMP_WHY_NO_SENSOR: return "no sensor";
     case PUMP_WHY_FORCED: return "forced";
     case PUMP_WHY_PWM: return "pwm setup";
+    case PUMP_WHY_STALLED: return "stalled";
+    case PUMP_WHY_NO_TACH: return "no tach";
     default: return "";
   }
 }
@@ -111,6 +117,7 @@ struct PumpInputs {
   bool mot_ok, fet_ok;  // the reading is plausible (vesc_temp_plausible)
   float t_mot, t_fet;   // C
   bool turning;       // fresh STATUS_1 with |mechanical rpm| > PUMP_TURNING_RPM
+  uint8_t tach;       // PumpTachState from the tach (PUMP_TACH_NONE without one); set by the pump task
 };
 
 // From the VESC telemetry, read under the state lock with `now` taken inside it (a frame
@@ -124,6 +131,7 @@ inline PumpInputs pump_inputs(const vesc_telemetry_t &t, uint32_t now) {
   in.fet_ok = vesc_temp_plausible(t.temp_fet);
   in.turning = vesc_fresh(&t, VESC_IDX_STATUS_1, now, VESC_STALE_R1_MS) &&
                fabsf(vesc_mech_rpm(&t, VESC_MOTOR_POLES)) > (float)PUMP_TURNING_RPM;
+  in.tach = PUMP_TACH_NONE;  // the pump task fills it from its own tach state
   return in;
 }
 
@@ -223,6 +231,14 @@ inline float pump_step(PumpCtl &c, const PumpInputs &in, const PumpTargets &tg, 
     // Bumpless from FULL / BLIND: continue at the duty it had and let the loop ease it down.
     if (prev != PUMP_MODE_RUN) c.integ = clampf(prev_duty - PUMP_KP * err - PUMP_KD * c.d_filt, 0.0f, 100.0f);
   }
+
+#if PUMP_TACH_ENABLE && PUMP_TACH_STALL_DUTY_PCT > 0
+  // ---- it should run, but the tach says it does not turn: the most torque to restart, and
+  // a broken FG wire costs noise, never cooling. Coming back, RUN eases down from here. ----
+  if (pump_tach_alarm(in.tach))
+    return set(c, PUMP_MODE_FULL, in.tach == PUMP_TACH_STALL ? PUMP_WHY_STALLED : PUMP_WHY_NO_TACH,
+               (float)PUMP_TACH_STALL_DUTY_PCT);
+#endif
 
   // ---- PID ----
   float u = PUMP_KP * err + c.integ + PUMP_KD * c.d_filt;

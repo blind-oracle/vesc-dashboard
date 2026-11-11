@@ -1780,6 +1780,13 @@ static SharedState pump_state() {
   s.pump.derate_mot = tg.derate_mot;
   s.pump.derate_fet = tg.derate_fet;
   s.pump.t_ms = NOW - 200;
+#if PUMP_TACH_ENABLE
+  s.pump.tach = PUMP_TACH_OK;  // turning at 3450 rpm over a full window
+  s.pump.tach_full = true;
+  s.pump.tach_rpm = 3450.0f;
+  s.pump.tach_pulses = 12345;
+  s.pump.tach_since_ms = NOW - 60000;
+#endif
   return s;
 }
 
@@ -1793,7 +1800,11 @@ static void test_pump_rows() {
   TEST_ASSERT_EQUAL_STRING("Tmot 58.3  tgt 66.0", g.rows[1]);
   TEST_ASSERT_EQUAL_STRING("Tfet 41.0  tgt 66.0", g.rows[2]);
   TEST_ASSERT_EQUAL_STRING("Lim M85/100 F85/100", g.rows[3]);
+#if PUMP_TACH_ENABLE
+  TEST_ASSERT_EQUAL_STRING("dec 0.15   3450rpm", g.rows[4]);  // the tach in place of the limits' source
+#else
   TEST_ASSERT_EQUAL_STRING("dec 0.15 VESC 6.06", g.rows[4]);
+#endif
   TEST_ASSERT_EQUAL_STRING("err -7.7   int 12.0", g.rows[5]);
   assert_grid_lengths(g);
 
@@ -1835,6 +1846,9 @@ static void test_pump_stale_and_missing() {
   TEST_ASSERT_EQUAL_STRING("--", g.rows[0]);
   TEST_ASSERT_EQUAL_STRING("err --     int --", g.rows[5]);
   TEST_ASSERT_EQUAL_STRING("Lim M85/100 F85/100", g.rows[3]);
+#if PUMP_TACH_ENABLE
+  TEST_ASSERT_EQUAL_STRING("dec 0.15   --", g.rows[4]);  // a silent task's rpm is not shown either
+#endif
   assert_grid_lengths(g);
 
   // Fresh boot: nothing from the pump task or the VESC yet.
@@ -1842,23 +1856,38 @@ static void test_pump_stale_and_missing() {
   g = build_grid(SCREEN_PUMP, s, NOW);
   TEST_ASSERT_EQUAL_STRING("--", g.rows[0]);
   TEST_ASSERT_EQUAL_STRING("Tmot --    tgt --", g.rows[1]);
+#if PUMP_TACH_ENABLE
+  TEST_ASSERT_EQUAL_STRING("dec 0.15   --", g.rows[4]);
+#else
   TEST_ASSERT_EQUAL_STRING("dec 0.15 DEF wait", g.rows[4]);
+#endif
   assert_grid_lengths(g);
 }
 
 static void test_pump_limit_sources() {
+  // The source label (row 4 without a tach; with one it is in the log line only).
   SharedState s = pump_state();
+  char src[16];
+  pump_limits_src(s.vesc_limits, src, sizeof src);
+  TEST_ASSERT_EQUAL_STRING("VESC 6.06", src);
   s.vesc_limits.result = MCCONF_UNKNOWN_SIG;  // a firmware this build does not know: the defaults
   s.vesc_limits.lim.mot_start = 95.0f;        // whatever was stored before is not shown
   OledGrid g = build_grid(SCREEN_PUMP, s, NOW);
+  pump_limits_src(s.vesc_limits, src, sizeof src);
+  TEST_ASSERT_EQUAL_STRING("DEF new FW", src);
+#if !PUMP_TACH_ENABLE
   TEST_ASSERT_EQUAL_STRING("dec 0.15 DEF new FW", g.rows[4]);
+#endif
   TEST_ASSERT_EQUAL_STRING("Lim M85/100 F85/100", g.rows[3]);
   s.vesc_limits.result = MCCONF_IMPLAUSIBLE;
-  g = build_grid(SCREEN_PUMP, s, NOW);
-  TEST_ASSERT_EQUAL_STRING("dec 0.15 DEF bad lim", g.rows[4]);
+  pump_limits_src(s.vesc_limits, src, sizeof src);
+  TEST_ASSERT_EQUAL_STRING("DEF bad lim", src);
   s.vesc_limits.result = MCCONF_SHORT;
-  g = build_grid(SCREEN_PUMP, s, NOW);
-  TEST_ASSERT_EQUAL_STRING("dec 0.15 DEF bad rep", g.rows[4]);
+  pump_limits_src(s.vesc_limits, src, sizeof src);
+  TEST_ASSERT_EQUAL_STRING("DEF bad rep", src);
+  s.vesc_limits.result = MCCONF_NONE;
+  pump_limits_src(s.vesc_limits, src, sizeof src);
+  TEST_ASSERT_EQUAL_STRING(PUMP_READS_MCCONF ? "DEF wait" : "DEF cfg", src);
 
   // The longest firmware label and the widest limits still fit the row.
   s.vesc_limits.result = MCCONF_OK;
@@ -1870,9 +1899,126 @@ static void test_pump_limit_sources() {
   s.vesc_limits.lim.accel_dec = 1.0f;
   g = build_grid(SCREEN_PUMP, s, NOW);
   TEST_ASSERT_EQUAL_STRING("Lim M149/150 F120/250", g.rows[3]);
+  pump_limits_src(s.vesc_limits, src, sizeof src);
+  TEST_ASSERT_EQUAL_STRING("VESC 6.00/02", src);
+#if PUMP_TACH_ENABLE
+  TEST_ASSERT_EQUAL_STRING("dec 1.00   3450rpm", g.rows[4]);
+#else
   TEST_ASSERT_EQUAL_STRING("dec 1.00 VESC 6.00/02", g.rows[4]);
+#endif
   assert_grid_lengths(g);
 }
+
+#if PUMP_TACH_ENABLE
+// Row 4's right side: the rpm while all is well, the word when something needs attention.
+static void test_pump_tach_row() {
+  SharedState s = pump_state();
+  OledGrid g;
+  s.pump.tach_full = false;  // window still filling: the rpm is marked
+  g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("dec 0.15   3450rpm~", g.rows[4]);
+  s.pump.tach_full = true;
+  s.pump.tach = PUMP_TACH_WAIT;  // spin-up / spin-down: the number, no verdict
+  s.pump.tach_rpm = 812.4f;
+  g = build_grid(SCREEN_PUMP, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("dec 0.15   812rpm", g.rows[4]);
+  s.pump.tach_rpm = 123456.0f;  // implausible, but it must still fit 10 chars
+  g = build_grid(SCREEN_PUMP, s, NOW);
+  assert_grid_lengths(g);
+  TEST_ASSERT_TRUE(strlen(g.rows[4]) <= 21u);
+
+  const struct {
+    uint8_t st;
+    const char *row;
+  } words[] = {
+      {PUMP_TACH_STALL, "dec 0.15   STALL"},
+      {PUMP_TACH_NO_SIGNAL, "dec 0.15   NO TACH"},
+      {PUMP_TACH_RUNS_AT_0, "dec 0.15   RUNS AT 0%"},
+      {PUMP_TACH_ERR, "dec 0.15   tach ERR"},
+      {PUMP_TACH_NONE, "dec 0.15   --"},
+  };
+  for (const auto &w : words) {
+    s.pump.tach = w.st;
+    s.disp.pump_ack = s.pump.tach_alarms;  // the alarm is dismissed: the page itself shows
+    g = build_grid(SCREEN_PUMP, s, NOW);
+    TEST_ASSERT_EQUAL_STRING(w.row, g.rows[4]);
+    assert_grid_lengths(g);
+  }
+}
+
+// The pump alarm takes the panel while the tach says STALL / NO_SIGNAL, until a press
+// acknowledges that alarm's number; a new stall shows again; the dead-man's alarm wins.
+static void test_pump_alarm_overlay() {
+  SharedState s = pump_state();
+  OledFrame f;
+
+  // All well: no overlay.
+  oled_build_frame(s, NOW, SCREEN_GNSS, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_NONE, f.overlay);
+
+  // Stalled 12 s ago, forced to full duty: the overlay on every screen.
+  s.pump.mode = PUMP_MODE_FULL;
+  s.pump.why = PUMP_WHY_STALLED;
+  s.pump.duty_pct = 100.0f;
+  s.pump.tach = PUMP_TACH_STALL;
+  s.pump.tach_rpm = 0.0f;
+  s.pump.tach_alarms = 1;
+  s.pump.tach_since_ms = NOW - 12000;
+  for (unsigned scr = 0; scr < (unsigned)SCREEN_COUNT; ++scr) {
+    memset(&f, 0xAA, sizeof f);
+    oled_build_frame(s, NOW, (uint8_t)scr, kInfo, f);
+    TEST_ASSERT_EQUAL_UINT8(OVERLAY_PUMP, f.overlay);
+    TEST_ASSERT_EQUAL_STRING("PUMP", f.grid.title);
+    TEST_ASSERT_EQUAL_STRING("!", f.grid.page);
+    assert_grid_lengths(f.grid);
+  }
+  TEST_ASSERT_EQUAL_STRING("PUMP STALLED 12s", f.grid.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("duty 100%  0rpm", f.grid.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("forced to 100%", f.grid.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("chk fuse/plug/hose", f.grid.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("motor may derate", f.grid.rows[4]);
+  TEST_ASSERT_EQUAL_STRING("PRESS BTN: DISMISS", f.grid.rows[5]);
+
+  // A stamp a little after the display's clock reads as 0 s, not 49 days.
+  s.pump.tach_since_ms = NOW + 300;
+  oled_build_frame(s, NOW, SCREEN_MAIN, kInfo, f);
+  TEST_ASSERT_EQUAL_STRING("PUMP STALLED 0s", f.grid.rows[0]);
+  s.pump.tach_since_ms = NOW - 12000;
+
+  // Dismissed: the selected page is back, and the PUMP page still says STALL.
+  s.disp.pump_ack = 1;
+  oled_build_frame(s, NOW, SCREEN_PUMP, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_NONE, f.overlay);
+  TEST_ASSERT_EQUAL_STRING("FULL 100% stalled", f.grid.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("dec 0.15   STALL", f.grid.rows[4]);
+
+  // The next stall is a new number: it shows again.
+  s.pump.tach_alarms = 2;
+  s.pump.tach = PUMP_TACH_NO_SIGNAL;
+  s.pump.why = PUMP_WHY_NO_TACH;
+  oled_build_frame(s, NOW, SCREEN_MAIN, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_PUMP, f.overlay);
+  TEST_ASSERT_EQUAL_STRING("NO PUMP TACH SIGNAL", f.grid.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("chk FG wire / diode", f.grid.rows[3]);
+  assert_grid_lengths(f.grid);
+
+  // Over: an unacknowledged alarm that has cleared does not show.
+  s.pump.tach = PUMP_TACH_OK;
+  oled_build_frame(s, NOW, SCREEN_MAIN, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_NONE, f.overlay);
+  s.pump.tach = PUMP_TACH_RUNS_AT_0;  // only a report: never the overlay
+  oled_build_frame(s, NOW, SCREEN_MAIN, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_NONE, f.overlay);
+
+#if DEADMAN_UI_ENABLE
+  // A cut motor outranks a stalled pump.
+  s.pump.tach = PUMP_TACH_STALL;
+  s.deadman.state = DM_TRIPPED;
+  oled_build_frame(s, NOW, SCREEN_MAIN, kInfo, f);
+  TEST_ASSERT_EQUAL_UINT8(OVERLAY_DEADMAN, f.overlay);
+#endif
+}
+#endif  // PUMP_TACH_ENABLE
 #endif  // PUMP_ENABLE
 
 static void test_boot_frame() {
@@ -2213,6 +2359,10 @@ int main(int, char **) {
   RUN_TEST(test_pump_rows);
   RUN_TEST(test_pump_stale_and_missing);
   RUN_TEST(test_pump_limit_sources);
+#if PUMP_TACH_ENABLE
+  RUN_TEST(test_pump_tach_row);
+  RUN_TEST(test_pump_alarm_overlay);
+#endif
 #endif
   RUN_TEST(test_boot_frame);
   RUN_TEST(test_layout_geometry);

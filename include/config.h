@@ -69,6 +69,9 @@
 #ifndef PIN_PUMP_PWM
 #define PIN_PUMP_PWM 6 // GP6 (front edge, next to GP5) -> the coolant pump's transistor stage; -1 = no pump
 #endif
+#ifndef PIN_PUMP_TACH
+#define PIN_PUMP_TACH 11 // GP11 (front edge, next to GP10) <- the pump's FG wire through the diode stage; -1 = no tach
+#endif
 #ifndef VESC_UART_PORT
 #define VESC_UART_PORT 2 // UART2: UART0 and its TX/RX pads (43/44, where the ROM prints its boot log) stay untouched
 #endif
@@ -473,6 +476,42 @@
 #ifndef PUMP_DEFAULT_TEMP_ACCEL_DEC
 #define PUMP_DEFAULT_TEMP_ACCEL_DEC 0.15f // l_temp_accel_dec, 0..1
 #endif
+// ---- the pump's tachometer (FG, the yellow wire; include/pump_tach.h, README section 2 "Pump tach") ----
+// FG -> Schottky diode (cathode to the pump) -> node with 10k to 3V3 and 1 nF to GND -> 1k ->
+// PIN_PUMP_TACH: FG can only pull the pin low, so an open-collector, 5 V or 12 V output all
+// work. The PCNT peripheral counts its falling edges. A pump that should run but does not
+// turn raises a STALL (or NO TACH: no pulse since boot) alarm and runs at
+// PUMP_TACH_STALL_DUTY_PCT; one that turns while commanded off is reported as RUNS AT 0%.
+#ifndef PIN_PUMP_TACH
+#define PIN_PUMP_TACH 19 // silkscreen "19" (SDA, the board's default I2C pin, free here): FG input. -1 = no tach
+#endif
+#ifndef PUMP_TACH_PPR
+#define PUMP_TACH_PPR 1 // FG pulses per revolution: Kamoer's brushless pumps give 1 (one motor series 6)
+#endif
+#ifndef PUMP_TACH_MIN_RPM
+#define PUMP_TACH_MIN_RPM 200 // below this the pump counts as not turning. Set to ~1/3 of the rpm at PUMP_MIN_DUTY_PCT
+#endif
+#ifndef PUMP_TACH_WINDOW_MS
+#define PUMP_TACH_WINDOW_MS 2000 // rpm = the pulses over this window (a multiple of PUMP_PERIOD_MS, <= 16 periods)
+#endif
+#ifndef PUMP_TACH_SPINUP_MS
+#define PUMP_TACH_SPINUP_MS 3000 // after a start, no verdict for this long
+#endif
+#ifndef PUMP_TACH_STALL_MS
+#define PUMP_TACH_STALL_MS 5000 // ... then below PUMP_TACH_MIN_RPM for this long = STALL / NO TACH
+#endif
+#ifndef PUMP_TACH_SPINDOWN_MS
+#define PUMP_TACH_SPINDOWN_MS 5000 // after a stop, no verdict for this long (then turning = RUNS AT 0%)
+#endif
+#ifndef PUMP_TACH_OK_MS
+#define PUMP_TACH_OK_MS 2000 // a stalled pump counts as turning again after this long at or above PUMP_TACH_MIN_RPM
+#endif
+#ifndef PUMP_TACH_STALL_DUTY_PCT
+#define PUMP_TACH_STALL_DUTY_PCT 100 // duty while STALL / NO TACH (the cool side, and the most torque to restart). 0 = alert only
+#endif
+#ifndef PUMP_TACH_GLITCH_NS
+#define PUMP_TACH_GLITCH_NS 10000 // PCNT glitch filter: pulses shorter than this are ignored (<= 12000, the hardware max)
+#endif
 #ifndef VESC_MCCONF_TIMEOUT_MS
 #if VESC_LINK_UART
 #define VESC_MCCONF_TIMEOUT_MS 300 // the ~480-byte reply takes ~42 ms at 115200 baud, plus the VESC's own time
@@ -792,6 +831,8 @@
 #define DEADMAN_TAGS 2
 // The pump's targets come from COMM_GET_MCCONF only where a request can be sent at all.
 #define PUMP_READS_MCCONF (PUMP_ENABLE && PUMP_LIMITS_FROM_VESC && VESC_POLL_MS > 0 && !CAN_LISTEN_ONLY)
+// The pump's tach exists with the pump and a pin for it.
+#define PUMP_TACH_ENABLE (PUMP_ENABLE && PIN_PUMP_TACH >= 0)
 
 // ============================================================================
 // Compile-time sanity checks
@@ -908,6 +949,32 @@
 #if PUMP_ENABLE && TASK_PRIO_PUMP >= TASK_PRIO_GNSS
 #error "TASK_PRIO_PUMP must stay below the data producers (TASK_PRIO_GNSS / TASK_PRIO_CAN)"
 #endif
+#if PUMP_TACH_ENABLE && BOARD_CUT_PIN_FORBIDDEN(PIN_PUMP_TACH)
+#error "PIN_PUMP_TACH must not be a strapping pin of this board (FireBeetle C6: 8/9/15; S3-Zero: 0/3/45/46): the pump's FG output may hold it low through reset (GPIO8 low blocks the C6's download mode)"
+#endif
+#if PUMP_TACH_ENABLE && (PUMP_TACH_PPR < 1 || PUMP_TACH_PPR > 32)
+#error "PUMP_TACH_PPR must be 1..32 pulses per revolution"
+#endif
+#if PUMP_TACH_ENABLE && PUMP_TACH_MIN_RPM <= 0
+#error "PUMP_TACH_MIN_RPM must be > 0"
+#endif
+#if PUMP_TACH_ENABLE && (PUMP_TACH_WINDOW_MS % PUMP_PERIOD_MS != 0 || PUMP_TACH_WINDOW_MS < PUMP_PERIOD_MS || \
+                         PUMP_TACH_WINDOW_MS > 16 * PUMP_PERIOD_MS)
+#error "PUMP_TACH_WINDOW_MS must be 1..16 times PUMP_PERIOD_MS"
+#endif
+#if PUMP_TACH_ENABLE && (PUMP_TACH_SPINUP_MS < PUMP_TACH_WINDOW_MS || PUMP_TACH_SPINDOWN_MS < PUMP_TACH_WINDOW_MS)
+#error "PUMP_TACH_SPINUP_MS and PUMP_TACH_SPINDOWN_MS must cover PUMP_TACH_WINDOW_MS: the rpm still averages the time before the change"
+#endif
+#if PUMP_TACH_ENABLE && (PUMP_TACH_STALL_MS < PUMP_PERIOD_MS || PUMP_TACH_OK_MS < PUMP_PERIOD_MS)
+#error "PUMP_TACH_STALL_MS and PUMP_TACH_OK_MS must be at least one PUMP_PERIOD_MS"
+#endif
+#if PUMP_TACH_ENABLE && PUMP_TACH_STALL_DUTY_PCT != 0 && \
+    (PUMP_TACH_STALL_DUTY_PCT < PUMP_MIN_DUTY_PCT || PUMP_TACH_STALL_DUTY_PCT > 100)
+#error "PUMP_TACH_STALL_DUTY_PCT must be 0 (alert only) or PUMP_MIN_DUTY_PCT..100"
+#endif
+#if PUMP_TACH_ENABLE && (PUMP_TACH_GLITCH_NS < 0 || PUMP_TACH_GLITCH_NS > 12000)
+#error "PUMP_TACH_GLITCH_NS must be 0..12000 (the PCNT filter takes at most 1023 APB cycles at 80 MHz)"
+#endif
 // hbOk() counts a heartbeat that was never touched as fresh for its first max_age ms, so a
 // confirmation earlier than every HB_MAX_* would vouch for tasks that may never have started.
 #if OTA_ENABLE && (OTA_CONFIRM_MS <= HB_MAX_CAN_MS || OTA_CONFIRM_MS <= HB_MAX_GNSS_MS || OTA_CONFIRM_MS <= HB_MAX_DISP_MS || \
@@ -966,6 +1033,9 @@ namespace cfg_check
 #endif
 #if PUMP_ENABLE
       PIN_PUMP_PWM,
+#endif
+#if PUMP_TACH_ENABLE
+      PIN_PUMP_TACH,
 #endif
   };
 // PIN_OLED_RST is optional (-1); guard it separately.

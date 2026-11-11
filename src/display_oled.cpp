@@ -469,6 +469,9 @@ struct DispCtx {
   DisplayStats st;         // counters + flags, mirrored into g_state.disp
   uint8_t screen;          // OledScreen currently selected
   uint32_t last_press_ms;  // last debounced button event (0 = never), for the auto-return timer
+#if PUMP_TACH_ENABLE
+  uint32_t pump_alarms;    // PumpStatus::tach_alarms in the last snapshot: what a press on the pump alarm dismisses
+#endif
 #if PIN_BUTTON >= 0
   Button btn;
 #endif
@@ -569,7 +572,20 @@ static bool poll_button(DispCtx &c, uint32_t now) {
     c.last_press_ms = now ? now : 1u;
     c.st.last_change_ms = now;
     restore_contrast(c, "button");
-    if (ev == ButtonEvent::Short) changed = set_screen(c, (uint8_t)((c.screen + 1u) % SCREEN_COUNT), "short press");
+    bool dismissed = false;  // a short press that only dismissed the pump alarm
+#if PUMP_TACH_ENABLE
+    // Any press on the pump alarm dismisses it (until the next stall). A short press does
+    // nothing else; a long one still goes back to MAIN below.
+    if (c.prev.overlay == OVERLAY_PUMP && ev != ButtonEvent::VeryLong) {
+      c.st.pump_ack = c.pump_alarms;
+      dismissed = ev == ButtonEvent::Short;
+      changed = true;
+      ESP_LOGI(TAG, "display: pump alarm %lu dismissed", (unsigned long)c.pump_alarms);
+    }
+#endif
+    if (ev == ButtonEvent::Short) {
+      if (!dismissed) changed = set_screen(c, (uint8_t)((c.screen + 1u) % SCREEN_COUNT), "short press");
+    }
 #if OTA_ENABLE
     // The rest of a hold whose long press (1.5 s in) already went back to MAIN or asked the
     // dead-man for a reset. In update mode it means nothing more. Accepted, this does not
@@ -598,7 +614,7 @@ static bool poll_button(DispCtx &c, uint32_t now) {
       deadman_request_reset();
     }
 #endif
-    else changed = set_screen(c, SCREEN_MAIN, "long press");
+    else changed = set_screen(c, SCREEN_MAIN, "long press") || changed;
   }
 #endif
 #if SCREEN_AUTO_RETURN_MS > 0
@@ -625,6 +641,9 @@ static bool frame_tick(DispCtx &c, uint32_t now) {
   now = state_now_ms();
 #endif
   s.disp = c.st;  // the SYS screen shows this task's own counters (the published copy lags one poll)
+#if PUMP_TACH_ENABLE
+  c.pump_alarms = s.pump.tach_alarms;
+#endif
   OledSysInfo info;
   info.uptime_s = now / 1000u;
   info.heap_free = esp_get_free_heap_size();

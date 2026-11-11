@@ -4,7 +4,7 @@ Be advised that this whole repo is AI-generated, so take it with a grain of salt
 
 # vesc-dashboard
 
-ESP32-C6 firmware that listens to a VESC motor controller on CAN, polls it once a second for the few values its broadcasts lack (fault code, per-MOSFET temperatures, id/iq, vd/vq, absolute tachometer), reads ground speed and time from a u-blox GNSS receiver at 5 Hz, shows everything on a 128x64 monochrome OLED (SSD1309 controller, I2C) as eight screens cycled by a push button, integrates speed and energy into a trip log with the boat's efficiency in Wh per nautical mile (or km), and runs the motor's coolant pump by PWM from the VESC temperatures, with targets taken from the VESC's own temperature limits (section 7). Built for the DFRobot FireBeetle 2 ESP32-C6 (DFR1075) with an MCP2551-class CAN transceiver, any 2.42" or 1.54" SSD1309 module switched to I2C mode and any receiver that speaks UBX (u-blox 6/7, M8, M9, M10 or a compatible clone). On the CAN bus the firmware acknowledges frames and transmits only read requests: a 7-byte `COMM_GET_VALUES_SELECTIVE` every `VESC_POLL_MS` (1 s), and for the pump a 3-byte `COMM_GET_MCCONF` at link-up and every 10 minutes. It never sends a command or a setting; `-DVESC_POLL_MS=0` makes it strictly passive (ACK only). Optionally the C6's own Bluetooth LE radio runs a dead-man's switch (`pio run -e deadman`, section 5): a BLE tag worn by the helmsman, and if it stops advertising the firmware pulls the VESC's own kill-switch input low, in parallel with the boat's mechanical lanyard switch; the default build contains no BLE code at all. That path uses a GPIO, not CAN - what the firmware transmits on the bus is unchanged. Without a CAN transceiver, `pio run -e deadman_uart` talks to the VESC over its COMM-header UART instead (section 3b): one `COMM_GET_VALUES` poll every 100 ms replaces both the broadcasts and the CAN poll, and everything except the ADC/PPM row stays available. The same UART build also runs on a Waveshare ESP32-S3-Zero (`pio run -e s3zero_deadman_uart`, section 2b).
+ESP32-C6 firmware that listens to a VESC motor controller on CAN, polls it once a second for the few values its broadcasts lack (fault code, per-MOSFET temperatures, id/iq, vd/vq, absolute tachometer), reads ground speed and time from a u-blox GNSS receiver at 5 Hz, shows everything on a 128x64 monochrome OLED (SSD1309 controller, I2C) as eight screens cycled by a push button, integrates speed and energy into a trip log with the boat's efficiency in Wh per nautical mile (or km), and runs the motor's coolant pump by PWM from the VESC temperatures, with targets taken from the VESC's own temperature limits, and watches the pump's tach wire so a stalled, unpowered or unplugged pump raises an alarm and runs at full duty (section 7). Built for the DFRobot FireBeetle 2 ESP32-C6 (DFR1075) with an MCP2551-class CAN transceiver, any 2.42" or 1.54" SSD1309 module switched to I2C mode and any receiver that speaks UBX (u-blox 6/7, M8, M9, M10 or a compatible clone). On the CAN bus the firmware acknowledges frames and transmits only read requests: a 7-byte `COMM_GET_VALUES_SELECTIVE` every `VESC_POLL_MS` (1 s), and for the pump a 3-byte `COMM_GET_MCCONF` at link-up and every 10 minutes. It never sends a command or a setting; `-DVESC_POLL_MS=0` makes it strictly passive (ACK only). Optionally the C6's own Bluetooth LE radio runs a dead-man's switch (`pio run -e deadman`, section 5): a BLE tag worn by the helmsman, and if it stops advertising the firmware pulls the VESC's own kill-switch input low, in parallel with the boat's mechanical lanyard switch; the default build contains no BLE code at all. That path uses a GPIO, not CAN - what the firmware transmits on the bus is unchanged. Without a CAN transceiver, `pio run -e deadman_uart` talks to the VESC over its COMM-header UART instead (section 3b): one `COMM_GET_VALUES` poll every 100 ms replaces both the broadcasts and the CAN poll, and everything except the ADC/PPM row stays available. The same UART build also runs on a Waveshare ESP32-S3-Zero (`pio run -e s3zero_deadman_uart`, section 2b).
 
 ## 1. What it does
 
@@ -16,7 +16,7 @@ Six FreeRTOS tasks (tick 1 ms; the dead-man builds add `deadmanTask`, the `ble` 
 | `gnssTask` (`src/gnss_ubx.cpp`) | `TASK_PRIO_GNSS` = 5 | 4096 | AUTOBAUD -> DETECT (MON-VER) -> BAUD (move the receiver's UART to `GNSS_TARGET_BAUD`) -> CONFIGURE (`GNSS_RATE_MS`, NAV-PVT on, NMEA off) -> RUN; parses NAV-PVT (position, speed, accuracies, heading, UTC date and time) into `g_state.gnss`; back to autobaud after `GNSS_REDETECT_MS` of silence or when the receiver does not answer at the new baud |
 | `displayTask` (`src/display_oled.cpp`) | `TASK_PRIO_DISP` = 2 | 6144 (`OLED_TASK_STACK`) | loop every `OLED_BUTTON_POLL_MS` (20 ms): debounce the button, switch screens; every `OLED_PERIOD_MS` (or at once after a screen change) build the frame for the current screen from a snapshot and push it only when something changed; dim after `OLED_IDLE_DIM_MS` idle; re-probe the controller every 5 s and re-initialise a panel that stopped answering |
 | `tripTask` (`src/trip.cpp`) | `TASK_PRIO_TRIP` = 3 | 4096 (`TRIP_TASK_STACK`) | every `TRIP_PERIOD_MS` (200 ms): snapshot, integrate GNSS ground speed into distance and the VESC watt-hour counters (or `v_in x current_in`) into energy, keep the `EFF_WINDOW_S` ring, publish `g_state.trip` (section "Efficiency and trip"); a pure consumer that owns no peripheral and is not watched by the watchdog |
-| `pumpTask` (`src/pump.cpp`, every build with `PIN_PUMP_PWM`) | `TASK_PRIO_PUMP` = 3 | 3072 (`PUMP_TASK_STACK`) | every `PUMP_PERIOD_MS` (500 ms): the VESC's motor and MOSFET temperatures and the limits read with `COMM_GET_MCCONF` in, the pure controller in `include/pump_logic.h` (PID, start/stop, blind and derating rules), the LEDC duty on `PIN_PUMP_PWM` out, `g_state.pump` published (section 7, "Coolant pump"). Never logs; the supervisor does |
+| `pumpTask` (`src/pump.cpp`, every build with `PIN_PUMP_PWM`) | `TASK_PRIO_PUMP` = 3 | 3072 (`PUMP_TASK_STACK`) | every `PUMP_PERIOD_MS` (500 ms): the VESC's motor and MOSFET temperatures and the limits read with `COMM_GET_MCCONF` in, the FG pulse count from the PCNT (`PIN_PUMP_TACH`) in, the pure tach logic in `include/pump_tach.h` (rpm, STALL / NO TACH / RUNS AT 0%) and the pure controller in `include/pump_logic.h` (PID, start/stop, blind, derating and stall rules), the LEDC duty on `PIN_PUMP_PWM` out, `g_state.pump` published (section 7, "Coolant pump"). Never logs; the supervisor does |
 | `deadmanTask` (`src/deadman.cpp`, `deadman` env only) | `TASK_PRIO_DEADMAN` = 7 | 2560 (`DEADMAN_TASK_STACK`) | every `DEADMAN_TICK_MS` (20 ms): run the pure state machine in `include/deadman_logic.h` against the beacon timestamp the NimBLE host task stamps (`src/ble_scan.cpp`), drive `PIN_DEADMAN_CUT` (open drain, in parallel with the mechanical kill switch on VESC ADC2), confirm the cut against the polled `VESC_STATUS_KILL_SW` bit and publish `g_state.deadman`. Runs ABOVE `canTask` on purpose and never logs - the supervisor does that for it |
 | `ble` task (`src/ble_scan.cpp`, `deadman` env only) | `TASK_PRIO_BLE` = 4 | 4096 (`BLE_TASK_STACK`) | owns every NimBLE call: settles the own address after each host sync and, every 100 ms or at once when the host reports a change, makes sure the passive watchdog scan is running (`DEADMAN_SCAN_ITVL_MS` / `DEADMAN_SCAN_WINDOW_MS`, no duplicate filter). The host task's scan callback timestamps a matching tag straight into the dead-man and counts every other advert. The NimBLE host and controller tasks (priorities 21 / 23) run their own short slices |
 | supervisor loop in `app_main()` (`src/main.cpp`) | 1 | 8192 (`CONFIG_ESP_MAIN_TASK_STACK_SIZE`) | sole Task-WDT subscriber (`WDT_TIMEOUT_MS`), fed only while the CAN, GNSS, display and pump heartbeats (and in a dead-man build the dead-man's) are fresh; the trip and `ble` tasks do not gate it (the dead-man watches the `ble` heartbeat itself and reports `NO RADIO`); 1 Hz VESC and GNSS log lines, 5 s TRIP, DM and PUMP lines (`LOG_TRIP_MS`, `LOG_DEADMAN_MS`, `LOG_PUMP_MS`), 10 s SYS line with the display, button and poll counters and the BLE scan state; LED |
@@ -31,6 +31,7 @@ Data flow:
  BLE tag ~adv~> NimBLE host (gap_cb): volatile timestamp ---------> deadmanTask -> PIN_DEADMAN_CUT (deadman envs only)
  button (GPIO7) ---------------------------------------------------> displayTask (20 ms poll)
  g_state (temperatures, mcconf limits) -> pumpTask (500 ms) -> LEDC 25 kHz -> GPIO18 -> N-MOSFET -> pump PWM wire
+ pump FG wire -> Schottky stage -> GPIO19 -> PCNT -> pumpTask (rpm, stall) -> g_state.pump -> PUMP page / pump alarm
 ```
 
 Every hold of the mutex is a memcpy or a few field writes, never I/O; consumers work on snapshots. Every timestamp is a `state_now_ms()` value (milliseconds since boot, 32-bit) where 0 means "never received" and all age arithmetic is wrap-safe.
@@ -49,17 +50,17 @@ Files:
 | `include/gnss_ubx.h`, `src/gnss_ubx.cpp` | UART1 setup, autobaud, MON-VER detection, baud switch, VALSET/legacy configuration |
 | `include/trip.h`, `src/trip.cpp` | header-only trip integrator (distance, energy sources, `EFF_WINDOW_S` window, efficiency; framework-free, unit-tested) and the 200 ms task that feeds it snapshots and publishes `g_state.trip` |
 | `include/display.h` | `display_start()`, the display task's one entry point (implemented by `src/display_oled.cpp`) |
-| `include/display_strings_oled.h` | pure builders of all OLED screens (eight with the pump, seven without, plus the dead-man row and alarm of a `deadman` build and the FW UPDATE / UPDATE REFUSED overlays; character budgets, stale -> `--`, UTC -> local clock), unit-tested |
+| `include/display_strings_oled.h` | pure builders of all OLED screens (eight with the pump, seven without, plus the dead-man row and alarm of a `deadman` build, the pump alarm and the FW UPDATE / UPDATE REFUSED overlays; character budgets, stale -> `--`, UTC -> local clock), unit-tested |
 | `src/display_oled.cpp` | I2C bring-up and presence probe, u8g2 rendering, button debounce, screen switching, change-detected refresh, idle dimming |
 | `include/u8g2_hal_idf.h`, `src/u8g2_hal_idf.cpp` | u8g2 HAL for ESP-IDF: I2C master byte callback, reset GPIO, delays, address probe |
 | `components/u8g2/` | u8g2 library (git submodule, tag 2.37.1): fonts, frame buffer, SSD1309 init sequence; only the referenced fonts are linked |
 | `include/ble_scan.h`, `src/ble_scan.cpp` | the dead-man's radio (the only file that includes NimBLE): NVS + NimBLE host init, the scan callback that timestamps the tags, the `ble` task that keeps the watchdog scan running; inline no-ops when `DEADMAN_ENABLE` is 0 |
 | `include/ota.h`, `include/ota_logic.h`, `src/ota.cpp` | over-the-air update (section 7): the reboot request across RTC memory, the update-mode access point and upload server, the probation of a new image; the entry gate (motor turning, boat moving, dead-man alarm) is the framework-free, unit-tested `ota_logic.h`; inline no-ops when `OTA_ENABLE` is 0 |
 | `include/nvs_util.h` | NVS bring-up shared by the BLE controller and update mode's Wi-Fi |
-| `include/pump.h`, `include/pump_logic.h`, `src/pump.cpp` | coolant pump (section 7): LEDC PWM output with its fail-safe, the pump task, the handler for the `COMM_GET_MCCONF` replies both links pass on; the controller itself (targets, modes, PID) is the framework-free, unit-tested `pump_logic.h`; inline no-ops when `PUMP_ENABLE` is 0 |
+| `include/pump.h`, `include/pump_logic.h`, `include/pump_tach.h`, `src/pump.cpp` | coolant pump (section 7): LEDC PWM output with its fail-safe, the PCNT tach input, the pump task, the handler for the `COMM_GET_MCCONF` replies both links pass on; the controller itself (targets, modes, PID) and the tach verdicts (rpm window, stall, no signal, runs at 0 %) are the framework-free, unit-tested `pump_logic.h` and `pump_tach.h`; inline no-ops when `PUMP_ENABLE` is 0 |
 | `src/main.cpp` | `app_main()`: start-up and the supervisor loop (a smaller one in update mode) |
 | `platformio.ini`, `boards/dfrobot_firebeetle2_esp32c6.json`, `boards/waveshare_esp32s3_zero.json`, `sdkconfig.defaults`, `sdkconfig.defaults.ble`, `sdkconfig.defaults.esp32s3`, `partitions.csv`, `CMakeLists.txt`, `src/CMakeLists.txt` | build: pinned platform and envs, board definitions, ESP-IDF configuration (the `.ble` fragment adds the NimBLE host, observer role only, for the dead-man envs; ESP-IDF applies `.esp32s3` by itself on the S3-Zero), partition table, IDF project files |
-| `test/test_vesc/`, `test/test_vesc_getvalues/`, `test/test_vesc_uart/`, `test/test_vesc_mcconf/`, `test/test_ubx/`, `test/test_trip/`, `test/test_display_strings_oled/`, `test/test_deadman/`, `test/test_ble_addr/`, `test/test_pump/` | Unity tests (one `test_main.cpp` each, 243 test cases), run on the host with `pio test -e native` |
+| `test/test_vesc/`, `test/test_vesc_getvalues/`, `test/test_vesc_uart/`, `test/test_vesc_mcconf/`, `test/test_ubx/`, `test/test_trip/`, `test/test_display_strings_oled/`, `test/test_deadman/`, `test/test_ble_addr/`, `test/test_pump/`, `test/test_pump_tach/` | Unity tests (one `test_main.cpp` each, 266 test cases), run on the host with `pio test -e native` |
 
 ## 2. Hardware and wiring
 
@@ -96,7 +97,7 @@ Files:
 
 - Resistors: 1 kOhm in series with TXD (TXD has a 25 kOhm pull-up to 5 V inside the MCP2551; the resistor limits the current into GPIO3 while the ESP32 is in reset). The 1 kOhm / 2.2 kOhm divider exists because the MCP2551 is a 5 V part and drives RXD to 5 V, while ESP32-C6 pads take VDD + 0.3 V at most; the divider gives ~3.4 V at a 5.0 V supply (check it, see below). A 3.3 V-IO transceiver (MCP2562 with VIO = 3V3, TJA1051T/3, SN65HVD230) connects RXD to GPIO2 directly. 120 Ohm across CANH/CANL at each end of the bus.
 - 5 V: the transceiver's VDD comes from the VESC's 5 V pin (or another regulated 5 V on the boat), never from the FireBeetle 3V3; every GND is commoned. The FireBeetle itself runs from USB-C (also the console) or its battery connector; the OLED and the GNSS module take 3V3 from the board.
-- Free header pins: GPIO1 and 8 (CS, DC on the SPI header) are not used by anything (GPIO1 is the dead-man cut in a `deadman` build); GPIO18 (SD_CS) drives the coolant pump stage ("Coolant pump" below). Alternatives: the FireBeetle's default I2C pins 19 (SDA) / 20 (SCL) with `-DPIN_OLED_SDA=19 -DPIN_OLED_SCL=20`; the on-board BOOT button with `-DPIN_BUTTON=9`; `-DPIN_OLED_RST=-1` when RES is tied high on the module.
+- Free header pins: GPIO1 and 8 (CS, DC on the SPI header) are not used by anything (GPIO1 is the dead-man cut in a `deadman` build); GPIO18 (SD_CS) drives the coolant pump stage ("Coolant pump" below) and GPIO19 (SDA) reads the pump's tach ("Pump tach (FG)" below). Alternatives: the FireBeetle's default I2C pins 19 (SDA) / 20 (SCL) with `-DPIN_OLED_SDA=19 -DPIN_OLED_SCL=20` (then move the tach, e.g. `-DPIN_PUMP_TACH=1` in a build without the dead-man); the on-board BOOT button with `-DPIN_BUTTON=9`; `-DPIN_OLED_RST=-1` when RES is tied high on the module.
 
 Silkscreen labels on the FireBeetle 2 ESP32-C6 equal GPIO numbers.
 
@@ -112,6 +113,7 @@ Silkscreen labels on the FireBeetle 2 ESP32-C6 equal GPIO numbers.
 | GNSS TX | 5 (`PIN_GNSS_TX`) | 5 / LP_TX | GNSS module RX |
 | LED | 15 (`PIN_LED`) | 15 | on-board LED, nothing to wire |
 | Pump PWM | 18 (`PIN_PUMP_PWM`, -1 = no pump) | 18 / SD_CS | gate (or base) of the pump's transistor stage ("Coolant pump" below) |
+| Pump tach | 19 (`PIN_PUMP_TACH`, -1 = no tach) | 19 / SDA | the FG input stage's node, through 1 kOhm ("Pump tach (FG)" below) |
 
 The OLED module and the GNSS module go to the board's 3V3 and GND. The CAN transceiver needs more care.
 
@@ -146,7 +148,7 @@ Any 128x64 SSD1309 module works (Waveshare, DIYables, LCDWIKI, Diymore / ACEIRMC
 | back-side solder resistors | interface select | - | Waveshare 2.42": both 0R resistors to the "I2C" position. LCDWIKI MSP154X: 4.7k on R4 + R9 only (remove R5). Diymore / ACEIRMC 2.42": move the 4.7k from R4 to R3, bridge R5. Adafruit 2719: BS1/BS2 jumpers. 4-pin "IIC" modules come pre-configured |
 
 - Pull-ups: the SSD1309 datasheet requires external pull-ups on SDA and SCL; the C6's internal ones (~45 kOhm) are far too weak for 400 kHz. Most I2C-configured modules carry 4.7 kOhm (on LCDWIKI boards the R4/R9 parts are the pull-ups); measure SDA and SCL to VCC and add 2.2..4.7 kOhm to 3V3 if there are none. If the display is flaky, build with `-DOLED_I2C_HZ=100000` (a frame then takes ~105 ms instead of ~26 ms, still fine at 4 Hz).
-- Why the SPI header pins: the OLED sits on the FireBeetle's SPI header pins (23 / SCK, 22 / MOSI, 14 / RES), which the C6 routes to I2C through its GPIO matrix (22 and 23 are unrestricted "P2" pins); nothing else uses SPI. The neighbouring CS / DC / SD_CS pins (GPIO1, 8, 18) are free. If you prefer the FireBeetle's default I2C pins (19 = SDA, 20 = SCL, also on the GDI connector), build with `-DPIN_OLED_SDA=19 -DPIN_OLED_SCL=20`.
+- Why the SPI header pins: the OLED sits on the FireBeetle's SPI header pins (23 / SCK, 22 / MOSI, 14 / RES), which the C6 routes to I2C through its GPIO matrix (22 and 23 are unrestricted "P2" pins); nothing else uses SPI. The neighbouring CS / DC / SD_CS pins (GPIO1, 8, 18) are free. If you prefer the FireBeetle's default I2C pins (19 = SDA, 20 = SCL, also on the GDI connector), build with `-DPIN_OLED_SDA=19 -DPIN_OLED_SCL=20` and move the pump tach off GPIO19 (`PIN_PUMP_TACH`).
 - Burn-in: white SSD1309 glass is rated ~20,000 h to half luminance (yellow ~50,000 h) and static images leave residual ghosts. The layout is black with sparse text (the only filled area is the 10-px title bar of the detail screens), and the contrast drops to `OLED_IDLE_CONTRAST` after `OLED_IDLE_DIM_MS` without a change (section 6). If the panel is still to be bought, a yellow one lasts longer.
 
 ### GNSS receiver
@@ -155,7 +157,7 @@ Any u-blox receiver or clone with a 3.3 V UART: NEO-6M/7M, NEO-M8N, SAM-M8Q, NEO
 
 ### Coolant pump (Kamoer KDLP1200-B12-T)
 
-The pump is a 12 V brushless diaphragm pump with four wires: red +12 V, black GND, white PWM speed input, yellow tach (FG, not used). Kamoer's manuals for the pumps of this family specify the PWM input as **5 V amplitude, 10..30 kHz**, 0..10 % duty = stopped, 11..100 % = the speed range, and the same wire also takes a 0..5 V analog level. For full speed without a controller Kamoer ties the white wire to +V, so the input tolerates 12 V; whether it has a pull-up of its own is not documented.
+The pump is a 12 V brushless diaphragm pump with four wires: red +12 V, black GND, white PWM speed input, yellow tach (FG: "speed feedback, 1 pulse/revolution" in Kamoer's manuals for its brushless pumps, output type undocumented; wiring in "Pump tach (FG)" below). Kamoer's manuals for the pumps of this family specify the PWM input as **5 V amplitude, 10..30 kHz**, 0..10 % duty = stopped, 11..100 % = the speed range, and the same wire also takes a 0..5 V analog level. For full speed without a controller Kamoer ties the white wire to +V, so the input tolerates 12 V; whether it has a pull-up of its own is not documented.
 
 **A 3.3 V GPIO cannot drive it directly.** Driven straight from the pin, the input sees 3.3 V where it expects 5 V: read as a level that is about 66 % speed, and against 5 V CMOS thresholds (0.7 x 5 V = 3.5 V) maybe not "high" at all. And should the pump pull its input up to 5 V or 12 V, a pin that is not 5 V tolerant would feed that into the ESP32's 3.3 V rail. One logic-level N-MOSFET solves both:
 
@@ -238,6 +240,68 @@ On the legs (TO-92, flat printed face towards you, legs down: **C B E** from lef
   2. ESP32 not connected (R1's free end open), pump on 12 V: the white wire reads ~5 V and the pump runs at full speed. Touch R1's free end to 3V3: the wire drops below 0.2 V and the pump stops.
   3. Everything connected: hold the board's RST button. The pump must go to full speed and stay there until you release it. This is the check that R2 is right.
 
+**Pump tach (FG).** The yellow wire tells the firmware whether the pump really turns (section 7, "The tach"). Kamoer does not document whether FG is open collector or push-pull, or at what voltage, so the stage below works with all of them and the pin never sees more than 3.3 V. Both stages sit in the dashboard enclosure; only the four pump wires leave it:
+
+```
+ +----------------- dashboard enclosure -------------------+                                Kamoer KDLP1200-B12-T
+ | FireBeetle 2 ESP32-C6 (S3-Zero: GP6 / GP11)             |                                +--------------+
+ | GPIO18 --> PWM stage: R1 R2 Q1 R3 (section 2) ----------+------ white  (PWM in) -------->| white  PWM   |
+ |                                                         |                                |              |
+ | GPIO19 <-- tach stage: R4 R5 C1 D1 (below) <------------+<----- yellow (FG out) ---------| yellow FG    |
+ |                                                         |                                |              |
+ | 3V3 ------> R5 (tach pull-up)                           |                                |              |
+ | VESC 5 V -> R3 (PWM pull-up; a wire from the VESC)      |                                |              |
+ | GND --+                                                 |                                |              |
+ +-------|-------------------------------------------------+                                |              |
+         |                                                                                  |              |
+ ========+==== boat 12 V negative bus: dashboard GND and pump black meet here ==============| black  GND   |
+                                                                                            |              |
+ boat +12 V ---[fuse 2 A]--------------------------------------- red (+12 V) -------------->| red    +12 V |
+                                                                                            +--------------+
+```
+
+The tach stage:
+
+```
+                                  3V3 (board pin)
+                                  |
+                              [R5 10k]   pull-up
+                                  |
+ GPIO19 ------[R4 1k]-------------+------------+------>|---------------> pump yellow (FG)
+ (PIN_PUMP_TACH)                    node       |   D1 BAT85, Schottky
+ S3-Zero: GP11                                 |   A ->| K   K = band, towards the pump
+                                           [C1 1nF]
+                                               |
+ GND ------------------------------------------+-----------------------> pump black / boat 12 V negative
+```
+
+Parts and their connections (the "node" is where R4, R5, C1 and D1's anode meet):
+
+| Part | Value / type | One end | Other end | Why |
+|---|---|---|---|---|
+| D1 | **Schottky**: BAT85 / BAT43 / BAT46 (DO-35 glass) or 1N5819 / SS14 | anode: node | **cathode (band): pump yellow** | lets FG only pull the node low. A high of 5 V or 12 V reverse-biases it, so the pin never sees more than 3.3 V |
+| R5 | 10 kOhm, 1/4 W | 3V3 | node | pull-up: an open-collector FG needs one, and a push-pull FG doesn't mind it. 0.33 mA when FG is low |
+| C1 | 1 nF ceramic, 50 V (C0G or X7R) | node | GND | with R5, 10 us of filtering against the 25 kHz PWM in the same cable (the PCNT's 10 us glitch filter, `PUMP_TACH_GLITCH_NS`, does the rest) |
+| R4 | 1 kOhm, 1/4 W | node | GPIO19 | limits the current into the pin's clamp diodes when a spike on the long wire drives the node below GND. No DC flows through it |
+
+Levels in each situation:
+
+| Situation | Yellow wire | D1 | GPIO19 | Counted |
+|---|---|---|---|---|
+| FG low (pump's output transistor on) | ~0..0.3 V | conducts, 0.33 mA | ~0.3..0.6 V = low (C6 VIL max 0.82 V) | yes, the falling edge |
+| FG high, open collector | floats | off | 3.3 V through R5 | - |
+| FG high, push-pull 5 V or 12 V | 5 / 12 V | reverse-biased, blocks | 3.3 V | - |
+| Yellow wire broken, pump unpowered or dead | - | off | 3.3 V, steady | no pulses: STALL / NO TACH |
+| ESP32 unpowered, pump running | toggling | off whenever FG is high | 0 V: nothing feeds the dead 3V3 rail | - |
+
+- **Why a Schottky:** a 1N4148 drops ~0.6 V at 0.33 mA. That puts the low level at ~0.8 V, right at the C6's VIL limit. A Schottky drops ~0.25 V.
+- **Pins:** FireBeetle GPIO19 (silkscreen "19" / SDA; the OLED uses 22/23). S3-Zero GP11 (front edge, next to GP10). Never 8/9/15 on the C6 or 0/3/45/46 on the S3: an FG holding a strapping pin low at reset can block download mode, and `config.h` refuses them. `-DPIN_PUMP_TACH=-1` builds without a tach.
+- **Placement and cable:** mount the stage at the dashboard end next to the PWM stage. Run yellow, white and black together as one cable to the pump, away from the motor phase cables. For a run longer than ~2 m, or a noisy boat, use a shielded cable with the shield on GND at the dashboard end only.
+- **Bench checks before the first run:**
+  1. Meter diode test across D1, red probe on the anode (node side): 0.15..0.35 V. Reversed: open. Anything else means it is in backwards or it is not a Schottky.
+  2. Dashboard powered, yellow end free: GPIO19 reads 3.3 V. Touch the free end to GND: below 0.7 V. The PUMP log line's `pulses=` counter goes up with each touch (a touch may count several bounces).
+  3. Pump on 12 V with yellow disconnected: measure the yellow wire against black. ~0 V means open collector without a pull-up; ~half the supply, or a Hz reading, means push-pull or a pull-up of its own. All are fine with this stage. A meter with a Hz range shows rpm x `PUMP_TACH_PPR` / 60.
+
 ### Pins to leave alone
 
 | GPIO | Why |
@@ -253,7 +317,7 @@ On the legs (TO-92, flat printed face towards you, legs down: **C B E** from lef
 
 `pio run -e s3zero_deadman_uart` is the `deadman_uart` build (VESC over UART, dead-man's switch) for a Waveshare ESP32-S3-Zero instead of the FireBeetle (`BOARD_S3_ZERO=1`, board JSON `boards/waveshare_esp32s3_zero.json`). The module is an ESP32-S3FH4R2: 4 MB flash, and 2 MB PSRAM that the firmware leaves unused. It has native USB only (GPIO19/20), a WS2812 RGB LED on GPIO21 and a BOOT button on GPIO0. It is powered through its 5V pin (3.7..6 V in) and has 3V3 out from an ME6217 regulator (800 mA).
 
-Everything uses the FireBeetle's GPIO numbers wherever the module has them. Only the OLED moves (the S3-Zero has no GPIO22/23), the pump stage moves to GP6 (GPIO18 is only a pad on the back), and the LED becomes the on-board WS2812:
+Everything uses the FireBeetle's GPIO numbers wherever the module has them. Only the OLED moves (the S3-Zero has no GPIO22/23), the pump stage moves to GP6 (GPIO18 is only a pad on the back), the pump tach to GP11 (GPIO19 is USB there), and the LED becomes the on-board WS2812:
 
 | S3-Zero pin | Function | FireBeetle GPIO |
 |---|---|---|
@@ -262,6 +326,7 @@ Everything uses the FireBeetle's GPIO numbers wherever the module has them. Only
 | GP3 | VESC UART TX -> 1 kOhm -> VESC RX | 3 |
 | GP4 / GP5 | GNSS RX / TX | 4 / 5 |
 | GP6 | coolant pump PWM stage (section 2, "Coolant pump") | 18 |
+| GP11 | coolant pump tach (FG) stage (section 2, "Pump tach (FG)") | 19 |
 | GP7 | button to GND | 7 |
 | GP8 / GP9 / GP10 | OLED SDA / SCL / RES | 22 / 23 / 14 |
 | GP21 (on board) | WS2812 status LED | 15 (plain LED) |
@@ -672,7 +737,8 @@ Eight screens, cycled by the button (section "Button" below); the detail screens
 - **VESC 1/3.** Row 1 is the fault row: `FAULT <name>` while the live fault byte of a fresh poll reply is non-zero, `LAST <name> <age>` when a fault was latched earlier (`34s`, `12m`, `3h`, `2d`), `FAULT none` (fresh reply, no fault, nothing latched), `FAULT --` (polled values stale, or `VESC_POLL_MS 0`). Then input voltage / battery current (one decimal), motor current / duty %, power / rpm, FET and motor temperature with one decimal (raw, no plausibility filter), Ah / Wh drawn.
 - **VESC 2/3** (polled values, `VESC_EXT_STALE_MS` window): `Tmos`, the first MOSFET temperature (the VESC reports three; MOSFET 2 and 3 stay in the poll and the log but left the screen) with `Iin`, the VESC's own averaged input current (`Tmos --    Iin --` when stale), average d/q currents, d/q voltages, tachometer (STATUS_5) / absolute tachometer (polled), status `St OK` / `TIMEOUT` (no control input, timeout brake active) / `KILLSW` / `TO+KILL` and the controller id from the reply, charged Ah / Wh.
 - **VESC 3/3**: PPM input / PID position, `ADC` 1/2/3 volts (`ADC --` when STATUS_6 is stale), poll counters `poll` (requests sent) / `ok` (complete replies) / `bad` (CRC or format failures) / `tmo` (reply timeouts) - `poll off   ok --` and `bad --     tmo --` in a `VESC_POLL_MS 0` build -, `frm` accepted status frames / `oth` frames from another controller id, `misc` non-status or odd-DLC frames / `busoff` events.
-- **PUMP** (`PUMP_ENABLE`, section 7 "Coolant pump"): the pump task's mode, commanded duty and reason (`RUN 62% warm`, `RUN 20% turning`, `RUN 20% after-run`, `OFF 0% cool`, `OFF 0% no data`, `FULL 100% derating`, `BLIND 100% no link`, `FORCED 30% forced`, `FAULT 100% pwm setup`; `--` while the task is silent); motor and MOSFET temperature (`--` stale, `n/a` no sensor) against their targets; the VESC limits in use, `Lim M<motor start>/<end> F<MOSFET start>/<end>`; `dec` = `l_temp_accel_dec` and where the limits came from (`VESC 6.06` = read from a 6.06 firmware, `DEF wait` = the `PUMP_DEFAULT_*` values until the first answer, `DEF new FW` = a firmware whose layout this build does not know, `DEF bad lim` / `DEF bad rep`, `DEF cfg` = not read at all); the loop's error (C over target, the worse sensor) and its integral term.
+- **PUMP** (`PUMP_ENABLE`, section 7 "Coolant pump"): the pump task's mode, commanded duty and reason (`RUN 62% warm`, `RUN 20% turning`, `RUN 20% after-run`, `OFF 0% cool`, `OFF 0% no data`, `FULL 100% derating`, `FULL 100% stalled`, `FULL 100% no tach`, `BLIND 100% no link`, `FORCED 30% forced`, `FAULT 100% pwm setup`; `--` while the task is silent); motor and MOSFET temperature (`--` stale, `n/a` no sensor) against their targets; the VESC limits in use, `Lim M<motor start>/<end> F<MOSFET start>/<end>`; `dec` = `l_temp_accel_dec`, and next to it the pump's speed from the tach: `3450rpm` (`~` while the 2 s window is still filling), or `STALL` / `NO TACH` / `RUNS AT 0%` / `tach ERR` (section 7, "The tach"). Without a tach (`PIN_PUMP_TACH -1`) that place says where the limits came from (`VESC 6.06` = read from a 6.06 firmware, `DEF wait` = the `PUMP_DEFAULT_*` values until the first answer, `DEF new FW` = a firmware whose layout this build does not know, `DEF bad lim` / `DEF bad rep`, `DEF cfg` = not read at all); with a tach the source is in the PUMP log line (`lim VESC(6.06)` / `lim DEF...`). Last row: the loop's error (C over target, the worse sensor) and its integral term.
+- **Pump alarm** (overlay, with a tach). While the tach says `STALL` or `NO TACH` it replaces whatever page is shown: `PUMP STALLED 12s` (or `NO PUMP TACH SIGNAL`), the duty and the rpm, `forced to 100%`, what to check (`chk fuse/plug/hose`, or `chk FG wire / diode`), `motor may derate`, and `PRESS BTN: DISMISS`. A short press dismisses it and does nothing else; a long press dismisses it and goes back to MAIN. The next stall brings it back. Only the dead-man's alarm and the update-mode screens rank above it.
 - **GNSS**: fix and satellites (`3D 9sv`, `2D 12sv`, `TIME ONLY`, `NO FIX`, `NO DATA`, `NO GNSS`, or the phase `AUTOBAUD` / `DETECT` / `CONFIG` while nothing has been received) with pDOP; latitude/longitude with five decimals (`Pos --` without a usable fix); height above sea level / horizontal accuracy; speed (same rules as the main screen) / speed accuracy in m/s; heading of motion (only while moving) / vertical accuracy; UTC date-time (`UTC --` when unknown).
 - **SYS `FW_VERSION`**: uptime (`12m34s`, `1h23m`, `12d03h`) / debounced button presses, free heap / minimum free heap in kB, TWAI state (`UNINST` / `STOP` / `RUN` / `BUSOFF` / `RECOV`) with the TEC and REC error counters, GNSS phase, baud and PROTVER, good/bad UBX frames and redetects, reset reason / `state_lock()` timeouts.
 - **Dead-man overlay** (`deadman` build, section 5). While the firmware is holding the motor cut
@@ -731,7 +797,7 @@ Prerequisites: PlatformIO Core (`pio` on the PATH, e.g. `~/.platformio/penv/bin/
 | `pio run -e deadman -t upload` | the default build plus the BLE dead-man's switch (section 5; NimBLE host from `sdkconfig.defaults.ble`). `DEADMAN_BEACON_ADDR` (and `DEADMAN_BEACON_ADDR2` for a second tag) must be set to your hardware first: a tag address that never matches leaves the switch in `NO TAG` for ever |
 | `pio run -e deadman_uart -t upload` | the `deadman` build with the VESC on its COMM-header UART instead of CAN (section 3b): no transceiver; App to Use must include UART |
 | `pio run -e s3zero_deadman_uart -t upload` | `deadman_uart` on a Waveshare ESP32-S3-Zero (section 2b); the first build compiles ESP-IDF for the S3 |
-| `pio test -e native` | host unit tests in ten directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_vesc_uart`, `test/test_vesc_mcconf`, `test/test_ubx`, `test/test_trip`, `test/test_display_strings_oled`, `test/test_deadman`, `test/test_ble_addr`, `test/test_pump`; 243 test cases): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UART link codec (request frame, reassembly through junk, damaged frames and bogus headers, the state update from a reply), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, 32-bit clock wrap), the dead-man state machine (arming, enrolment of two tags, timeout, latch and reset, no radio, the closed loop), BLE address parsing, the temperature limits out of a `COMM_GET_MCCONF` reply for every known firmware layout and the read scheduler, the pump controller (targets, modes, start/stop, PI loop, anti-windup, bumpless transfers), all OLED screens and overlays, the update-mode entry gate, and the clock arithmetic; no hardware |
+| `pio test -e native` | host unit tests in eleven directories (`test/test_vesc`, `test/test_vesc_getvalues`, `test/test_vesc_uart`, `test/test_vesc_mcconf`, `test/test_ubx`, `test/test_trip`, `test/test_display_strings_oled`, `test/test_deadman`, `test/test_ble_addr`, `test/test_pump`, `test/test_pump_tach`; 266 test cases): STATUS decoder, poll codec (request bytes, reassembly, CRC, decode, fault table), UART link codec (request frame, reassembly through junk, damaged frames and bogus headers, the state update from a reply), UBX parser and the CFG-PRT / CFG-RATE / VALSET frame builders (byte-exact against the u-blox frames), trip integrator (distance gate, both energy sources, counter resets, outages, window and gap rules, 32-bit clock wrap), the dead-man state machine (arming, enrolment of two tags, timeout, latch and reset, no radio, the closed loop), BLE address parsing, the temperature limits out of a `COMM_GET_MCCONF` reply for every known firmware layout and the read scheduler, the pump controller (targets, modes, start/stop, PI loop, anti-windup, bumpless transfers, the stall duty), the pump's tach (rpm window, spin-up and spin-down, STALL / NO TACH / RUNS AT 0%, the alarm count), all OLED screens and overlays, the update-mode entry gate, and the clock arithmetic; no hardware |
 | `pio run -e demo -t upload` | flash the layout demo (`DISPLAY_DEMO=1` on top of the default env: all eight screens and the dead-man row with synthetic data, dimming after 20 s; no BLE) |
 | `pio run -t menuconfig` | ESP-IDF menuconfig on the env's generated `sdkconfig`; put lasting changes into `sdkconfig.defaults` |
 | `pio project init --ide vscode` | regenerate IntelliSense after changing `platformio.ini` |
@@ -748,6 +814,7 @@ I (1535) gnss: GNSS: UART1 RX=GPIO4 TX=GPIO5 ring=2048 B, first baud 115200, tar
 I (1540) oled: OLED: button on GPIO7 (active low, pull-up, debounce 30 ms, long press 1500 ms, auto-return 0 ms)
 I (1575) oled: OLED: init ok (SSD1309 128x64, I2C 0x3C @ 400000 Hz, sda=22 scl=23 rst=14)
 I (1600) pump: pump started: GPIO18 25000 Hz 10 bit inverted, min 20 %, blind 100 %, Kp 8.0 Ki 0.10 Kd 0.0, target = derating start - 10 C, limits from the VESC (COMM_GET_MCCONF)
+I (1601) pump: tach on GPIO19: 1 pulse(s)/rev, stall below 200 rpm for 5000 ms after a 3000 ms spin-up -> full duty, glitch filter 10000 ns
 I (1611) main: started: can=1 gnss=1 display=1 trip=1 ble=0 deadman=0 pump=1
 I (1612) trip: trip: task started (period 200 ms, window 10 s, unit Wh/km, min speed 500 mm/s)
 I (1640) oled: OLED: task started (poll 20 ms, frame 250 ms, 8 screens, button GPIO7, auto-return 0 ms, demo=0)
@@ -822,6 +889,7 @@ Every build with `PIN_PUMP_PWM` set (GPIO18 on the FireBeetle, GP6 on the S3-Zer
 | `OFF` (`no data`) | no fresh VESC temperatures since power-up: the VESC is off at the dock | 0 |
 | `BLIND` (`no link` / `no sensor`) | temperatures were seen and then stopped (link lost, VESC switched off), or neither reads plausibly. The dashboard cannot tell whether the motor still works hard, so it errs on the cool side; it stays blind until data returns | `PUMP_BLIND_DUTY_PCT` (100 %) |
 | `FULL` (`derating`) | a temperature at or above its derating point: a backstop, the loop is normally there already | 100 % |
+| `FULL` (`stalled` / `no tach`) | the pump should run (any of the `RUN` reasons), but the tach says it does not turn ("The tach" below). The start / stop rules still apply: a cool, still motor stops it | `PUMP_TACH_STALL_DUTY_PCT` (100 %) |
 | `RUN` (`turning` / `warm` / `after-run`) | started by the motor turning (fresh rpm above `PUMP_TURNING_RPM`) or a temperature within `PUMP_ON_BAND_C` (15 C) of its target; stopped only with the motor still, both temperatures more than `PUMP_ON_BAND_C + PUMP_HYST_C` (20 C) below target and `PUMP_MIN_RUN_MS` (60 s) after the last reason to run - Kamoer warns that frequent start/stop wears the pump | PID, `PUMP_MIN_DUTY_PCT` (20 %)..100 % |
 | `OFF` (`cool`) | otherwise | 0 |
 | `FORCED` | `PUMP_FORCE_DUTY_PCT` 0..100 (commissioning) | that |
@@ -835,11 +903,32 @@ The loop works on one error: the larger of (motor - motor target) and (MOSFET - 
 3. Normal build: at link-up the log shows `VESC temp limits (mcconf FW 6.06): motor 85/100 C, MOSFET 85/100 C, accel_dec 0.15 -> the VESC derates from motor 76.0 / MOSFET 76.0 C`; the PUMP page shows `VESC 6.06`. Spin the motor: `pump RUN (turning) at 20 %`.
 4. Pull the CAN or UART plug: within `VESC_STALE_R1_MS` (2 s) `pump BLIND (no link): 100 %`. Plug it back: `RUN` again.
 5. To watch the loop without heating anything, build with a large `PUMP_TARGET_MARGIN_C` (40 puts the target at 36 C) and see the duty follow the temperatures; then go back to 10.
+6. Tach (wiring and bench checks: section 2, "Pump tach (FG)"): build with `-DPUMP_FORCE_DUTY_PCT=100`. After 2 s the PUMP page and the log show a steady rpm. If it is about 6 times what the pump's motor can do, it gives 6 pulses per revolution: set `PUMP_TACH_PPR 6`.
+7. Repeat at 15, 20, 30 and 50 % and note the rpm per duty. Set `PUMP_TACH_MIN_RPM` to about a third of the rpm at `PUMP_MIN_DUTY_PCT`. Keep the table: it is the baseline for a later slow / fast check.
+8. Normal build, pump running (spin the motor): pull the yellow wire. About 7 s later (the 2 s window empties, then `PUMP_TACH_STALL_MS`) the log says `pump tach STALL`, the pump alarm comes up and the duty goes to 100 %. A press dismisses it. Plug the wire back: `pump tach OK again` 2 s later.
+9. Pull the pump's fuse while it runs: the same STALL.
+
+**The tach** (`include/pump_tach.h`; `PIN_PUMP_TACH`: GPIO19 on the FireBeetle, GP11 on the S3-Zero, `-DPIN_PUMP_TACH=-1` removes it). A PCNT unit counts the FG wire's falling edges. Every tick the pump task turns the count into rpm over the last `PUMP_TACH_WINDOW_MS` (2 s), at `PUMP_TACH_PPR` (1) pulses per revolution, and judges it against the duty it drove over the period before:
+
+| Tach state | When | What happens |
+|---|---|---|
+| `OK` | turning at or above `PUMP_TACH_MIN_RPM` (200) while it should run; still after the spin-down while it is stopped | nothing; the rpm on the PUMP page |
+| (no verdict) | for `PUMP_TACH_SPINUP_MS` (3 s) after a start and `PUMP_TACH_SPINDOWN_MS` (5 s) after a stop, and at a FORCED duty below `PUMP_MIN_DUTY_PCT` | the rpm is shown, nothing is judged |
+| `STALL` | should run, but below `PUMP_TACH_MIN_RPM` for `PUMP_TACH_STALL_MS` (5 s) after the spin-up: a blocked, unpowered (fuse) or unplugged pump, a dead one, or the FG wire came off. A locked rotor whose driver retries now and then still averages under the minimum | `FULL (stalled)` at `PUMP_TACH_STALL_DUTY_PCT` (100 %: the most torque for those retries, and a broken FG wire costs noise, never cooling; 0 = alert only), the pump alarm, a `W` log line. Over once it turns for `PUMP_TACH_OK_MS` (2 s); RUN then eases down from 100 %. Stopping the pump ends it too, and the next start judges again |
+| `NO TACH` | the same, but not one pulse since boot: most likely the FG stage or its wire | the same, `FULL (no tach)`, an `E` log line |
+| `RUNS AT 0%` | still turning `PUMP_TACH_SPINDOWN_MS` after it was commanded to 0 %, for `PUMP_TACH_OK_MS` | a `W` log line and the PUMP page only: the PWM stage does not stop it (transistor, pull-up, white wire), so it runs at full speed, the cool side |
+| `tach ERR` | the PCNT could not be set up (the `pump: tach:` error at boot) | no speed and no alarm; the pump control is unaffected |
+
+Every summary line ends with the tach: state, rpm (`~` while the window is still filling), the pulse count since boot and the alarm count. With the duty on the same line that is a record of rpm against duty every 5 s, the data a later slow / fast check (a blocked hose, air in the loop) needs. That check does not exist yet: Kamoer's driver may hold the speed itself, so a change in load may not show in the rpm at all.
 
 The task logs a line every `LOG_PUMP_MS` (5 s) and every mode change:
 
 ```
-I (8000) pump: PUMP RUN(turning) 20% Tm=41.5/66.0 Tf=38.0/66.0 err=-24.5 I=0.0 | lim VESC(6.06) M85/100 F85/100 dec0.15 reads=1 age=210ms
+I (8000) pump: PUMP RUN(turning) 20% Tm=41.5/66.0 Tf=38.0/66.0 err=-24.5 I=0.0 | lim VESC(6.06) M85/100 F85/100 dec0.15 reads=1 age=210ms | tach OK rpm=1830 pulses=187 alarms=0
+I (8000) pump: pump tach OK: 1830 rpm at 20 %
+W (61200) pump: pump FULL (stalled) at 100 %: the tach says it does not turn
+W (61200) pump: pump tach STALL: 0 rpm although it should run (blocked, unpowered or unplugged pump, or the FG wire) - duty 100 %
+I (75400) pump: pump tach OK again: 3410 rpm at 100 %
 W (95200) pump: pump BLIND (no link): 100 % until the VESC temperatures are back
 ```
 
@@ -878,8 +967,13 @@ Update mode (above) holds the pump stopped: the motor cannot be driven then (the
 | Pump never runs, PUMP page `OFF 0% no data` | no VESC temperatures since power-up: the VESC link is down (VESC 1/3 `Tfet --`). `OFF 0% cool` with the motor turning: the rpm is stale or below `PUMP_TURNING_RPM` |
 | Pump runs at the set duty but does not turn at low duty | below the pump's dead band (0..10 % per Kamoer, more on some units): raise `PUMP_MIN_DUTY_PCT` (commissioning step 2) |
 | Pump keeps running after the ride | intended: `PUMP_MIN_RUN_MS` (60 s) after the motor last turned, and it holds while a temperature stays inside the `PUMP_HYST_C` band (within 20 C of target) |
-| PUMP page `DEF new FW`, log `VESC mcconf signature 0x... is no firmware layout this build knows` | VESC firmware newer (or older) than the table in `include/vesc_mcconf.h`: the pump uses `PUMP_DEFAULT_*`. Add the signature from that release's `confgenerator.h` with the encoding of its `l_temp_*` fields (`confgenerator.c`) |
-| PUMP page `DEF wait` for good, log `no complete answer to COMM_GET_MCCONF` every 10 s | over CAN: `CAN: RX queue full` / `rxmiss` = the 76-frame reply overflowed the queue (raise `CAN_RX_QUEUE_LEN`); over UART: raise `VESC_MCCONF_TIMEOUT_MS`. `DEF cfg` = the read is off (`VESC_POLL_MS 0`, `CAN_LISTEN_ONLY` or `PUMP_LIMITS_FROM_VESC 0`) |
+| Pump alarm `PUMP STALLED`, log `pump tach STALL` | the pump should run but turns below `PUMP_TACH_MIN_RPM`: its fuse and 12 V, its plug, a blocked inlet or outlet, a kinked hose, or the yellow wire. The duty stays at 100 % until it turns again. Only at low duty: `PUMP_MIN_DUTY_PCT` is below this pump's real start point (commissioning step 2), or `PUMP_TACH_MIN_RPM` is above its speed there (step 7) |
+| Pump alarm `NO PUMP TACH SIGNAL`, log `pump tach NO SIGNAL` | not one pulse since boot: the FG stage (D1 backwards, R5 missing: the bench checks in section 2), the yellow wire, or `PIN_PUMP_TACH` is not where the stage is. No tach wired at all: build with `-DPIN_PUMP_TACH=-1` |
+| PUMP page `RUNS AT 0%`, log `the PWM stage does not stop it` | the pump turns while it is commanded off: the PWM stage's transistor, its pull-up or the white wire (section 2). It runs at full speed meanwhile |
+| PUMP page `tach ERR` | the PCNT setup failed: the `pump: tach:` error at boot names the step |
+| PUMP page rpm jumps, or reads far too high | noise on the yellow wire: run it with the black one and away from the motor phases, check C1, raise `PUMP_TACH_GLITCH_NS` (up to 12000) |
+| PUMP page `DEF new FW` (with a tach: the PUMP log line's `lim DEF(sig ...)`), log `VESC mcconf signature 0x... is no firmware layout this build knows` | VESC firmware newer (or older) than the table in `include/vesc_mcconf.h`: the pump uses `PUMP_DEFAULT_*`. Add the signature from that release's `confgenerator.h` with the encoding of its `l_temp_*` fields (`confgenerator.c`) |
+| PUMP page `DEF wait` for good (with a tach: `lim DEF` in the PUMP log line), log `no complete answer to COMM_GET_MCCONF` every 10 s | over CAN: `CAN: RX queue full` / `rxmiss` = the 76-frame reply overflowed the queue (raise `CAN_RX_QUEUE_LEN`); over UART: raise `VESC_MCCONF_TIMEOUT_MS`. `DEF cfg` = the read is off (`VESC_POLL_MS 0`, `CAN_LISTEN_ONLY` or `PUMP_LIMITS_FROM_VESC 0`) |
 | `fatal error: u8g2.h: No such file or directory` | the submodule is empty: `git submodule update --init` |
 | `#error This firmware targets the ESP32-C6 (ESP-IDF)` | the board or platform in `platformio.ini` was changed, `sdkconfig.defaults` lost `CONFIG_IDF_TARGET`, or the wrong env is selected |
 | A change in `sdkconfig.defaults`, `sdkconfig.defaults.ble` or `sdkconfig.defaults.esp32s3` has no effect | the generated `sdkconfig.<env>` (`sdkconfig.dfrobot_firebeetle2_esp32c6`, `sdkconfig.deadman`, ...) already exists, and a value in it wins over the defaults: delete it and rebuild |
@@ -917,6 +1011,7 @@ Compile-time checks stop you from using GPIO12/13 (on the S3-Zero: the USB pins 
 | GNSS | `PIN_GNSS_RX`, `PIN_GNSS_TX`, `GNSS_BAUDS`, `GNSS_TARGET_BAUD` (0 = keep the detected baud), `GNSS_RX_BUFFER`, `GNSS_RATE_MS` (200 = 5 Hz, 100 = 10 Hz), `GNSS_DYNMODEL_SEA`, `GNSS_STALE_MS`, `GNSS_REDETECT_MS`, `GNSS_ACK_TIMEOUT_MS`, `GNSS_MAX_SACC_MM_S`, `SPEED_MIN_SHOW`, `SPEED_UNIT_KNOTS` |
 | Trip / efficiency | `TRIP_PERIOD_MS`, `EFF_WINDOW_S` (2..120 s), `EFF_MIN_SPEED_MM_S`, `EFF_MIN_DIST_M`, `EFF_UNIT_KM` (1 = Wh/km even with knots), `LOG_TRIP_MS` (0 = off) |
 | Dead-man's switch (`deadman` env, section 5) | `DEADMAN_ENABLE`, `DEADMAN_BEACON_ADDR` (mandatory), `DEADMAN_BEACON_ADDR2` ("" = one tag), `DEADMAN_ENROL_MS`, `PIN_DEADMAN_CUT`, `DEADMAN_TIMEOUT_MS`, `DEADMAN_WARN_MS`, `DEADMAN_ARM_REPORTS` / `DEADMAN_ARM_WINDOW_MS` / `DEADMAN_ARM_RSSI`, `DEADMAN_RESET_FRESH_MS`, `DEADMAN_BOOT_CUT`, `DEADMAN_CONFIRM_ENABLE` / `DEADMAN_CONFIRM_MS`, `DEADMAN_SCAN_ITVL_MS` / `DEADMAN_SCAN_WINDOW_MS`, `TASK_PRIO_DEADMAN`, `DEADMAN_TASK_STACK`, `DEADMAN_TICK_MS`, `HB_MAX_DEADMAN_MS`, `LOG_DEADMAN_MS`, `TASK_PRIO_BLE` / `BLE_TASK_STACK` (the `ble` task). Derived: `DEADMAN_UI_ENABLE` |
+| Coolant pump (section 7) | `PIN_PUMP_PWM` (-1 = no pump), `PUMP_PWM_FREQ_HZ`, `PUMP_PWM_INVERT`, `PUMP_PWM_RES_BITS`, `PUMP_MIN_DUTY_PCT`, `PUMP_BLIND_DUTY_PCT`, `PUMP_FORCE_DUTY_PCT`, `PUMP_PERIOD_MS`, `PUMP_KP` / `PUMP_KI` / `PUMP_KD` / `PUMP_D_ALPHA`, `PUMP_TARGET_MARGIN_C`, `PUMP_ON_BAND_C`, `PUMP_HYST_C`, `PUMP_MIN_RUN_MS`, `PUMP_TURNING_RPM`, `PUMP_LIMITS_FROM_VESC`, `PUMP_DEFAULT_*`, `VESC_MCCONF_TIMEOUT_MS` / `_RETRY_MS` / `_REFRESH_MS`; the tach: `PIN_PUMP_TACH` (-1 = no tach), `PUMP_TACH_PPR`, `PUMP_TACH_MIN_RPM`, `PUMP_TACH_WINDOW_MS`, `PUMP_TACH_SPINUP_MS`, `PUMP_TACH_STALL_MS`, `PUMP_TACH_SPINDOWN_MS`, `PUMP_TACH_OK_MS`, `PUMP_TACH_STALL_DUTY_PCT` (0 = alert only), `PUMP_TACH_GLITCH_NS`; `TASK_PRIO_PUMP`, `PUMP_TASK_STACK`, `HB_MAX_PUMP_MS`, `LOG_PUMP_MS` |
 | Tasks / watchdog / logging | `TASK_PRIO_CAN`, `TASK_PRIO_GNSS`, `TASK_PRIO_DISP`, `WDT_TIMEOUT_MS`, `HB_MAX_CAN_MS`, `HB_MAX_GNSS_MS`, `HB_MAX_DISP_MS`, `LOG_VESC_MS`, `LOG_GNSS_MS`, `LOG_TRIP_MS`, `LOG_SYS_MS`, `SERIAL_BOOT_DELAY_MS`, `PIN_LED`, `FW_VERSION` |
 | Advanced (defaults are fine) | `CAN_TASK_STACK`, `CAN_INSTALL_RETRY_MS`, `CAN_RX_TIMEOUT_MS`, `CAN_ERR_LOG_MIN_MS`, `CAN_ERR_WARN_LEVEL`, `CAN_TX_WAIT_MS`, `VESC_POLL_LOG_MIN_MS`, `VESC_POLL_BACKOFF_AFTER`, `VESC_POLL_BACKOFF_MS`, `VESC_GETVALUES_MASK` (0 = plain `COMM_GET_VALUES`), `VESC_RX_BUFFER_SIZE`, `GNSS_TASK_STACK`, `GNSS_AUTOBAUD_LISTEN_MS`, `GNSS_MONVER_TIMEOUT_MS`, `GNSS_AUTOBAUD_RETRY_MS`, `OLED_TASK_STACK`, `OLED_INIT_RETRY_MS`, `OLED_I2C_TIMEOUT_MS`, `OLED_BUTTON_POLL_MS`. Also in `config.h`, with local `#ifndef` fallbacks in the sources so a trimmed copy still builds: `GNSS_BAUD_SWITCH_ATTEMPTS` (2), `GNSS_BAUD_SWITCH_SETTLE_MS` (100), `TASK_PRIO_TRIP` (3), `TRIP_TASK_STACK` (4096), `TRIP_DT_MAX_MS` (5000), `TRIP_COUNTER_RESET_WH` (0.5), `TRIP_EFF_MIN_FILL_S` (3), `TRIP_STALE_MS` (5000). `src/can_vesc.cpp` alone: `CAN_SAMPLE_POINT_PERMILL` (800, the bit sample point) |
 
@@ -927,7 +1022,7 @@ Notes: the OLED layout is hard-coded for 128x64 in `OLED_ROTATION` 0 or 2. `OLED
 - With the default `VESC_POLL_MS 1000` the board is no longer silent on the bus: it transmits one 7-byte read request per second under its own id `CAN_OWN_ID` (`candump` on a second adapter shows `0000084A [7] 78 00 32 00 3E C0 3C` for VESC id 74) and the VESC answers with seven frames. The request is the same read-only query VESC Tool uses; nothing in the firmware can write a setting or command the motor (`grep -rn twai_node_transmit src/` finds the single call in `poll_tick()`, under `#if VESC_POLL_MS > 0`). Build with `-DVESC_POLL_MS=0` to get a node that only ACKs and contains no transmit call at all.
 - The dead-man's switch (section 5) does **not** change any of this. It cuts the motor through a GPIO wired to the VESC's own kill-switch input, so `grep -rn twai_node_transmit src/` still finds the single call in `poll_tick()` and the bytes on the CAN bus are identical with `DEADMAN_ENABLE` 0 or 1. What does change is that the board now actuates a safety input. It is fail-passive - the pin is open drain, so the firmware can only ever ADD a kill and a dead dashboard leaves the mechanical lanyard in charge - but a hung dashboard silently removes the BLE layer for up to `WDT_TIMEOUT_MS`, and a reboot releases a latched cut. It is not a certified man-overboard device and does not replace the lanyard.
 - The UART build (section 3b) transmits exactly two things, both from `poll_tick()` in `src/uart_vesc.cpp` (the only `uart_write_bytes` call there): the 6-byte `COMM_GET_VALUES` request every `VESC_POLL_MS`, and with the pump the 6-byte `COMM_GET_MCCONF` at link-up and every 10 minutes. Both are read-only and neither resets the VESC's control timeout, and the TWAI driver is not linked at all. On CAN the pump's `COMM_GET_MCCONF` goes through the same single `twai_node_transmit` call.
-- The coolant pump (section 7) is the second output the board drives, and like the dead-man's it fails towards the safe side: whenever the firmware is not actively driving `PIN_PUMP_PWM` (no power, reset, crash, a hung task until the watchdog reboot, failed PWM setup) the MOSFET stage's pull-down runs the pump at full speed. Software that loses the VESC temperatures after seeing them does the same (`BLIND`). It is still a dashboard function, not a protection: the VESC's own temperature derating and cut-off stay in charge of the motor.
+- The coolant pump (section 7) is the second output the board drives, and like the dead-man's it fails towards the safe side: whenever the firmware is not actively driving `PIN_PUMP_PWM` (no power, reset, crash, a hung task until the watchdog reboot, failed PWM setup) the MOSFET stage's pull-down runs the pump at full speed. Software that loses the VESC temperatures after seeing them does the same (`BLIND`). With the tach, a pump that should run but does not turn is no longer silent: `STALL` / `NO TACH` raise the pump alarm and set `PUMP_TACH_STALL_DUTY_PCT` (100 %), so a broken tach wire costs pump noise, never cooling. The tach input only reads; nothing about it can stop the pump. It is still a dashboard function, not a protection: the VESC's own temperature derating and cut-off stay in charge of the motor.
 - The radio of the dead-man builds (section 5) only listens: NimBLE runs in the observer role with a passive scan, so the board never advertises, never connects and transmits nothing over BLE (a passive scan sends no scan requests). It stores no bonding: after the first controller enable (PHY calibration blob, written before the CAN node exists) nothing is written to flash.
 - The polled averages (Iavg, id/iq, vd/vq) are "since the previous read": running VESC Tool's realtime page at the same time shortens their window on both sides. Everything else is unaffected by a second reader.
 - With the VESC powered off, each unanswered request costs the controller 8 error points until it goes error-passive (~16 polls); the log then shows `CAN: error passive` and the poll warnings every 10 s and the request rate drops to every 5 s. No bus-off, and it recovers by itself when the VESC is back.
@@ -941,7 +1036,7 @@ Notes: the OLED layout is hard-coded for 128x64 in `OLED_ROTATION` 0 or 2. `OLED
 ## 10. Future work (out of scope for this version)
 
 - `CAN_PACKET_PING` / `PONG` discovery so polling can start on a VESC that broadcasts no status frames without pinning `VESC_CAN_ID`, and answering pings so the board shows up in VESC Tool's CAN scan.
-- The pump's yellow FG (tach) wire on a PCNT input, so a stalled, dry-running or unplugged pump raises an alarm instead of going unnoticed.
+- A slow / fast check for the pump against a measured rpm-vs-duty baseline (a blocked hose, air in the loop), once the logged rpm shows that this pump's speed actually moves with load.
 - Burn-in mitigation beyond dimming: `DISPLAYOFF` (0xAE) after a long idle, or shifting the layout by a pixel every few minutes.
 - Deep sleep and the LP-UART for the GNSS receiver.
 - Persisting the trip (distance, energy) across reboots and logging a track; today the trip restarts at every boot and nothing is written to flash.

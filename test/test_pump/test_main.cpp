@@ -323,9 +323,91 @@ static void test_mode_and_reason_names() {
   TEST_ASSERT_EQUAL_STRING("BLIND", pump_mode_str(PUMP_MODE_BLIND));
   TEST_ASSERT_EQUAL_STRING("?", pump_mode_str(99));
   // every reason fits next to "BLIND 100% " on a 21-char row
-  for (uint8_t w = PUMP_WHY_NONE; w <= PUMP_WHY_PWM; ++w) TEST_ASSERT_TRUE(strlen(pump_why_str(w)) <= 9);
+  for (uint8_t w = PUMP_WHY_NONE; w <= PUMP_WHY_NO_TACH; ++w) TEST_ASSERT_TRUE(strlen(pump_why_str(w)) <= 9);
   TEST_ASSERT_EQUAL_STRING("no link", pump_why_str(PUMP_WHY_STALE));
+  TEST_ASSERT_EQUAL_STRING("stalled", pump_why_str(PUMP_WHY_STALLED));
+  TEST_ASSERT_EQUAL_STRING("no tach", pump_why_str(PUMP_WHY_NO_TACH));
 }
+
+// ---------------------------------------------------------------- the tach
+#if PUMP_TACH_ENABLE
+static PumpInputs with_tach(PumpInputs in, uint8_t tach) {
+  in.tach = tach;
+  return in;
+}
+
+static void test_inputs_leave_the_tach_to_the_task() {
+  vesc_telemetry_t t;
+  memset(&t, 0, sizeof t);
+  TEST_ASSERT_EQUAL_UINT8(PUMP_TACH_NONE, pump_inputs(t, 1000).tach);
+}
+
+static void test_stall_while_running_forces_the_stall_duty() {
+  PumpCtl c;
+  pump_init(c);
+  uint32_t now = 1000;
+  const PumpTargets tg = def_targets();
+  run(c, temps(60.0f, 40.0f, true), tg, &now, 10);
+  TEST_ASSERT_EQUAL_UINT8(PUMP_MODE_RUN, c.mode);
+  const float d = run(c, with_tach(temps(60.0f, 40.0f, true), PUMP_TACH_STALL), tg, &now, 1);
+  TEST_ASSERT_EQUAL_FLOAT((float)PUMP_TACH_STALL_DUTY_PCT, d);
+  TEST_ASSERT_EQUAL_UINT8(PUMP_MODE_FULL, c.mode);
+  TEST_ASSERT_EQUAL_UINT8(PUMP_WHY_STALLED, c.why);
+  run(c, with_tach(temps(60.0f, 40.0f, true), PUMP_TACH_NO_SIGNAL), tg, &now, 1);
+  TEST_ASSERT_EQUAL_UINT8(PUMP_WHY_NO_TACH, c.why);
+  // The tach says OK again: RUN continues from the forced duty and eases down (bumpless).
+  const float back = run(c, with_tach(temps(60.0f, 40.0f, true), PUMP_TACH_OK), tg, &now, 1);
+  TEST_ASSERT_EQUAL_UINT8(PUMP_MODE_RUN, c.mode);
+  TEST_ASSERT_TRUE(back > 50.0f);
+  TEST_ASSERT_EQUAL_FLOAT((float)PUMP_MIN_DUTY_PCT,
+                          run(c, with_tach(temps(60.0f, 40.0f, true), PUMP_TACH_OK), tg, &now, (int)(600.0f / DT)));
+}
+
+static void test_stall_never_starts_a_stopped_pump() {
+  // A stale alarm must not run a pump that has no reason to run (cool, motor still).
+  PumpCtl c;
+  pump_init(c);
+  uint32_t now = 1000;
+  TEST_ASSERT_EQUAL_FLOAT(0.0f, run(c, with_tach(temps(25.0f, 28.0f), PUMP_TACH_STALL), def_targets(), &now, 10));
+  TEST_ASSERT_EQUAL_UINT8(PUMP_MODE_OFF, c.mode);
+}
+
+static void test_stall_does_not_block_the_stop() {
+  // Stalled at full duty, then everything is cool and still: the after-run ends it as usual.
+  PumpCtl c;
+  pump_init(c);
+  uint32_t now = 1000;
+  run(c, with_tach(temps(25.0f, 28.0f, true), PUMP_TACH_STALL), def_targets(), &now, 2);
+  TEST_ASSERT_EQUAL_UINT8(PUMP_MODE_FULL, c.mode);
+  run(c, with_tach(temps(25.0f, 28.0f), PUMP_TACH_STALL), def_targets(), &now, PUMP_MIN_RUN_MS / PUMP_PERIOD_MS + 2);
+  TEST_ASSERT_EQUAL_UINT8(PUMP_MODE_OFF, c.mode);
+  TEST_ASSERT_EQUAL_FLOAT(0.0f, c.duty);
+}
+
+static void test_quiet_tach_states_change_nothing() {
+  const uint8_t quiet[] = {PUMP_TACH_NONE, PUMP_TACH_WAIT, PUMP_TACH_OK, PUMP_TACH_RUNS_AT_0, PUMP_TACH_ERR};
+  for (uint8_t q : quiet) {
+    PumpCtl a, b;
+    pump_init(a);
+    pump_init(b);
+    uint32_t ta = 1000, tb = 1000;
+    const float da = run(a, temps(70.0f, 40.0f, true), def_targets(), &ta, 20);
+    const float db = run(b, with_tach(temps(70.0f, 40.0f, true), q), def_targets(), &tb, 20);
+    TEST_ASSERT_EQUAL_FLOAT(da, db);
+    TEST_ASSERT_EQUAL_UINT8(a.mode, b.mode);
+  }
+}
+
+static void test_derating_and_blind_keep_their_reason() {
+  PumpCtl c;
+  pump_init(c);
+  uint32_t now = 1000;
+  run(c, with_tach(temps(40.0f, 76.0f, true), PUMP_TACH_STALL), def_targets(), &now, 1);
+  TEST_ASSERT_EQUAL_UINT8(PUMP_WHY_DERATE, c.why);  // the same 100 %, the more urgent reason
+  run(c, with_tach(stale(), PUMP_TACH_STALL), def_targets(), &now, 1);
+  TEST_ASSERT_EQUAL_UINT8(PUMP_MODE_BLIND, c.mode);
+}
+#endif  // PUMP_TACH_ENABLE
 
 int main() {
   UNITY_BEGIN();
@@ -348,5 +430,13 @@ int main() {
   RUN_TEST(test_inputs_from_telemetry);
   RUN_TEST(test_duty_to_ledc);
   RUN_TEST(test_mode_and_reason_names);
+#if PUMP_TACH_ENABLE
+  RUN_TEST(test_inputs_leave_the_tach_to_the_task);
+  RUN_TEST(test_stall_while_running_forces_the_stall_duty);
+  RUN_TEST(test_stall_never_starts_a_stopped_pump);
+  RUN_TEST(test_stall_does_not_block_the_stop);
+  RUN_TEST(test_quiet_tach_states_change_nothing);
+  RUN_TEST(test_derating_and_blind_keep_their_reason);
+#endif
   return UNITY_END();
 }

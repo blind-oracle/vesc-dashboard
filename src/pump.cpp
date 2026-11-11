@@ -12,6 +12,12 @@
 // which the LEDC channel undoes (output_invert = PUMP_PWM_INVERT), and it fails safe: whenever
 // this firmware is not driving the pin - the bootloader, a reset, a crash, a failed PWM setup -
 // the pull-down turns the transistor off and the pump runs flat out.
+//
+// Tachometer (PUMP_TACH_ENABLE, README section 2 "Pump tach"): the pump's FG wire pulls
+// PIN_PUMP_TACH low through a Schottky diode (pull-up 10k to 3V3 on the pin side), and a PCNT
+// unit counts the falling edges. The task hands the running total to the pure logic in
+// include/pump_tach.h every tick, before the controller runs, so a stall found this tick
+// already sets this tick's duty.
 #include "pump.h"
 
 #if PUMP_ENABLE
@@ -25,6 +31,11 @@
 #include <stdio.h>
 
 #include "pump_logic.h"
+#include "pump_tach.h"
+
+#if PUMP_TACH_ENABLE
+#include <driver/pulse_cnt.h>
+#endif
 
 static const char *TAG = "pump";
 
@@ -35,6 +46,13 @@ static constexpr uint32_t kStopLevel = PUMP_PWM_INVERT ? 1u : 0u;  // the pin le
 
 static PumpCtl s_ctl;          // pumpTask only
 static bool s_pwm_ok = false;  // set by pump_start() before the task exists, read-only afterwards
+
+#if PUMP_TACH_ENABLE
+static constexpr int kTachHigh = 32767;     // the 16-bit counter's top; the driver accumulates past it
+static pcnt_unit_handle_t s_pcnt = nullptr;  // set by pump_start() before the task exists; null = no counter
+static PumpTach s_tach;                      // pumpTask only
+static uint32_t s_tach_total = 0;            // pumpTask only: the last count read
+#endif
 
 // ---------------------------------------------------------------- the output
 void pump_gpio_early_init() {
@@ -87,6 +105,79 @@ static bool pwm_setup() {
   return true;
 }
 
+// ---------------------------------------------------------------- the tachometer
+#if PUMP_TACH_ENABLE
+// One PCNT unit, one channel: +1 on every falling edge of the FG input (the pump pulling it
+// low through the diode), nothing on the rising one. accum_count with a watch point at the
+// top lets the driver carry the 16-bit counter past 32767, so the task reads a running total.
+static bool tach_setup() {
+  pcnt_unit_handle_t unit = nullptr;
+  pcnt_channel_handle_t chan = nullptr;
+  const char *step = "unit";
+  pcnt_unit_config_t uc = {};
+  uc.low_limit = -1;  // the driver wants a limit below 0; the count only ever goes up
+  uc.high_limit = kTachHigh;
+  uc.flags.accum_count = 1;
+  esp_err_t err = pcnt_new_unit(&uc, &unit);
+  if (err == ESP_OK && PUMP_TACH_GLITCH_NS > 0) {
+    step = "glitch filter";
+    pcnt_glitch_filter_config_t gf = {};
+    gf.max_glitch_ns = PUMP_TACH_GLITCH_NS;
+    err = pcnt_unit_set_glitch_filter(unit, &gf);
+  }
+  if (err == ESP_OK) {
+    step = "channel";
+    pcnt_chan_config_t cc = {};
+    cc.edge_gpio_num = PIN_PUMP_TACH;
+    cc.level_gpio_num = -1;
+    err = pcnt_new_channel(unit, &cc, &chan);
+  }
+  if (err == ESP_OK) {
+    step = "edge action";
+    err = pcnt_channel_set_edge_action(chan, PCNT_CHANNEL_EDGE_ACTION_HOLD, PCNT_CHANNEL_EDGE_ACTION_INCREASE);
+  }
+  if (err == ESP_OK) {
+    step = "watch point";
+    err = pcnt_unit_add_watch_point(unit, kTachHigh);
+  }
+  // The external 10k does the work; the weak internal pull-up only keeps an unwired input from floating.
+  if (err == ESP_OK) {
+    step = "pull-up";
+    err = gpio_pullup_en((gpio_num_t)PIN_PUMP_TACH);
+  }
+  if (err == ESP_OK) {
+    step = "enable";
+    err = pcnt_unit_enable(unit);
+  }
+  if (err == ESP_OK) {
+    step = "clear";
+    err = pcnt_unit_clear_count(unit);
+  }
+  if (err == ESP_OK) {
+    step = "start";
+    err = pcnt_unit_start(unit);
+  }
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "tach: PCNT %s on GPIO%d failed: %s - no pump speed, no stall alarm", step, PIN_PUMP_TACH,
+             esp_err_to_name(err));
+    if (unit) pcnt_unit_disable(unit);  // fails harmlessly when it never got enabled
+    if (chan) pcnt_del_channel(chan);
+    if (unit) pcnt_del_unit(unit);
+    return false;
+  }
+  s_pcnt = unit;
+  return true;
+}
+
+// Reads the counter and judges it against the duty driven over the period that just ended.
+static uint8_t tach_tick(float applied_duty, uint32_t now) {
+  if (!s_pcnt) return PUMP_TACH_ERR;
+  int count = 0;
+  if (pcnt_unit_get_count(s_pcnt, &count) == ESP_OK) s_tach_total = (uint32_t)count;  // wraps: only differences count
+  return pump_tach_step(s_tach, s_tach_total, applied_duty, now);
+}
+#endif
+
 // ---------------------------------------------------------------- the task
 static void publish(const PumpTargets &tg, bool limits_vesc, uint32_t now) {
   PumpStatus p;
@@ -103,6 +194,14 @@ static void publish(const PumpTargets &tg, bool limits_vesc, uint32_t now) {
   p.derate_mot = tg.derate_mot;
   p.derate_fet = tg.derate_fet;
   p.t_ms = now ? now : 1u;
+#if PUMP_TACH_ENABLE
+  p.tach = s_pcnt ? s_tach.state : (uint8_t)PUMP_TACH_ERR;
+  p.tach_full = s_pcnt && s_tach.full;
+  p.tach_rpm = s_pcnt ? s_tach.rpm : 0.0f;
+  p.tach_pulses = s_tach_total;
+  p.tach_alarms = s_tach.alarms;
+  p.tach_since_ms = s_tach.since;
+#endif
   if (state_lock()) {
     g_state.pump = p;
     state_unlock();
@@ -133,6 +232,10 @@ static void pump_task(void *) {
       const PumpTargets tg = pump_targets(pump_limits(lim, &limits_vesc));
       const float dt = prev_ms ? (float)(uint32_t)(now - prev_ms) / 1000.0f : 0.0f;
       prev_ms = now ? now : 1u;
+#if PUMP_TACH_ENABLE
+      // The duty the pump saw over the last period: a released pin is the hardware's full speed.
+      in.tach = tach_tick(s_pwm_ok ? s_ctl.duty : 100.0f, now);
+#endif
       const uint32_t count = pump_duty_to_ledc(pump_step(s_ctl, in, tg, now, dt), PUMP_PWM_RES_BITS);
       if (s_pwm_ok && count != written && ledc_set_duty(kMode, kChannel, count) == ESP_OK &&
           ledc_update_duty(kMode, kChannel) == ESP_OK)
@@ -147,6 +250,10 @@ static void pump_task(void *) {
 // ---------------------------------------------------------------- public API
 bool pump_start() {
   pump_init(s_ctl);
+#if PUMP_TACH_ENABLE
+  pump_tach_init(s_tach);
+  const bool tach_ok = tach_setup();  // before the task: it reads s_pcnt unlocked
+#endif
   s_pwm_ok = pwm_setup();
   if (!s_pwm_ok) pin_release();
   if (xTaskCreatePinnedToCore(pump_task, "pump", PUMP_TASK_STACK, nullptr, TASK_PRIO_PUMP, nullptr, TASK_CORE_APP) !=
@@ -163,6 +270,13 @@ bool pump_start() {
            PIN_PUMP_PWM, PUMP_PWM_FREQ_HZ, PUMP_PWM_RES_BITS, PUMP_PWM_INVERT ? " inverted" : "", PUMP_MIN_DUTY_PCT,
            PUMP_BLIND_DUTY_PCT, (double)PUMP_KP, (double)PUMP_KI, (double)PUMP_KD, PUMP_TARGET_MARGIN_C,
            PUMP_READS_MCCONF ? "from the VESC (COMM_GET_MCCONF)" : "PUMP_DEFAULT_* only");
+#if PUMP_TACH_ENABLE
+  if (tach_ok)
+    ESP_LOGI(TAG,
+             "tach on GPIO%d: %d pulse(s)/rev, stall below %d rpm for %d ms after a %d ms spin-up -> %s, glitch filter %d ns",
+             PIN_PUMP_TACH, PUMP_TACH_PPR, PUMP_TACH_MIN_RPM, PUMP_TACH_STALL_MS, PUMP_TACH_SPINUP_MS,
+             PUMP_TACH_STALL_DUTY_PCT ? "full duty" : "alert only", PUMP_TACH_GLITCH_NS);
+#endif
   if (PUMP_FORCE_DUTY_PCT >= 0)
     ESP_LOGW(TAG, "PUMP_FORCE_DUTY_PCT %d: fixed duty, the control loop is OFF (commissioning build)",
              PUMP_FORCE_DUTY_PCT);
@@ -227,12 +341,12 @@ static void fmt_temp(char *buf, size_t n, bool fresh_s4, float t) {
 }
 
 void pump_log_events(const SharedState &s, uint32_t now) {
-  static uint8_t last_mode = 0xFF;
+  static uint8_t last_mode = 0xFF, last_why = 0xFF;
   static bool last_lim = false, lim_reported = false;
   const PumpStatus &p = s.pump;
   if (p.t_ms == 0) return;  // the task has not ticked yet
 
-  if (p.mode != last_mode) {
+  if (p.mode != last_mode || (p.mode == PUMP_MODE_FULL && p.why != last_why)) {
     const bool f4 = vesc_fresh(&s.vesc.t, VESC_IDX_STATUS_4, now, VESC_STALE_R1_MS);
     char tm[8], tf[8];
     fmt_temp(tm, sizeof tm, f4, s.vesc.t.temp_motor);
@@ -244,8 +358,12 @@ void pump_log_events(const SharedState &s, uint32_t now) {
                  (double)p.duty_pct, tm, (double)p.tgt_mot, tf, (double)p.tgt_fet);
         break;
       case PUMP_MODE_FULL:
-        ESP_LOGW(TAG, "pump FULL: the VESC derates from here on - motor %s C (derating %.1f), MOSFET %s C (derating %.1f)",
-                 tm, (double)p.derate_mot, tf, (double)p.derate_fet);
+        if (p.why == PUMP_WHY_DERATE)
+          ESP_LOGW(TAG, "pump FULL: the VESC derates from here on - motor %s C (derating %.1f), MOSFET %s C (derating %.1f)",
+                   tm, (double)p.derate_mot, tf, (double)p.derate_fet);
+        else
+          ESP_LOGW(TAG, "pump FULL (%s) at %.0f %%: the tach says it does not turn", pump_why_str(p.why),
+                   (double)p.duty_pct);
         break;
       case PUMP_MODE_BLIND:
         ESP_LOGW(TAG, "pump BLIND (%s): %d %% until the VESC temperatures are back", pump_why_str(p.why),
@@ -258,7 +376,43 @@ void pump_log_events(const SharedState &s, uint32_t now) {
       default: break;
     }
     last_mode = p.mode;
+    last_why = p.why;
   }
+
+#if PUMP_TACH_ENABLE
+  // Tach verdicts. WAIT (spin-up / spin-down) is silent, and so is OK after OK: the pump
+  // starting and stopping is not news, a stall and its end are.
+  static uint8_t last_verdict = PUMP_TACH_NONE;
+  if (p.tach != PUMP_TACH_WAIT && p.tach != PUMP_TACH_NONE && p.tach != last_verdict) {
+    switch (p.tach) {
+      case PUMP_TACH_OK:
+        ESP_LOGI(TAG, "pump tach OK%s: %.0f rpm at %.0f %%", last_verdict == PUMP_TACH_NONE ? "" : " again",
+                 (double)p.tach_rpm, (double)p.duty_pct);
+        break;
+      case PUMP_TACH_STALL:
+        ESP_LOGW(TAG,
+                 "pump tach STALL: %.0f rpm although it should run (blocked, unpowered or unplugged pump, or the FG "
+                 "wire) - duty %d %%",
+                 (double)p.tach_rpm, PUMP_TACH_STALL_DUTY_PCT ? PUMP_TACH_STALL_DUTY_PCT : (int)(p.duty_pct + 0.5f));
+        break;
+      case PUMP_TACH_NO_SIGNAL:
+        ESP_LOGE(TAG,
+                 "pump tach NO SIGNAL: not one FG pulse since boot although the pump should run (FG wire, the diode "
+                 "stage, or a dead pump) - duty %d %%",
+                 PUMP_TACH_STALL_DUTY_PCT ? PUMP_TACH_STALL_DUTY_PCT : (int)(p.duty_pct + 0.5f));
+        break;
+      case PUMP_TACH_RUNS_AT_0:
+        ESP_LOGW(TAG,
+                 "pump tach: %.0f rpm while commanded to 0 %% - the PWM stage does not stop it (transistor, pull-up or "
+                 "white wire): it runs at full speed",
+                 (double)p.tach_rpm);
+        break;
+      case PUMP_TACH_ERR: ESP_LOGE(TAG, "pump tach: no pulse counter (see the setup error at boot)"); break;
+      default: break;
+    }
+    last_verdict = p.tach;
+  }
+#endif
 
   // The targets move when the limits arrive from the VESC (or stop arriving): say where they are now.
   if (!lim_reported || p.limits_vesc != last_lim) {
@@ -285,13 +439,19 @@ void pump_log_summary(const SharedState &s, uint32_t now) {
   else if (s.vesc_limits.result == MCCONF_UNKNOWN_SIG)
     snprintf(src, sizeof src, "DEF(sig %08lX)", (unsigned long)s.vesc_limits.sig);
   else snprintf(src, sizeof src, "DEF");
+  char tach[80] = "";
+#if PUMP_TACH_ENABLE
+  // rpm next to the duty on every line: the record a future slow / fast check is built from.
+  snprintf(tach, sizeof tach, " | tach %s rpm=%.0f%s pulses=%lu alarms=%lu", pump_tach_str(p.tach), (double)p.tach_rpm,
+           p.tach_full ? "" : "~", (unsigned long)p.tach_pulses, (unsigned long)p.tach_alarms);
+#endif
   ESP_LOGI(TAG,
            "PUMP %s(%s) %.0f%% Tm=%s/%.1f Tf=%s/%.1f err=%s I=%.1f | lim %s M%.0f/%.0f F%.0f/%.0f dec%.2f "
-           "reads=%lu age=%lums",
+           "reads=%lu age=%lums%s",
            pump_mode_str(p.mode), pump_why_str(p.why), (double)p.duty_pct, tm, (double)p.tgt_mot, tf,
            (double)p.tgt_fet, err, (double)p.integ, src, (double)l.mot_start, (double)l.mot_end, (double)l.fet_start,
            (double)l.fet_end, (double)l.accel_dec, (unsigned long)s.vesc_limits.requests,
-           (unsigned long)age_ms(p.t_ms, now));
+           (unsigned long)age_ms(p.t_ms, now), tach);
 }
 
 #endif  // PUMP_ENABLE

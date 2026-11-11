@@ -151,6 +151,7 @@ struct DisplayStats
   uint32_t button_presses;       // debounced presses seen
   uint8_t ota_refused;           // OtaRefusal of the last refused update-mode hold (0 = none)
   uint32_t ota_refused_ms;       // when it was refused (0 = never): the refusal shows for OTA_REFUSED_SHOW_MS
+  uint32_t pump_ack;             // PumpStatus::tach_alarms the helmsman dismissed with a press (the pump alarm overlay)
 };
 
 #if OTA_ENABLE
@@ -201,7 +202,7 @@ struct VescLimitsState {
 enum PumpMode : uint8_t {
   PUMP_MODE_OFF = 0,  // stopped: no VESC temperatures since boot, or cool, still and the after-run over
   PUMP_MODE_RUN,      // closed loop, PUMP_MIN_DUTY_PCT..100 %
-  PUMP_MODE_FULL,     // a temperature reached the VESC's derating start: 100 %
+  PUMP_MODE_FULL,     // a temperature reached the VESC's derating start (100 %), or the tach says it stalled (PUMP_TACH_STALL_DUTY_PCT)
   PUMP_MODE_BLIND,    // temperatures were seen, then went stale (or none reads plausibly): PUMP_BLIND_DUTY_PCT
   PUMP_MODE_FORCED,   // PUMP_FORCE_DUTY_PCT (commissioning)
   PUMP_MODE_FAULT,    // the PWM output could not be set up: the pin floats, the hardware runs the pump flat out
@@ -220,6 +221,19 @@ enum PumpWhy : uint8_t {
   PUMP_WHY_NO_SENSOR,  // BLIND: fresh data, but neither temperature is plausible
   PUMP_WHY_FORCED,     // FORCED
   PUMP_WHY_PWM,        // FAULT
+  PUMP_WHY_STALLED,    // FULL: the tach says the pump does not turn although it should (PUMP_TACH_STALL)
+  PUMP_WHY_NO_TACH,    // FULL: no tach pulse since boot although the pump should turn (PUMP_TACH_NO_SIGNAL)
+};
+
+// What the pump's tachometer (FG wire, include/pump_tach.h) says about the pump.
+enum PumpTachState : uint8_t {
+  PUMP_TACH_NONE = 0,   // no tach in this build (PIN_PUMP_TACH -1), or the task has not ticked yet
+  PUMP_TACH_WAIT,       // no verdict: spin-up / spin-down, or a duty between 0 and PUMP_MIN_DUTY_PCT
+  PUMP_TACH_OK,         // turning while it should, or still while it should be stopped
+  PUMP_TACH_STALL,      // should run, pulses were seen since boot, but below PUMP_TACH_MIN_RPM now: ALARM
+  PUMP_TACH_NO_SIGNAL,  // should run, and not one pulse since boot: the FG wire or a dead pump: ALARM
+  PUMP_TACH_RUNS_AT_0,  // commanded to 0 %, but it turns: the PWM stage does not stop it (full speed)
+  PUMP_TACH_ERR,        // the pulse counter could not be set up
 };
 
 struct PumpStatus {
@@ -233,6 +247,13 @@ struct PumpStatus {
   float tgt_mot, tgt_fet;        // targets, C
   float derate_mot, derate_fet;  // where the VESC starts cutting acceleration current, C
   uint32_t t_ms;                 // last pump task tick (0 = never)
+  // The tachometer (all zero / PUMP_TACH_NONE without PUMP_TACH_ENABLE)
+  uint8_t tach;                  // PumpTachState
+  bool tach_full;                // tach_rpm averages a full PUMP_TACH_WINDOW_MS
+  float tach_rpm;                // pump rpm over the window (pulses / PUMP_TACH_PPR)
+  uint32_t tach_pulses;          // FG pulses counted since boot
+  uint32_t tach_alarms;          // entries into STALL / NO_SIGNAL since boot: the alarm overlay's sequence number
+  uint32_t tach_since_ms;        // when the tach state was entered (0 = never)
 };
 #endif  // PUMP_ENABLE
 

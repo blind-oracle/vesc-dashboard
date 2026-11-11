@@ -220,6 +220,7 @@ enum OledOverlay : uint8_t {
   OVERLAY_DEADMAN,      // the dead-man's switch is holding the motor cut (TRIPPED or FAULT)
   OVERLAY_OTA,          // update mode: access point, passphrase, upload progress
   OVERLAY_OTA_REFUSED,  // a hold for update mode was just refused (OTA_REFUSED_SHOW_MS)
+  OVERLAY_PUMP,         // the pump's tach says it stalled (or gives no signal) and nobody dismissed it yet
 };
 
 // Host-side facts the Arduino-free builders cannot fetch themselves.
@@ -1096,9 +1097,46 @@ inline void oled_build_eff(const SharedState &s, uint32_t now, OledGrid &g) {
 //   Tmot 58.3  tgt 66.0     motor temperature ("--" stale, "n/a" no sensor) and its target
 //   Tfet 41.0  tgt 66.0     MOSFET temperature and its target
 //   Lim M85/100 F85/100     the VESC's l_temp_motor/fet_start/end in use
-//   dec 0.15 VESC 6.06      l_temp_accel_dec and where the limits came from: the VESC (its
-//                           firmware), or DEF = PUMP_DEFAULT_* (wait / cfg / new FW / bad ...)
+//   dec 0.15   3450rpm      l_temp_accel_dec, and with a tach (PUMP_TACH_ENABLE) the pump's
+//                           speed, or what is wrong with it (pump_tach_row). Without a tach the
+//                           right side says where the limits came from: the VESC (its firmware,
+//                           "VESC 6.06"), or DEF = PUMP_DEFAULT_* (wait / cfg / new FW / bad ...).
+//                           With a tach that source is only in the PUMP log line.
 //   err +7.7   int 12.0     the loop's error (C over target, max of both sensors) and I term
+// Where the pump's limits came from (<= 12 chars): "VESC 6.06", or DEF = PUMP_DEFAULT_* and why.
+inline void pump_limits_src(const VescLimitsState &v, char *out, size_t n) {
+  using namespace oled_detail;
+  if (v.result == MCCONF_OK) {
+    copy_str(out, n, "VESC ");
+    append_str(out, n, v.fw);
+    return;
+  }
+  switch (v.result) {
+    case MCCONF_NONE: copy_str(out, n, PUMP_READS_MCCONF ? "DEF wait" : "DEF cfg"); break;
+    case MCCONF_UNKNOWN_SIG: copy_str(out, n, "DEF new FW"); break;
+    case MCCONF_IMPLAUSIBLE: copy_str(out, n, "DEF bad lim"); break;
+    default: copy_str(out, n, "DEF bad rep"); break;
+  }
+}
+
+#if PUMP_TACH_ENABLE
+// The tach on the PUMP page (<= 10 chars): the word when something needs attention, the rpm
+// otherwise ("~" while the window is still filling), "--" while the pump task is silent.
+inline void pump_tach_row(const PumpStatus &p, bool live, char *out, size_t n) {
+  using namespace oled_detail;
+  if (!live || p.tach == PUMP_TACH_NONE) {
+    fmt_dashes(out, n);
+  } else if (p.tach == PUMP_TACH_STALL || p.tach == PUMP_TACH_NO_SIGNAL || p.tach == PUMP_TACH_RUNS_AT_0 ||
+             p.tach == PUMP_TACH_ERR) {
+    copy_str(out, n, pump_tach_str(p.tach));
+  } else {
+    fmt_num_unit(out, n, p.tach_rpm, 0, p.tach_full ? 10 : 9, "rpm");
+    if (!p.tach_full) append_str(out, n, "~");
+  }
+  clip(out, n, 10);
+}
+#endif
+
 inline void oled_build_pump(const SharedState &s, uint32_t now, OledGrid &g) {
   using namespace oled_detail;
   grid_begin(g, "PUMP", SCREEN_PUMP);
@@ -1127,20 +1165,17 @@ inline void oled_build_pump(const SharedState &s, uint32_t now, OledGrid &g) {
            (double)lim.fet_start, (double)lim.fet_end);
   row1(g.rows[3], buf);
 
+#if PUMP_TACH_ENABLE
+  (void)from_vesc;  // the source is in the log line; the row shows the pump's speed instead
+  snprintf(l, sizeof l, "dec %.2f", (double)lim.accel_dec);
+  pump_tach_row(p, live, r, sizeof r);
+  row2(g.rows[4], l, r);
+#else
   char src[16];
-  if (from_vesc) {
-    copy_str(src, sizeof src, "VESC ");
-    append_str(src, sizeof src, s.vesc_limits.fw);
-  } else {
-    switch (s.vesc_limits.result) {
-      case MCCONF_NONE: copy_str(src, sizeof src, PUMP_READS_MCCONF ? "DEF wait" : "DEF cfg"); break;
-      case MCCONF_UNKNOWN_SIG: copy_str(src, sizeof src, "DEF new FW"); break;
-      case MCCONF_IMPLAUSIBLE: copy_str(src, sizeof src, "DEF bad lim"); break;
-      default: copy_str(src, sizeof src, "DEF bad rep"); break;
-    }
-  }
+  pump_limits_src(s.vesc_limits, src, sizeof src);
   snprintf(buf, sizeof buf, "dec %.2f %s", (double)lim.accel_dec, src);
   row1(g.rows[4], buf);
+#endif
 
   char num[8];
   if (live && p.have_err) fmt_num(num, sizeof num, p.err_c, 1, 5);
@@ -1250,6 +1285,65 @@ inline void oled_build_deadman_alarm(const SharedState &s, uint32_t now, OledGri
   else row1(g.rows[5], "HOLD BTN: NEED TAG");
 }
 #endif  // DEADMAN_UI_ENABLE
+
+#if PUMP_TACH_ENABLE
+// The pump alarm: shown INSTEAD of whatever page is selected while the tach reports STALL or
+// NO_SIGNAL, until a press dismisses that alarm (DisplayStats::pump_ack = its sequence number,
+// PumpStatus::tach_alarms). A later stall is a new number and shows again. It says what is
+// wrong, what the firmware does about it, what to check and what it means for the ride.
+//
+//   [PUMP              !]
+//   PUMP STALLED        12s    (or "NO PUMP TACH SIGNAL": not one pulse since boot)
+//   duty 100%        0rpm
+//   forced to 100%             (or "alert only")
+//   chk fuse/plug/hose         (NO SIGNAL: "chk FG wire / diode")
+//   motor may derate
+//   PRESS BTN: DISMISS
+inline bool pump_alarm_active(const SharedState &s) {
+  return pump_tach_alarm(s.pump.tach) && s.pump.tach_alarms != s.disp.pump_ack;
+}
+
+inline void oled_build_pump_alarm(const SharedState &s, uint32_t now, OledGrid &g) {
+  using namespace oled_detail;
+  const PumpStatus &p = s.pump;
+  memset(&g, 0, sizeof g);
+  copy_str(g.title, sizeof g.title, "PUMP");
+  copy_str(g.page, sizeof g.page, "!");
+  g.nrows = kGridRows;
+
+  const bool stalled = p.tach == PUMP_TACH_STALL;
+  char l[32], r[32], a[8];
+  if (stalled) {
+    if (p.tach_since_ms) {
+      // Signed: the pump task stamps with its own clock read, which may be a little after `now`.
+      const int32_t age = (int32_t)(now - p.tach_since_ms);
+      fmt_age_short(a, sizeof a, age > 0 ? (uint32_t)age : 0u);
+      row2(g.rows[0], "PUMP STALLED", a);
+    } else {
+      row1(g.rows[0], "PUMP STALLED");
+    }
+  } else {
+    row1(g.rows[0], "NO PUMP TACH SIGNAL");
+  }
+
+  char num[8];
+  fmt_num(num, sizeof num, p.duty_pct, 0, 3);
+  snprintf(l, sizeof l, "duty %s%%", num);
+  fmt_num_unit(r, sizeof r, p.tach_rpm, 0, 10, "rpm");
+  row2(g.rows[1], l, r);
+
+  if (PUMP_TACH_STALL_DUTY_PCT > 0) {
+    snprintf(l, sizeof l, "forced to %d%%", PUMP_TACH_STALL_DUTY_PCT);
+    row1(g.rows[2], l);
+  } else {
+    row1(g.rows[2], "alert only");
+  }
+  row1(g.rows[3], stalled ? "chk fuse/plug/hose" : "chk FG wire / diode");
+  row1(g.rows[4], "motor may derate");
+  // The last grid row sits on the panel's bottom pixel row: no descenders, so upper case.
+  row1(g.rows[5], "PRESS BTN: DISMISS");
+}
+#endif  // PUMP_TACH_ENABLE
 
 #if OTA_ENABLE
 // FW UPDATE: shown for the whole of update mode (src/ota.cpp publishes g_state.ota).
@@ -1361,6 +1455,15 @@ inline void oled_build_frame(const SharedState &s, uint32_t now, uint8_t screen,
       (int32_t)(now - s.disp.ota_refused_ms) < (int32_t)OTA_REFUSED_SHOW_MS) {
     out.overlay = OVERLAY_OTA_REFUSED;
     oled_build_ota_refused(s.disp.ota_refused, out.grid);
+    return;
+  }
+#endif
+#if PUMP_TACH_ENABLE
+  // A pump that should run but does not turn: the motor heats up from here, so it takes the
+  // panel until a press acknowledges it (the PUMP page keeps saying STALL after that).
+  if (pump_alarm_active(s)) {
+    out.overlay = OVERLAY_PUMP;
+    oled_build_pump_alarm(s, now, out.grid);
     return;
   }
 #endif
