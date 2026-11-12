@@ -129,8 +129,7 @@ inline PumpInputs pump_inputs(const vesc_telemetry_t &t, uint32_t now) {
   in.t_fet = t.temp_fet;
   in.mot_ok = vesc_temp_plausible(t.temp_motor);
   in.fet_ok = vesc_temp_plausible(t.temp_fet);
-  in.turning = vesc_fresh(&t, VESC_IDX_STATUS_1, now, VESC_STALE_R1_MS) &&
-               fabsf(vesc_mech_rpm(&t, VESC_MOTOR_POLES)) > (float)PUMP_TURNING_RPM;
+  in.turning = vesc_turning(&t, now, VESC_STALE_R1_MS, VESC_MOTOR_POLES, (float)PUMP_TURNING_RPM);
   in.tach = PUMP_TACH_NONE;  // the pump task fills it from its own tach state
   return in;
 }

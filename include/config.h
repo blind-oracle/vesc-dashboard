@@ -144,7 +144,7 @@
 #define VESC_CAN_ID -1 // -1 = accept any VESC id and lock onto the first one seen; 0..254 = only this id (VESC Tool "VESC ID")
 #endif
 #ifndef VESC_MOTOR_POLES
-#define VESC_MOTOR_POLES 10 // VESC Tool > Motor Settings > Additional Info > Motor Poles. mech rpm = erpm / (poles/2). Logging only.
+#define VESC_MOTOR_POLES 10 // VESC Tool > Motor Settings > Additional Info > Motor Poles. mech rpm = erpm / (poles/2): the logs, and the rpm thresholds of the pump and the motor hours.
 #endif
 #ifndef VESC_STALE_R1_MS
 #define VESC_STALE_R1_MS 2000 // STATUS 1/4/5 ("Rate 1", default 50 Hz) older than this are shown as "--"
@@ -309,6 +309,42 @@
 #endif
 #ifndef EFF_UNIT_KM
 #define EFF_UNIT_KM 0 // 0 = follow the speed unit (knots -> Wh/NM, km/h -> Wh/km); 1 = always Wh/km
+#endif
+
+// ============================================================================
+// Lifetime totals (include/totals.h, src/totals.cpp, TOTALS screen)
+// ============================================================================
+// Motor running hours, powered hours (VESC link fresh), GNSS distance and energy, summed over
+// every boot: the record loaded at boot + what the trip integrator counted since. Kept as one
+// 24-byte blob in the NVS partition (namespace "totals", key "rec"), so no partition-table change.
+// NVS never rewrites in place: a save appends three 32-byte entries, and a sector is erased only
+// when garbage collection reclaims it, about once per 145 saves. At >= 100,000 erase cycles per
+// sector that is ~14 million saves, ~240,000 running hours at one save per running minute. A save
+// stops the CPU for ~1-3 ms (an erase ~50 ms): a few CAN frames, never a stale value.
+#ifndef TOTALS_ENABLE
+#define TOTALS_ENABLE 1 // 0 = no record, no NVS writes, no TOTALS screen
+#endif
+#ifndef TOTALS_MIN_RPM
+#define TOTALS_MIN_RPM 100 // fresh mechanical rpm above this = the motor runs (the same test as PUMP_TURNING_RPM)
+#endif
+#ifndef TOTALS_STOP_SAVE_MS
+#define TOTALS_STOP_SAVE_MS 3000 // save once the motor has been still this long (a reversal through 0 rpm is no stop)
+#endif
+#ifndef TOTALS_SAVE_RUN_S
+#define TOTALS_SAVE_RUN_S 60 // running: save after this much unsaved motor time (the most a power cut can lose)
+#endif
+#ifndef TOTALS_SAVE_IDLE_S
+#define TOTALS_SAVE_IDLE_S 600 // anything else unsaved (powered time, a drift) is saved this long after the last save
+#endif
+#ifndef TOTALS_MIN_GAP_S
+#define TOTALS_MIN_GAP_S 10 // never two saves closer than this; a stop save waits for it, it is not dropped
+#endif
+#ifndef TOTALS_RETRY_S
+#define TOTALS_RETRY_S 60 // a failed write is tried again this long after the failure
+#endif
+#ifndef TOTALS_MOTOR_PRESET_H
+#define TOTALS_MOTOR_PRESET_H 0 // hours: the loaded motor hours are raised to at least this, never lowered (a used
+                                // motor, a lost record). May be fractional (-DTOTALS_MOTOR_PRESET_H=1234.5)
 #endif
 
 // ============================================================================
@@ -655,6 +691,9 @@
 #ifndef LOG_TRIP_MS
 #define LOG_TRIP_MS 5000 // period of the trip / efficiency log line (0 = off)
 #endif
+#ifndef LOG_TOTALS_MS
+#define LOG_TOTALS_MS 60000 // period of the lifetime totals log line (0 = off; saves and errors are logged anyway)
+#endif
 #ifndef SERIAL_BOOT_DELAY_MS
 #define SERIAL_BOOT_DELAY_MS 1500 // give the USB-Serial/JTAG host time to re-enumerate so the boot banner is visible
 #endif
@@ -745,7 +784,7 @@
 #define TASK_PRIO_TRIP 3 // trip integrator task: between the display (2) and the data producers (GNSS 5, CAN 6)
 #endif
 #ifndef TRIP_TASK_STACK
-#define TRIP_TASK_STACK 4096 // bytes
+#define TRIP_TASK_STACK 6144 // bytes: one SharedState snapshot (~0.8 KB) plus the NVS write of the lifetime totals (~2 KB deep)
 #endif
 #ifndef TRIP_DT_MAX_MS
 #define TRIP_DT_MAX_MS 5000 // longest step integrated after a stall; beyond it time is dropped, not integrated
@@ -851,6 +890,21 @@
 #endif
 #if EFF_WINDOW_S < 2 || EFF_WINDOW_S > 120
 #error "EFF_WINDOW_S must be 2..120 seconds"
+#endif
+#if TOTALS_ENABLE && TOTALS_MIN_RPM <= 0
+#error "TOTALS_MIN_RPM must be > 0: at 0 rpm a still motor would count as running"
+#endif
+#if TOTALS_ENABLE && (TOTALS_MIN_GAP_S < 1 || TOTALS_MIN_GAP_S > TOTALS_SAVE_RUN_S || TOTALS_SAVE_RUN_S > TOTALS_SAVE_IDLE_S)
+#error "Lifetime totals: need 1 <= TOTALS_MIN_GAP_S <= TOTALS_SAVE_RUN_S <= TOTALS_SAVE_IDLE_S (every save is a flash write)"
+#endif
+#if TOTALS_ENABLE && TOTALS_SAVE_IDLE_S > 86400
+#error "TOTALS_SAVE_IDLE_S must be <= 86400 (a day)"
+#endif
+#if TOTALS_ENABLE && (TOTALS_RETRY_S < TOTALS_MIN_GAP_S || TOTALS_RETRY_S > 86400)
+#error "TOTALS_RETRY_S must be TOTALS_MIN_GAP_S..86400"
+#endif
+#if TOTALS_ENABLE && (TOTALS_STOP_SAVE_MS < TRIP_PERIOD_MS || TOTALS_STOP_SAVE_MS > 600000)
+#error "TOTALS_STOP_SAVE_MS must be TRIP_PERIOD_MS..600000 (the trip task decides on its own ticks)"
 #endif
 #if VESC_LINK_UART && VESC_POLL_MS <= 0
 #error "VESC_LINK_UART needs VESC_POLL_MS > 0: over UART nothing is broadcast, the poll is the only data source"

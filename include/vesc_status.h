@@ -163,6 +163,22 @@ static inline bool vesc_fresh(const vesc_telemetry_t *t, int idx, uint32_t now_m
   return ts != 0 && (uint32_t)(now_ms - ts) <= max_age_ms;
 }
 
+// The VESC is talking: STATUS_1 or STATUS_5 (both "Rate 1") within max_age_ms. Either one may be
+// the only broadcast enabled, so one is enough. The status LED, the trip's powered time and the
+// lifetime totals all use this test.
+static inline bool vesc_link_fresh(const vesc_telemetry_t *t, uint32_t now_ms, uint32_t max_age_ms) {
+  return vesc_fresh(t, VESC_IDX_STATUS_1, now_ms, max_age_ms) || vesc_fresh(t, VESC_IDX_STATUS_5, now_ms, max_age_ms);
+}
+
+// The motor turns: a STATUS_1 within max_age_ms with |mechanical rpm| > min_rpm. Stale data is
+// "not turning" (unknown is never counted). The pump and the motor-hour count use this test.
+static inline bool vesc_turning(const vesc_telemetry_t *t, uint32_t now_ms, uint32_t max_age_ms, int motor_poles,
+                                float min_rpm) {
+  if (!vesc_fresh(t, VESC_IDX_STATUS_1, now_ms, max_age_ms)) return false;
+  const float r = vesc_mech_rpm(t, motor_poles);
+  return r > min_rpm || r < -min_rpm;
+}
+
 #ifdef __cplusplus
 }
 #endif

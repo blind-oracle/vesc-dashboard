@@ -4,7 +4,9 @@
 // include/trip.h (distance from GNSS ground speed, energy from the VESC
 // watt-hour counters or the v_in x current_in fallback, "now" window and trip
 // averages) and publish the result into g_state.trip for the EFFICIENCY screen
-// and the logs. The task owns no peripheral and is not watched by the
+// and the logs. The same tick runs the lifetime totals (src/totals.cpp), which
+// write their NVS record from this task when one is due, and publishes
+// g_state.totals with the trip. The task owns no peripheral and is not watched by the
 // supervisor (nothing depends on it for safety); it sleeps with vTaskDelay
 // between ticks, so it can never busy-loop.
 //
@@ -21,6 +23,7 @@
 
 #include "config.h"
 #include "shared_state.h"
+#include "totals.h"
 
 static const char *TAG = "trip";
 
@@ -29,7 +32,7 @@ static const char *TAG = "trip";
 #define TASK_PRIO_TRIP 3       // between the display (TASK_PRIO_DISP 2) and the data producers (GNSS 5, CAN 6)
 #endif
 #ifndef TRIP_TASK_STACK
-#define TRIP_TASK_STACK 4096   // bytes (ESP-IDF's xTaskCreate() takes bytes); holds one SharedState snapshot (~0.5 KB)
+#define TRIP_TASK_STACK 6144   // bytes (ESP-IDF's xTaskCreate() takes bytes); one SharedState snapshot (~0.8 KB) + an NVS write
 #endif
 
 namespace {
@@ -48,8 +51,14 @@ void trip_task(void *) {
     const uint32_t now = state_now_ms();
     TripState tmp;
     trip_calc_update(s_calc, s, now, tmp);
+    // Lifetime totals: may write the NVS record (a few ms, outside the lock).
+    TotalsState tot{};
+    totals_tick(tmp, now, &tot);
     if (state_lock()) {  // lock timeout (counted by state_lock): this tick's result is published next time
       g_state.trip = tmp;
+#if TOTALS_ENABLE
+      g_state.totals = tot;
+#endif
       state_unlock();
     }
     vTaskDelay(pdMS_TO_TICKS(TRIP_PERIOD_MS));

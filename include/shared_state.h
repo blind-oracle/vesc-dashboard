@@ -137,6 +137,47 @@ struct TripState {
   bool energy_from_counters; // true = VESC STATUS_3 watt-hour counters, false = v_in x current_in integration fallback
   uint8_t win_fill_s;        // seconds of data in the window (0..EFF_WINDOW_S)
   uint32_t counter_resets;   // VESC watt-hour counter resets detected (VESC rebooted)
+  uint32_t motor_s;          // seconds with the motor turning (vesc_turning, TOTALS_MIN_RPM) since the integrator started
+  uint32_t on_s;             // seconds with the VESC link fresh (vesc_link_fresh) since the integrator started
+  bool turning;              // the motor turned at the latest tick
+};
+
+// ---------------------------------------------------------------- Lifetime totals
+// What the NVS record holds (include/totals.h encodes it field by field, little-endian).
+struct TotalsRecord {
+  uint32_t motor_s;  // motor running, s
+  uint32_t on_s;     // VESC link fresh ("powered"), s
+  uint32_t dist_m;   // GNSS distance while moving, m
+  uint32_t wh;       // energy drawn from the battery, Wh
+  uint32_t whc;      // energy returned to it (regen), Wh
+};
+
+enum TotalsNvs : uint8_t {
+  TOTALS_NVS_OK = 0,  // the record was read at boot
+  TOTALS_NVS_NONE,    // NVS works but held no record (first boot, or the partition was erased): counting from 0
+  TOTALS_NVS_ERR,     // NVS could not be brought up, or the record was unreadable: RAM only, nothing is written
+};
+
+enum TotalsReason : uint8_t {
+  TOTALS_SAVE_NONE = 0,
+  TOTALS_SAVE_STOP,   // the motor stopped (still for TOTALS_STOP_SAVE_MS)
+  TOTALS_SAVE_RUN,    // TOTALS_SAVE_RUN_S of unsaved motor time
+  TOTALS_SAVE_IDLE,   // something else changed, TOTALS_SAVE_IDLE_S after the last save
+  TOTALS_SAVE_RETRY,  // TOTALS_RETRY_S after a failed write
+};
+
+// Published by the trip task (src/totals.cpp) on every tick.
+struct TotalsState {
+  uint32_t t_ms;          // last publish (0 = never)
+  TotalsRecord life;      // lifetime values: the record loaded at boot + this boot
+  uint32_t last_save_ms;  // last successful save this boot (0 = none yet)
+  uint32_t saves;         // successful saves this boot
+  uint32_t errors;        // failed saves this boot
+  int32_t last_err;       // esp_err_t of the last failed save (0 = none)
+  uint8_t nvs;            // TotalsNvs
+  uint8_t last_reason;    // TotalsReason of the last save attempt
+  bool dirty;             // life differs from the record in flash
+  bool failed;            // the last save failed (the next try is TOTALS_RETRY_S later)
 };
 
 // ---------------------------------------------------------------- Display
@@ -316,6 +357,9 @@ struct SharedState
   CanHealth can;
   GnssState gnss;
   TripState trip;
+#if TOTALS_ENABLE
+  TotalsState totals;
+#endif
 #if DEADMAN_UI_ENABLE
   DeadmanState deadman;
 #endif

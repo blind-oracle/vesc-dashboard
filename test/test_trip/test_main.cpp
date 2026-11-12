@@ -2,7 +2,7 @@
 // integrator in include/trip.h: distance from GNSS ground speed, energy from
 // the VESC watt-hour counters or the v_in x current_in fallback, counter reset
 // detection, the EFF_WINDOW_S "now" window, validity rules, the dt clamp and
-// millis() wrap-around.
+// millis() wrap-around, and the motor / powered time the lifetime totals add up.
 // Compiles with: -std=c++17 -DUNIT_TEST -Iinclude ; includes only Arduino-free headers.
 // Efficiency expectations follow the configured unit (SPEED_UNIT_KNOTS / EFF_UNIT_KM,
 // overridable with -D): the same 100 m / 5.556 Wh trip is 102.9 Wh/NM or 55.6 Wh/km.
@@ -101,6 +101,9 @@ static void tick(Sim &m, uint32_t ms, int32_t speed_mm_s, double power_w, Src sr
 static void run(Sim &m, unsigned steps, int32_t speed_mm_s, double power_w, Src src, bool gnss = true) {
   for (unsigned i = 0; i < steps; ++i) tick(m, STEP, speed_mm_s, power_w, src, gnss);
 }
+
+// Mechanical rpm on STATUS_1 (the poles of VESC_MOTOR_POLES).
+static void set_rpm(Sim &m, float mech_rpm) { m.s.vesc.t.erpm = mech_rpm * ((float)VESC_MOTOR_POLES / 2.0f); }
 
 // ---------------------------------------------------------------- basics
 static void test_first_call_only_initialises() {
@@ -629,6 +632,77 @@ static void test_counter_reset_tick_is_a_gap() {
   TEST_ASSERT_FLOAT_WITHIN(0.01f, 2.7778f + 54.0f * 0.05556f, m.out.wh);  // only the reset step itself is lost
 }
 
+// ---------------------------------------------------------------- motor / powered time
+static void test_motor_and_powered_time() {
+  Sim m;
+  start(m, 0, SRC_R1, false);
+  TEST_ASSERT_EQUAL_UINT32(0, m.out.motor_s);
+  TEST_ASSERT_EQUAL_UINT32(0, m.out.on_s);
+  run(m, 25, 0, 100.0, SRC_R1, false);  // 5 s powered, motor still: only the powered time counts
+  TEST_ASSERT_EQUAL_UINT32(5, m.out.on_s);
+  TEST_ASSERT_EQUAL_UINT32(0, m.out.motor_s);
+  TEST_ASSERT_FALSE(m.out.turning);
+  set_rpm(m, (float)TOTALS_MIN_RPM + 50.0f);
+  run(m, 25, 0, 100.0, SRC_R1, false);
+  TEST_ASSERT_EQUAL_UINT32(5, m.out.motor_s);
+  TEST_ASSERT_EQUAL_UINT32(10, m.out.on_s);
+  TEST_ASSERT_TRUE(m.out.turning);
+  set_rpm(m, -(float)TOTALS_MIN_RPM - 50.0f);  // astern counts the same
+  run(m, 25, 0, 100.0, SRC_R1, false);
+  TEST_ASSERT_EQUAL_UINT32(10, m.out.motor_s);
+  TEST_ASSERT_TRUE(m.out.turning);
+  set_rpm(m, (float)TOTALS_MIN_RPM);  // exactly at the threshold: not running
+  run(m, 25, 0, 100.0, SRC_R1, false);
+  TEST_ASSERT_EQUAL_UINT32(10, m.out.motor_s);
+  TEST_ASSERT_EQUAL_UINT32(20, m.out.on_s);
+  TEST_ASSERT_FALSE(m.out.turning);
+  // sub-second remainders carry over: 7 ticks = 1.4 s, then 3 more = 2.0 s
+  set_rpm(m, 1000.0f);
+  run(m, 7, 0, 100.0, SRC_R1, false);
+  TEST_ASSERT_EQUAL_UINT32(11, m.out.motor_s);
+  run(m, 3, 0, 100.0, SRC_R1, false);
+  TEST_ASSERT_EQUAL_UINT32(12, m.out.motor_s);
+}
+
+static void test_motor_time_needs_fresh_data() {
+  Sim m;
+  start(m, 0, SRC_R1, false);
+  set_rpm(m, 1000.0f);
+  run(m, 50, 0, 100.0, SRC_R1, false);  // 10 s running
+  TEST_ASSERT_EQUAL_UINT32(10, m.out.motor_s);
+  TEST_ASSERT_EQUAL_UINT32(10, m.out.on_s);
+  // the link goes quiet with the last frame still saying 1000 rpm: counted while that frame is
+  // fresh (VESC_STALE_R1_MS), never after
+  for (unsigned i = 0; i < 50; ++i) {
+    m.now += STEP;
+    trip_calc_update(m.c, m.s, m.now, m.out);
+  }
+  TEST_ASSERT_EQUAL_UINT32(10 + VESC_STALE_R1_MS / 1000, m.out.motor_s);
+  TEST_ASSERT_EQUAL_UINT32(10 + VESC_STALE_R1_MS / 1000, m.out.on_s);
+  TEST_ASSERT_FALSE(m.out.turning);
+  // STATUS_5 alone (STATUS_1 not broadcast): powered, but the rpm is unknown
+  Sim p;
+  start(p, 0, SRC_NONE, false);
+  set_rpm(p, 1000.0f);
+  for (unsigned i = 0; i < 25; ++i) {
+    p.now += STEP;
+    p.s.vesc.t.t_ms[VESC_IDX_STATUS_5] = nz(p.now);
+    trip_calc_update(p.c, p.s, p.now, p.out);
+  }
+  TEST_ASSERT_EQUAL_UINT32(5, p.out.on_s);
+  TEST_ASSERT_EQUAL_UINT32(0, p.out.motor_s);
+  TEST_ASSERT_FALSE(p.out.turning);
+}
+
+static void test_motor_time_dt_clamped() {
+  Sim m;
+  start(m, 0, SRC_R1, false);
+  set_rpm(m, 1000.0f);
+  tick(m, 30000, 0, 100.0, SRC_R1, false);  // a 30 s stall of the task counts TRIP_DT_MAX_MS only
+  TEST_ASSERT_EQUAL_UINT32(TRIP_DT_MAX_MS / 1000, m.out.motor_s);
+  TEST_ASSERT_EQUAL_UINT32(TRIP_DT_MAX_MS / 1000, m.out.on_s);
+}
+
 int main(int, char **) {
   UNITY_BEGIN();
   RUN_TEST(test_first_call_only_initialises);
@@ -658,5 +732,8 @@ int main(int, char **) {
   RUN_TEST(test_counters_return_after_fallback_overwrite_estimate);
   RUN_TEST(test_outage_split_return_recovers_energy);
   RUN_TEST(test_counter_reset_tick_is_a_gap);
+  RUN_TEST(test_motor_and_powered_time);
+  RUN_TEST(test_motor_time_needs_fresh_data);
+  RUN_TEST(test_motor_time_dt_clamped);
   return UNITY_END();
 }

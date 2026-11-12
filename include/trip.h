@@ -78,6 +78,12 @@
 //  * Trip: eff_avg = (wh - wh_charged) / (dist_m / EFF_DIST_UNIT_M),
 //    eff_avg_valid iff dist_m >= EFF_MIN_DIST_M.
 //
+//  * Motor / powered time: motor_s accumulates dt while vesc_turning() (fresh STATUS_1,
+//    |mechanical rpm| > TOTALS_MIN_RPM), on_s while vesc_link_fresh() (STATUS_1 or STATUS_5
+//    fresh), both with the latest sample (rectangle rule) and the clamped dt. out.turning is
+//    the latest tick's vesc_turning(). The lifetime totals (include/totals.h) add these and
+//    the trip distance / energy to the record loaded at boot.
+//
 //  * Accumulators are double inside TripCalc (no drift over days at 5 Hz);
 //    TripState stores float. out.t_ms = now_ms (1 when now_ms is 0, so 0 keeps
 //    meaning "never").
@@ -109,6 +115,9 @@
 #ifndef EFF_DIST_UNIT_M
 #define EFF_DIST_UNIT_M 1000.0f
 #endif
+#ifndef TOTALS_MIN_RPM
+#define TOTALS_MIN_RPM 100
+#endif
 // Local constants (candidates for config.h; overridable with -D).
 #ifndef TRIP_DT_MAX_MS
 #define TRIP_DT_MAX_MS 5000        // longest step integrated after a stall; beyond it time is dropped, not integrated
@@ -135,6 +144,10 @@ struct TripCalc {
   uint32_t run_rem_ms;     // ... plus this remainder (0..999)
   uint32_t moving_s;       // time with ground speed >= EFF_MIN_SPEED_MM_S, whole seconds ...
   uint32_t moving_rem_ms;  // ... plus this remainder
+  uint32_t motor_s;        // time with the motor turning (vesc_turning), whole seconds ...
+  uint32_t motor_rem_ms;   // ... plus this remainder
+  uint32_t on_s;           // time with the VESC link fresh (vesc_link_fresh), whole seconds ...
+  uint32_t on_rem_ms;      // ... plus this remainder
   // trip totals
   double dist_m;           // GNSS ground speed integrated while moving
   double wh;               // energy drawn from the battery
@@ -208,6 +221,11 @@ inline void trip_calc_update(TripCalc &c, const SharedState &s, uint32_t now_ms,
   c.started = true;
   c.last_ms = now_ms;
   trip_add_ms(c.run_s, c.run_rem_ms, dt);
+
+  // ---- motor / powered time: latest sample x dt ----
+  const bool turning = vesc_turning(&t, now_ms, VESC_STALE_R1_MS, VESC_MOTOR_POLES, (float)TOTALS_MIN_RPM);
+  if (turning && dt) trip_add_ms(c.motor_s, c.motor_rem_ms, dt);
+  if (dt && vesc_link_fresh(&t, now_ms, VESC_STALE_R1_MS)) trip_add_ms(c.on_s, c.on_rem_ms, dt);
 
   // ---- distance: latest ground speed sample x dt while moving ----
   const bool gnss_ok = trip_gnss_usable(g, now_ms);
@@ -321,6 +339,9 @@ inline void trip_calc_update(TripCalc &c, const SharedState &s, uint32_t now_ms,
   out.eff_avg_valid = c.dist_m >= (double)EFF_MIN_DIST_M;
   out.energy_from_counters = c.from_counters;
   out.counter_resets = c.counter_resets;
+  out.motor_s = c.motor_s;
+  out.on_s = c.on_s;
+  out.turning = turning;
 }
 
 // ---------------------------------------------------------------------------

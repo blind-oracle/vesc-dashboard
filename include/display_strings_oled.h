@@ -71,6 +71,9 @@ enum OledScreen : uint8_t {
 #endif
   SCREEN_GNSS,      // fix, position, accuracies, speed/heading, UTC date-time
   SCREEN_SYS,       // firmware, uptime, heap, CAN/GNSS driver state, button/lock counters
+#if TOTALS_ENABLE
+  SCREEN_TOTALS,    // "TOTALS": lifetime motor / powered hours, distance, net energy, this boot's motor time, last save
+#endif
   SCREEN_COUNT
 };
 
@@ -86,6 +89,9 @@ inline const char *oled_screen_name(uint8_t screen) {
 #endif
     case SCREEN_GNSS: return "GNSS";
     case SCREEN_SYS: return "SYS";
+#if TOTALS_ENABLE
+    case SCREEN_TOTALS: return "TOTALS";
+#endif
     default: return "?";
   }
 }
@@ -692,6 +698,12 @@ inline void fmt_uptime(char *buf, size_t n, uint32_t sec) {
 }
 
 
+// In-place ASCII upper case: the panel's last grid row has no room for descenders.
+inline void upper_str(char *buf) {
+  for (char *p = buf; *p; ++p)
+    if (*p >= 'a' && *p <= 'z') *p = (char)(*p - 'a' + 'A');
+}
+
 }  // namespace oled_detail
 
 #if DEADMAN_UI_ENABLE
@@ -1091,6 +1103,93 @@ inline void oled_build_eff(const SharedState &s, uint32_t now, OledGrid &g) {
 }
 
 
+#if TOTALS_ENABLE
+// "TOTALS": the lifetime record (include/totals.h) as the trip task last published it.
+//   motor      1234.5 h      motor running (|rpm| > TOTALS_MIN_RPM), every boot together
+//   powered    1502.3 h      VESC link fresh
+//   dist       4321.0 NM     GNSS distance while moving, in the efficiency's distance unit
+//   energy     812.40kWh     net = drawn - returned (fmt_energy)
+//   this boot  mot 1h02m     this boot's motor time (the trip integrator)
+//   SAVED 12M34S AGO         what is in flash (totals_save_row)
+// Every value is "--" while the trip task has not published (totals_live).
+inline bool totals_live(const TotalsState &t, uint32_t now) { return fresh(t.t_ms, now, TRIP_STALE_MS); }
+
+// The last row (upper case, <= 21 chars), first match wins:
+//   "NVS ERROR: RAM ONLY"    NVS unavailable or the record unreadable: nothing is written
+//   "SAVE FAILED, RETRYING"  the last write failed (next try TOTALS_RETRY_S later)
+//   "SAVED 12M34S AGO"       a write succeeded this boot
+//   "NOT SAVED YET"          changes waiting for their first save
+//   "UP TO DATE"             nothing to save: flash holds these values
+inline void totals_save_row(const TotalsState &t, uint32_t now, bool live, char *out, size_t n) {
+  using namespace oled_detail;
+  if (!live) {
+    fmt_dashes(out, n);
+  } else if (t.nvs == TOTALS_NVS_ERR) {
+    copy_str(out, n, "NVS ERROR: RAM ONLY");
+  } else if (t.failed) {
+    copy_str(out, n, "SAVE FAILED, RETRYING");
+  } else if (t.last_save_ms != 0) {
+    // Signed age: the trip task stamps the save after its own clock read, which may lead `now`.
+    const int32_t age_ms = (int32_t)(now - t.last_save_ms);
+    char a[12];
+    fmt_uptime(a, sizeof a, age_ms > 0 ? (uint32_t)age_ms / 1000u : 0u);
+    copy_str(out, n, "SAVED ");
+    append_str(out, n, a);
+    append_str(out, n, " AGO");
+    upper_str(out);
+  } else {
+    copy_str(out, n, t.dirty ? "NOT SAVED YET" : "UP TO DATE");
+  }
+  clip(out, n, kGridChars);
+}
+
+inline void oled_build_totals(const SharedState &s, uint32_t now, OledGrid &g) {
+  using namespace oled_detail;
+  grid_begin(g, "TOTALS", SCREEN_TOTALS);
+  const TotalsState &t = s.totals;
+  const bool live = totals_live(t, now);
+  const TotalsRecord &r = t.life;
+  char v[24], l[32];
+  // the value column starts at kGridCol2: 10 chars
+  const size_t vw = (size_t)(kGridChars - kGridCol2);
+
+  if (live) fmt_num_unit(v, sizeof v, (float)((double)r.motor_s / 3600.0), 1, vw, " h");
+  else fmt_dashes(v, sizeof v);
+  row2(g.rows[0], "motor", v);
+
+  if (live) fmt_num_unit(v, sizeof v, (float)((double)r.on_s / 3600.0), 1, vw, " h");
+  else fmt_dashes(v, sizeof v);
+  row2(g.rows[1], "powered", v);
+
+  if (live) {
+    char unit[8] = " ";
+    append_str(unit, sizeof unit, EFF_DIST_UNIT_STR);
+    fmt_num_unit(v, sizeof v, (float)((double)r.dist_m / (double)EFF_DIST_UNIT_M), 1, vw, unit);
+  } else {
+    fmt_dashes(v, sizeof v);
+  }
+  row2(g.rows[2], "dist", v);
+
+  if (live) fmt_energy(v, sizeof v, (float)((double)r.wh - (double)r.whc), vw);
+  else fmt_dashes(v, sizeof v);
+  row2(g.rows[3], "energy", v);
+
+  if (trip_live(s.trip, now)) {
+    char a[12];
+    fmt_uptime(a, sizeof a, s.trip.motor_s);
+    copy_str(v, sizeof v, "mot ");
+    append_str(v, sizeof v, a);
+  } else {
+    copy_str(v, sizeof v, "mot --");
+  }
+  row2(g.rows[4], "this boot", v);
+
+  // last row: no descenders (its baseline is the panel's last row)
+  totals_save_row(t, now, live, l, sizeof l);
+  row1(g.rows[5], l);
+}
+#endif  // TOTALS_ENABLE
+
 #if PUMP_ENABLE
 // "PUMP" (every row <= 21 chars):
 //   RUN 62% warm            mode, commanded duty, reason ("--" while the pump task is silent)
@@ -1477,6 +1576,9 @@ inline void oled_build_frame(const SharedState &s, uint32_t now, uint8_t screen,
 #endif
     case SCREEN_GNSS: oled_build_gnss(s, now, out.grid); break;
     case SCREEN_SYS: oled_build_sys(s, now, info, out.grid); break;
+#if TOTALS_ENABLE
+    case SCREEN_TOTALS: oled_build_totals(s, now, out.grid); break;
+#endif
     default: oled_build_main(s, now, out.main); break;
   }
 }

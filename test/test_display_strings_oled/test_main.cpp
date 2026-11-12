@@ -143,6 +143,27 @@ static void fill_trip(SharedState &s, uint32_t t) {
   s.trip.counter_resets = 0;
 }
 
+// Lifetime totals as the trip task publishes them: 1234.5 h on the motor, saved 12 s ago.
+static void fill_totals(SharedState &s, uint32_t t) {
+  s.trip.motor_s = 3720;  // this boot: 1h02m
+  s.trip.on_s = 5000;
+#if TOTALS_ENABLE
+  TotalsState &o = s.totals;
+  o.t_ms = t;
+  o.life.motor_s = 1234u * 3600u + 1800u;                     // 1234.5 h
+  o.life.on_s = 1502u * 3600u + 1080u;                        // 1502.3 h
+  o.life.dist_m = (uint32_t)(4321.0 * (double)EFF_DIST_UNIT_M);  // 4321.0 NM / km
+  o.life.wh = 830000u;
+  o.life.whc = 17600u;                                        // net 812.40 kWh
+  o.nvs = TOTALS_NVS_OK;
+  o.saves = 3;
+  o.last_reason = TOTALS_SAVE_STOP;
+  o.last_save_ms = t - 12000u;
+#else
+  (void)t;
+#endif
+}
+
 
 static SharedState make_state(uint32_t t) {
   SharedState s;
@@ -153,6 +174,7 @@ static SharedState make_state(uint32_t t) {
   fill_vesc(s, t);
   fill_gnss(s, t);
   fill_trip(s, t);
+  fill_totals(s, t);
   s.disp.button_presses = 12;
   return s;
 }
@@ -720,19 +742,23 @@ static void test_fmt_age_short() {
 
 static void test_screen_names_and_count() {
 #if PUMP_ENABLE
-  TEST_ASSERT_EQUAL_INT(8, (int)SCREEN_COUNT);
+  TEST_ASSERT_EQUAL_INT(8 + TOTALS_ENABLE, (int)SCREEN_COUNT);
   TEST_ASSERT_EQUAL_INT(5, (int)SCREEN_PUMP);  // right after the VESC pages it belongs to
   TEST_ASSERT_EQUAL_STRING("PUMP", oled_screen_name(SCREEN_PUMP));
 #else
-  TEST_ASSERT_EQUAL_INT(7, (int)SCREEN_COUNT);
+  TEST_ASSERT_EQUAL_INT(7 + TOTALS_ENABLE, (int)SCREEN_COUNT);
+#endif
+#if TOTALS_ENABLE
+  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 1, (int)SCREEN_TOTALS);  // the last page, after SYS
+  TEST_ASSERT_EQUAL_STRING("TOTALS", oled_screen_name(SCREEN_TOTALS));
 #endif
   TEST_ASSERT_EQUAL_INT(0, (int)SCREEN_MAIN);
   TEST_ASSERT_EQUAL_INT(1, (int)SCREEN_EFF);  // right after MAIN: one short press from the dashboard
   TEST_ASSERT_EQUAL_INT(2, (int)SCREEN_VESC_A);
   TEST_ASSERT_EQUAL_INT(3, (int)SCREEN_VESC_B);
   TEST_ASSERT_EQUAL_INT(4, (int)SCREEN_VESC_C);
-  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 2, (int)SCREEN_GNSS);
-  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 1, (int)SCREEN_SYS);
+  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 2 - TOTALS_ENABLE, (int)SCREEN_GNSS);
+  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 1 - TOTALS_ENABLE, (int)SCREEN_SYS);
   TEST_ASSERT_EQUAL_STRING("MAIN", oled_screen_name(SCREEN_MAIN));
   TEST_ASSERT_EQUAL_STRING("EFF", oled_screen_name(SCREEN_EFF));
   TEST_ASSERT_EQUAL_STRING("VESC 1/3", oled_screen_name(SCREEN_VESC_A));
@@ -1442,6 +1468,108 @@ static void test_sys_variants() {
   assert_grid_lengths(g);
 }
 
+
+// ---------------------------------------------------------------- TOTALS
+#if TOTALS_ENABLE
+static void test_totals_rows() {
+  SharedState s = make_state(NOW);
+  OledGrid g = build_grid(SCREEN_TOTALS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("TOTALS", g.title);
+  char pg[8];
+  TEST_ASSERT_EQUAL_STRING(expect_page(pg, sizeof pg, SCREEN_TOTALS), g.page);
+  TEST_ASSERT_EQUAL_STRING("motor      1234.5 h", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("powered    1502.3 h", g.rows[1]);
+  char want[32];
+  snprintf(want, sizeof want, "dist       4321.0 %s", EFF_DIST_UNIT_STR);
+  TEST_ASSERT_EQUAL_STRING(want, g.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("energy     812.40kWh", g.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("this boot  mot 1h02m", g.rows[4]);
+  TEST_ASSERT_EQUAL_STRING("SAVED 0M12S AGO", g.rows[5]);
+  assert_grid_lengths(g);
+
+  // a fresh board: nothing recorded yet, nothing counted
+  SharedState z = make_state(NOW);
+  z.totals.life = TotalsRecord{};
+  z.trip.motor_s = 0;
+  z.totals.last_save_ms = 0;
+  z.totals.nvs = TOTALS_NVS_NONE;
+  g = build_grid(SCREEN_TOTALS, z, NOW);
+  TEST_ASSERT_EQUAL_STRING("motor      0.0 h", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("energy     0Wh", g.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("this boot  mot 0m00s", g.rows[4]);
+  TEST_ASSERT_EQUAL_STRING("UP TO DATE", g.rows[5]);
+}
+
+static void test_totals_save_row_states() {
+  SharedState s = make_state(NOW);
+  char b[32];
+  totals_save_row(s.totals, NOW, true, b, sizeof b);
+  TEST_ASSERT_EQUAL_STRING("SAVED 0M12S AGO", b);
+  s.totals.last_save_ms = NOW - 3723000u;
+  totals_save_row(s.totals, NOW, true, b, sizeof b);
+  TEST_ASSERT_EQUAL_STRING("SAVED 1H02M AGO", b);
+  s.totals.last_save_ms = NOW + 300u;  // stamped after the display's clock read: never a 49-day age
+  totals_save_row(s.totals, NOW, true, b, sizeof b);
+  TEST_ASSERT_EQUAL_STRING("SAVED 0M00S AGO", b);
+  s.totals.last_save_ms = 0;
+  s.totals.dirty = true;
+  totals_save_row(s.totals, NOW, true, b, sizeof b);
+  TEST_ASSERT_EQUAL_STRING("NOT SAVED YET", b);
+  s.totals.dirty = false;
+  totals_save_row(s.totals, NOW, true, b, sizeof b);
+  TEST_ASSERT_EQUAL_STRING("UP TO DATE", b);
+  s.totals.last_save_ms = NOW - 1000u;
+  s.totals.failed = true;  // a failure outranks an older success
+  totals_save_row(s.totals, NOW, true, b, sizeof b);
+  TEST_ASSERT_EQUAL_STRING("SAVE FAILED, RETRYING", b);
+  TEST_ASSERT_EQUAL_size_t((size_t)kGridChars, strlen(b));
+  s.totals.nvs = TOTALS_NVS_ERR;  // and NVS that never came up outranks everything
+  totals_save_row(s.totals, NOW, true, b, sizeof b);
+  TEST_ASSERT_EQUAL_STRING("NVS ERROR: RAM ONLY", b);
+  totals_save_row(s.totals, NOW, false, b, sizeof b);
+  TEST_ASSERT_EQUAL_STRING("--", b);
+}
+
+static void test_totals_stale_and_extremes() {
+  // the trip task never published: every value unknown
+  SharedState s = make_state(NOW);
+  s.totals.t_ms = 0;
+  s.trip.t_ms = 0;
+  OledGrid g = build_grid(SCREEN_TOTALS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("motor      --", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("powered    --", g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("dist       --", g.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("energy     --", g.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("this boot  mot --", g.rows[4]);
+  TEST_ASSERT_EQUAL_STRING("--", g.rows[5]);
+  // published, but longer ago than TRIP_STALE_MS
+  s = make_state(NOW);
+  s.totals.t_ms = NOW - (uint32_t)TRIP_STALE_MS - 1u;
+  g = build_grid(SCREEN_TOTALS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("motor      --", g.rows[0]);
+
+  // the whole uint32_t range of every field stays inside its column
+  s = make_state(NOW);
+  s.totals.life.motor_s = UINT32_MAX;
+  s.totals.life.on_s = UINT32_MAX;
+  s.totals.life.dist_m = UINT32_MAX;
+  s.totals.life.wh = UINT32_MAX;
+  s.totals.life.whc = 0;
+  s.trip.motor_s = UINT32_MAX;
+  s.totals.last_save_ms = 1u;
+  g = build_grid(SCREEN_TOTALS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("motor      1193046 h", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("energy     4294.97MWh", g.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("this boot  mot 49710d", g.rows[4]);
+  assert_grid_lengths(g);
+  // more returned than drawn (a regen-only life): a signed net
+  s = make_state(NOW);
+  s.totals.life.wh = 100u;
+  s.totals.life.whc = 1330u;
+  g = build_grid(SCREEN_TOTALS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("energy     -1.23kWh", g.rows[3]);
+}
+#endif  // TOTALS_ENABLE
 
 // ---------------------------------------------------------------- frames: dispatch, determinism, boot
 static void test_frame_dispatch_and_determinism() {
@@ -2363,6 +2491,11 @@ int main(int, char **) {
   RUN_TEST(test_pump_tach_row);
   RUN_TEST(test_pump_alarm_overlay);
 #endif
+#endif
+#if TOTALS_ENABLE
+  RUN_TEST(test_totals_rows);
+  RUN_TEST(test_totals_save_row_states);
+  RUN_TEST(test_totals_stale_and_extremes);
 #endif
   RUN_TEST(test_boot_frame);
   RUN_TEST(test_layout_geometry);

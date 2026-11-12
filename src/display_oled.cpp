@@ -410,6 +410,28 @@ static SharedState demo_state(uint32_t now) {
   if (s.trip.eff_avg_valid) s.trip.eff_avg = (s.trip.wh - s.trip.wh_charged) / (s.trip.dist_m / EFF_DIST_UNIT_M);
   s.trip.energy_from_counters = true;
   s.trip.counter_resets = 0;
+  s.trip.motor_s = tsec;
+  s.trip.on_s = tsec;
+  s.trip.turning = true;
+
+#if TOTALS_ENABLE
+  // Lifetime totals: a well-used boat (1234.5 h on the motor, 4321 NM) adding this trip; the
+  // record was saved within the last minute (the run save of a motor that keeps turning).
+  {
+    TotalsState &tt = s.totals;
+    tt.t_ms = stamp;
+    tt.life.motor_s = 1234u * 3600u + 1800u + tsec;
+    tt.life.on_s = 1502u * 3600u + 1080u + tsec;
+    tt.life.dist_m = 8002692u + (uint32_t)s.trip.dist_m;  // 4321.0 NM = 8002.7 km
+    tt.life.wh = 830000u + (uint32_t)s.trip.wh;
+    tt.life.whc = 17600u + (uint32_t)s.trip.wh_charged;
+    tt.nvs = TOTALS_NVS_OK;
+    tt.saves = tsec / 60u;
+    tt.last_reason = TOTALS_SAVE_RUN;
+    tt.last_save_ms = tsec >= 60u ? stamp - (tsec % 60u) * 1000u : 0u;
+    tt.dirty = (tsec % 60u) != 0u;
+  }
+#endif
 
 #if PUMP_ENABLE
   // Coolant pump: limits read from a 6.06 VESC; the synthetic temperatures stay well below

@@ -28,6 +28,7 @@
 #include "ota.h"
 #include "pump.h"
 #include "status_led.h"
+#include "totals.h"
 #include "trip.h"
 
 static const char *TAG = "main";
@@ -35,7 +36,7 @@ static const char *TAG = "main";
 // Log tags of this project. Their runtime level is raised to the compile-time level of the
 // project sources (LOG_LOCAL_LEVEL; platformio.ini may set -DLOG_LOCAL_LEVEL=ESP_LOG_DEBUG),
 // so the debug lines can be switched on without touching the IDF components' own tags.
-static const char *const kLogTags[] = {"main", "can", "vesc", "gnss", "oled", "trip", "ble", "dm", "ota", "pump"};
+static const char *const kLogTags[] = {"main", "can", "vesc", "gnss", "oled", "trip", "ble", "dm", "ota", "pump", "totals"};
 
 [[maybe_unused]] static const char *resetReasonStr(esp_reset_reason_t r)
 { // log-only
@@ -82,6 +83,13 @@ static void logConfig()
            OLED_HEIGHT, OLED_ROTATION, OLED_PERIOD_MS, (unsigned long)OLED_IDLE_DIM_MS);
   ESP_LOGI(TAG, "cfg GNSS: rx=%d tx=%d rate=%d ms unit=%s rxbuf=%d", PIN_GNSS_RX, PIN_GNSS_TX, GNSS_RATE_MS,
            SPEED_UNIT_STR, GNSS_RX_BUFFER);
+#if TOTALS_ENABLE
+  ESP_LOGI(TAG, "cfg TOTL: NVS totals/rec, motor > %d rpm, save stop=%d ms run=%d s idle=%d s gap=%d s retry=%d s",
+           TOTALS_MIN_RPM, TOTALS_STOP_SAVE_MS, TOTALS_SAVE_RUN_S, TOTALS_SAVE_IDLE_S, TOTALS_MIN_GAP_S,
+           TOTALS_RETRY_S);
+#else
+  ESP_LOGI(TAG, "cfg TOTL: off (TOTALS_ENABLE 0)");
+#endif
 }
 
 // Returns true in update mode.
@@ -150,8 +158,10 @@ static bool setup()
     return true;
   }
 
-  // BLE first: the first controller enable may store the PHY calibration blob in NVS, and the TWAI
-  // ISR is not cache-safe, so the CAN node must not exist yet while that flash write happens.
+  // The lifetime totals first: NVS init may finish a write a power cut interrupted, and the TWAI
+  // ISR is not cache-safe, so neither the CAN node nor the radio may exist yet. Then BLE: the
+  // first controller enable may store the PHY calibration blob in NVS, the same way.
+  totals_load();
   [[maybe_unused]] const bool bleOk = ble_scan_start();
   // After the radio (it needs the scan) and before the display, so a tripped dead-man is
   // already asserting its cut by the time the first frame is drawn.
@@ -181,8 +191,8 @@ static bool hbOk(uint32_t hb, uint32_t now, uint32_t max_age)
 
 static void loop()
 {
-  static uint32_t nextVescLog = 0, nextGnssLog = 0, nextTripLog = 0, nextDmLog = 0, nextPumpLog = 0, nextSysLog = 0,
-                  nextStaleLog = 0, nextBlink = 0;
+  static uint32_t nextVescLog = 0, nextGnssLog = 0, nextTripLog = 0, nextTotalsLog = 0, nextDmLog = 0, nextPumpLog = 0,
+                  nextSysLog = 0, nextStaleLog = 0, nextBlink = 0;
   static bool led = false;
 
   // Snapshot BEFORE reading the clock: every timestamp inside s must be <= now,
@@ -229,8 +239,7 @@ static void loop()
   ota_confirm_if_healthy(allAlive && (!DEADMAN_ENABLE || ble_scan_active()), now);
 
   // ---- LED: 1 Hz blink when VESC data is fresh, 0.2 Hz otherwise (a WS2812 also turns red) ----
-  const bool vescFresh = vesc_fresh(&s.vesc.t, VESC_IDX_STATUS_1, now, VESC_STALE_R1_MS) ||
-                         vesc_fresh(&s.vesc.t, VESC_IDX_STATUS_5, now, VESC_STALE_R1_MS);
+  const bool vescFresh = vesc_link_fresh(&s.vesc.t, now, VESC_STALE_R1_MS);
   if ((int32_t)(now - nextBlink) >= 0)
   {
     nextBlink = now + (vescFresh ? 500 : 2500);
@@ -253,6 +262,14 @@ static void loop()
   {
     nextTripLog = now + LOG_TRIP_MS;
     trip_log_summary(s, now);
+  }
+  // Saves and failed saves every loop, the totals line on its own deadline (no-ops with
+  // TOTALS_ENABLE 0). The trip task writes the record; it never logs.
+  totals_log_events(s, now);
+  if (LOG_TOTALS_MS && TOTALS_ENABLE && (int32_t)(now - nextTotalsLog) >= 0)
+  {
+    nextTotalsLog = now + LOG_TOTALS_MS;
+    totals_log_summary(s, now);
   }
   // Transitions every loop (a trip must not wait for the next summary), the summary on its
   // own deadline. All dead-man logging happens here: its own task must never block on the
