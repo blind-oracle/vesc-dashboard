@@ -237,6 +237,11 @@
 #ifndef BUTTON_LONG_PRESS_MS
 #define BUTTON_LONG_PRESS_MS 1500 // long press -> back to the main screen
 #endif
+#ifndef BUTTON_DOUBLE_CLICK_MS
+#define BUTTON_DOUBLE_CLICK_MS 350 // a second press within this long after a short press = double click (previous screen).
+                                   // A single short press (next screen) is committed only once this window has passed.
+                                   // 0 = no double click: a short press acts at once, as before
+#endif
 #ifndef SCREEN_AUTO_RETURN_MS
 #define SCREEN_AUTO_RETURN_MS 0 // 0 (default) = stay on the selected screen; > 0 = return to the main screen this long after
                                 // the last button event. A long press always returns to the main screen.
@@ -694,6 +699,9 @@
 #ifndef LOG_TOTALS_MS
 #define LOG_TOTALS_MS 60000 // period of the lifetime totals log line (0 = off; saves and errors are logged anyway)
 #endif
+#ifndef LOG_PEAKS_MS
+#define LOG_PEAKS_MS 60000 // period of the peaks-since-boot log line (0 = off)
+#endif
 #ifndef SERIAL_BOOT_DELAY_MS
 #define SERIAL_BOOT_DELAY_MS 1500 // give the USB-Serial/JTAG host time to re-enumerate so the boot banner is visible
 #endif
@@ -960,6 +968,9 @@
 #endif
 #if OTA_ENABLE && PIN_BUTTON < 0
 #error "OTA_ENABLE needs a button: holding it is the only way into update mode"
+#endif
+#if BUTTON_DOUBLE_CLICK_MS != 0 && (BUTTON_DOUBLE_CLICK_MS <= BUTTON_DEBOUNCE_MS || BUTTON_DOUBLE_CLICK_MS >= BUTTON_LONG_PRESS_MS)
+#error "BUTTON_DOUBLE_CLICK_MS must be 0 (off) or longer than BUTTON_DEBOUNCE_MS and shorter than BUTTON_LONG_PRESS_MS"
 #endif
 #if OTA_ENABLE && OTA_LONG_PRESS_MS <= BUTTON_LONG_PRESS_MS
 #error "OTA_LONG_PRESS_MS must be longer than BUTTON_LONG_PRESS_MS (the same hold passes the long press first)"

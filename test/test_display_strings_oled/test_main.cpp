@@ -1,6 +1,6 @@
 // Unity tests (pio test -e native) for the pure OLED screen builders in
 // include/display_strings_oled.h: main screen cells, clock arithmetic, the grid
-// screens (efficiency, VESC 1-3, PUMP, GNSS, SYS), the overlays (dead-man alarm, FW UPDATE,
+// screens (efficiency, VESC 1-2, PUMP, GNSS, TOTALS, PEAKS, SYS), the overlays (dead-man alarm, FW UPDATE,
 // update refused) with the update-mode entry gate (ota_logic.h), the live/latched fault row, freshness
 // rules, character budgets, determinism. Fault names come from vesc_getvalues.h
 // (checked here as used).
@@ -164,6 +164,18 @@ static void fill_totals(SharedState &s, uint32_t t) {
 #endif
 }
 
+// Peaks since boot: 5980 W, 123.4 A drawn, 235 A motor, 3000 rpm, Tfet 65.2, Tmot 72.1, 5144 mm/s.
+static void fill_peaks(SharedState &s) {
+  PeaksState &p = s.peaks;
+  p.power_w = 5980.0f;
+  p.i_bat_a = 123.4f;
+  p.i_mot_a = 235.0f;
+  p.rpm = 3000.0f;
+  p.temp_fet_c = 65.2f;
+  p.temp_mot_c = 72.1f;
+  p.speed_mm_s = 5144;
+  p.have = PEAK_POWER | PEAK_IBAT | PEAK_IMOT | PEAK_RPM | PEAK_TFET | PEAK_TMOT | PEAK_SPEED;
+}
 
 static SharedState make_state(uint32_t t) {
   SharedState s;
@@ -175,6 +187,7 @@ static SharedState make_state(uint32_t t) {
   fill_gnss(s, t);
   fill_trip(s, t);
   fill_totals(s, t);
+  fill_peaks(s);
   s.disp.button_presses = 12;
   return s;
 }
@@ -240,10 +253,11 @@ static void assert_grid_lengths(const OledGrid &g) {
   TEST_ASSERT_TRUE(strnlen(g.title, sizeof g.title) >= 3);
   TEST_ASSERT_TRUE(strnlen(g.page, sizeof g.page) <= (size_t)kPageChars);
   TEST_ASSERT_EQUAL_UINT8(kGridRows, g.nrows);
+  const bool peaks = strcmp(g.title, "PEAKS") == 0;  // the one page with a deliberate blank row (row 4)
   for (int r = 0; r < kGridRows; ++r) {
     const size_t l = strnlen(g.rows[r], sizeof g.rows[r]);
     TEST_ASSERT_TRUE(l <= (size_t)kGridChars);
-    TEST_ASSERT_TRUE(l >= 1);
+    TEST_ASSERT_TRUE(l >= 1 || (peaks && r == 4));
     TEST_ASSERT_TRUE(l == 0 || g.rows[r][l - 1] != ' ');  // no trailing padding (memcmp stability)
   }
   // the last grid row sits on the panel's last pixel row: its labels carry no descenders
@@ -741,30 +755,29 @@ static void test_fmt_age_short() {
 }
 
 static void test_screen_names_and_count() {
+  // MAIN, EFF, VESC 1/2, VESC 2/2, [PUMP], GNSS, [TOTALS], PEAKS, SYS
+  TEST_ASSERT_EQUAL_INT(7 + PUMP_ENABLE + TOTALS_ENABLE, (int)SCREEN_COUNT);
 #if PUMP_ENABLE
-  TEST_ASSERT_EQUAL_INT(8 + TOTALS_ENABLE, (int)SCREEN_COUNT);
-  TEST_ASSERT_EQUAL_INT(5, (int)SCREEN_PUMP);  // right after the VESC pages it belongs to
+  TEST_ASSERT_EQUAL_INT(4, (int)SCREEN_PUMP);  // right after the VESC pages it belongs to
   TEST_ASSERT_EQUAL_STRING("PUMP", oled_screen_name(SCREEN_PUMP));
-#else
-  TEST_ASSERT_EQUAL_INT(7 + TOTALS_ENABLE, (int)SCREEN_COUNT);
 #endif
+  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 1, (int)SCREEN_SYS);    // ALWAYS the last page
+  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 2, (int)SCREEN_PEAKS);  // right before SYS
 #if TOTALS_ENABLE
-  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 1, (int)SCREEN_TOTALS);  // the last page, after SYS
+  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 3, (int)SCREEN_TOTALS);  // next to PEAKS
   TEST_ASSERT_EQUAL_STRING("TOTALS", oled_screen_name(SCREEN_TOTALS));
 #endif
   TEST_ASSERT_EQUAL_INT(0, (int)SCREEN_MAIN);
   TEST_ASSERT_EQUAL_INT(1, (int)SCREEN_EFF);  // right after MAIN: one short press from the dashboard
   TEST_ASSERT_EQUAL_INT(2, (int)SCREEN_VESC_A);
   TEST_ASSERT_EQUAL_INT(3, (int)SCREEN_VESC_B);
-  TEST_ASSERT_EQUAL_INT(4, (int)SCREEN_VESC_C);
-  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 2 - TOTALS_ENABLE, (int)SCREEN_GNSS);
-  TEST_ASSERT_EQUAL_INT((int)SCREEN_COUNT - 1 - TOTALS_ENABLE, (int)SCREEN_SYS);
+  TEST_ASSERT_EQUAL_INT(4 + PUMP_ENABLE, (int)SCREEN_GNSS);
   TEST_ASSERT_EQUAL_STRING("MAIN", oled_screen_name(SCREEN_MAIN));
   TEST_ASSERT_EQUAL_STRING("EFF", oled_screen_name(SCREEN_EFF));
-  TEST_ASSERT_EQUAL_STRING("VESC 1/3", oled_screen_name(SCREEN_VESC_A));
-  TEST_ASSERT_EQUAL_STRING("VESC 2/3", oled_screen_name(SCREEN_VESC_B));
-  TEST_ASSERT_EQUAL_STRING("VESC 3/3", oled_screen_name(SCREEN_VESC_C));
+  TEST_ASSERT_EQUAL_STRING("VESC 1/2", oled_screen_name(SCREEN_VESC_A));
+  TEST_ASSERT_EQUAL_STRING("VESC 2/2", oled_screen_name(SCREEN_VESC_B));
   TEST_ASSERT_EQUAL_STRING("GNSS", oled_screen_name(SCREEN_GNSS));
+  TEST_ASSERT_EQUAL_STRING("PEAKS", oled_screen_name(SCREEN_PEAKS));
   TEST_ASSERT_EQUAL_STRING("SYS", oled_screen_name(SCREEN_SYS));
   TEST_ASSERT_EQUAL_STRING("?", oled_screen_name(SCREEN_COUNT));
   TEST_ASSERT_EQUAL_STRING("?", oled_screen_name(255));
@@ -1084,11 +1097,11 @@ static void test_fmt_wh_and_energy_helpers() {
   TEST_ASSERT_EQUAL_STRING("0Wh", b);
 }
 
-// ---------------------------------------------------------------- grid: VESC 1/3
+// ---------------------------------------------------------------- grid: VESC 1/2
 static void test_vesc_a_rows() {
   OledGrid g = build_grid(SCREEN_VESC_A, make_state(NOW), NOW);
   char pg[8];
-  TEST_ASSERT_EQUAL_STRING("VESC 1/3", g.title);
+  TEST_ASSERT_EQUAL_STRING("VESC 1/2", g.title);
   TEST_ASSERT_EQUAL_STRING(expect_page(pg, sizeof pg, SCREEN_VESC_A), g.page);
   TEST_ASSERT_EQUAL_STRING("FAULT none", g.rows[0]);  // fresh reply, no fault, nothing latched
   TEST_ASSERT_EQUAL_STRING("Vin 48.2   Ibat 12.4", g.rows[1]);
@@ -1187,12 +1200,12 @@ static void test_vesc_a_latched_fault_with_age() {
   assert_grid_lengths(g);
 }
 
-// ---------------------------------------------------------------- grid: VESC 2/3
+// ---------------------------------------------------------------- grid: VESC 2/2
 static void test_vesc_b_rows() {
   SharedState s = make_state(NOW);
   OledGrid g = build_grid(SCREEN_VESC_B, s, NOW);
   char pg[8];
-  TEST_ASSERT_EQUAL_STRING("VESC 2/3", g.title);
+  TEST_ASSERT_EQUAL_STRING("VESC 2/2", g.title);
   TEST_ASSERT_EQUAL_STRING(expect_page(pg, sizeof pg, SCREEN_VESC_B), g.page);
   TEST_ASSERT_EQUAL_STRING("Tmos 45.1  Iin 12.4", g.rows[0]);  // first MOSFET sensor + the VESC's averaged input current
   TEST_ASSERT_EQUAL_STRING("Id 0.3     Iq 34.9", g.rows[1]);
@@ -1244,48 +1257,6 @@ static void test_vesc_b_rows() {
   TEST_ASSERT_EQUAL_STRING("Tach -MAX  Abs --", g.rows[3]);
   TEST_ASSERT_EQUAL_STRING("St --      id --", g.rows[4]);
   TEST_ASSERT_EQUAL_STRING("AhC 0.012  WhC 3.4", g.rows[5]);
-}
-
-// ---------------------------------------------------------------- grid: VESC 3/3
-static void test_vesc_c_rows() {
-  SharedState s = make_state(NOW);
-  OledGrid g = build_grid(SCREEN_VESC_C, s, NOW);
-  char pg[8];
-  TEST_ASSERT_EQUAL_STRING("VESC 3/3", g.title);
-  TEST_ASSERT_EQUAL_STRING(expect_page(pg, sizeof pg, SCREEN_VESC_C), g.page);
-  TEST_ASSERT_EQUAL_STRING("PPM 0.52   PID 12.3", g.rows[0]);
-  TEST_ASSERT_EQUAL_STRING("ADC 1.23 2.10 0.00", g.rows[1]);
-#if VESC_POLL_MS > 0
-  TEST_ASSERT_EQUAL_STRING("poll 123   ok 120", g.rows[2]);
-  TEST_ASSERT_EQUAL_STRING("bad 0      tmo 3", g.rows[3]);
-#else
-  TEST_ASSERT_EQUAL_STRING("poll off   ok --", g.rows[2]);  // passive build: never polls, never "0 of 0"
-  TEST_ASSERT_EQUAL_STRING("bad --     tmo --", g.rows[3]);
-#endif
-  TEST_ASSERT_EQUAL_STRING("frm 12345  oth 0", g.rows[4]);
-  TEST_ASSERT_EQUAL_STRING("misc 3     busoff 0", g.rows[5]);
-  assert_grid_lengths(g);
-  s.vesc.t.adc1 = -32.768f;
-  s.vesc.t.adc2 = 32.767f;
-  s.vesc.t.adc3 = -1.5f;
-  s.vesc_ext.polls_sent = 4294967295u;
-  s.vesc_ext.replies_ok = 1234567;
-  s.vesc.frames_total = 987654321;
-  s.can.bus_off_count = 999999;
-  g = build_grid(SCREEN_VESC_C, s, NOW);
-  TEST_ASSERT_EQUAL_STRING("ADC -32.8 32.77 -1.50", g.rows[1]);  // exactly 21 chars
-#if VESC_POLL_MS > 0
-  TEST_ASSERT_EQUAL_STRING("poll 4295M ok 1235k", g.rows[2]);
-#else
-  TEST_ASSERT_EQUAL_STRING("poll off   ok --", g.rows[2]);
-#endif
-  TEST_ASSERT_EQUAL_STRING("frm 988M   oth 0", g.rows[4]);
-  TEST_ASSERT_EQUAL_STRING("misc 3     busoff 1M", g.rows[5]);
-  assert_grid_lengths(g);
-  s.vesc.t.t_ms[VESC_IDX_STATUS_6] = NOW - VESC_STALE_R2_MS - 1;  // STATUS_6 is Rate 2
-  g = build_grid(SCREEN_VESC_C, s, NOW);
-  TEST_ASSERT_EQUAL_STRING("PPM --     PID 12.3", g.rows[0]);
-  TEST_ASSERT_EQUAL_STRING("ADC --", g.rows[1]);
 }
 
 // ---------------------------------------------------------------- grid: GNSS
@@ -1468,6 +1439,66 @@ static void test_sys_variants() {
   assert_grid_lengths(g);
 }
 
+
+// ---------------------------------------------------------------- PEAKS
+static void test_peaks_rows() {
+  SharedState s = make_state(NOW);
+  OledGrid g = build_grid(SCREEN_PEAKS, s, NOW);
+  char pg[8], want[32];
+  TEST_ASSERT_EQUAL_STRING("PEAKS", g.title);
+  TEST_ASSERT_EQUAL_STRING(expect_page(pg, sizeof pg, SCREEN_PEAKS), g.page);
+  snprintf(want, sizeof want, "Spd %s%s", kSpeed5144, kUnit);
+  TEST_ASSERT_EQUAL_STRING(want, g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("P 5980W    RPM 3000", g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("Ibat 123.4 Imot 235", g.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("Tfet 65.2  Tmot 72.1", g.rows[3]);
+  TEST_ASSERT_EQUAL_STRING("", g.rows[4]);
+  TEST_ASSERT_EQUAL_STRING("SINCE BOOT", g.rows[5]);
+  assert_grid_lengths(g);
+
+  // A record, not live data: everything stale (or never seen since) still shows the peaks.
+  SharedState old = never_state();
+  old.peaks = s.peaks;
+  OledGrid g2 = build_grid(SCREEN_PEAKS, old, NOW);
+  TEST_ASSERT_EQUAL_MEMORY(&g, &g2, sizeof g);
+}
+
+static void test_peaks_partial_and_extremes() {
+  SharedState s = make_state(NOW);
+  // STATUS_4 was seen (battery current), the motor temperature never read plausibly: no NTC
+  s.peaks.have = (uint8_t)(s.peaks.have & ~PEAK_TMOT);
+  OledGrid g = build_grid(SCREEN_PEAKS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("Tfet 65.2  Tmot n/a", g.rows[3]);
+  // ... but with no STATUS_4 ever, it is simply unknown
+  s.peaks.have = PEAK_SPEED;
+  g = build_grid(SCREEN_PEAKS, s, NOW);
+  TEST_ASSERT_EQUAL_STRING("P --       RPM --", g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("Ibat --    Imot --", g.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("Tfet --    Tmot --", g.rows[3]);
+
+  // Large values switch to thousands / drop decimals, never past their budgets
+  fill_peaks(s);
+  s.peaks.power_w = 12345.0f;
+  s.peaks.rpm = 12345.0f;
+  s.peaks.i_bat_a = 1234.6f;
+  s.peaks.i_mot_a = 123456.0f;
+  s.peaks.temp_fet_c = 199.9f;
+  s.peaks.speed_mm_s = 60000;
+  g = build_grid(SCREEN_PEAKS, s, NOW);
+  char want[32];
+  snprintf(want, sizeof want, "Spd %s%s", kSpeed60000, kUnit);
+  TEST_ASSERT_EQUAL_STRING(want, g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("P 12.3kW   RPM 12.3k", g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("Ibat 1235  Imot 123k", g.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("Tfet 199.9 Tmot 72.1", g.rows[3]);
+  assert_grid_lengths(g);
+
+  // A speed peak of 0 (fix seen, never moved) is a value, not "--"
+  s.peaks.speed_mm_s = 0;
+  g = build_grid(SCREEN_PEAKS, s, NOW);
+  snprintf(want, sizeof want, "Spd 0.0%s", kUnit);
+  TEST_ASSERT_EQUAL_STRING(want, g.rows[0]);
+}
 
 // ---------------------------------------------------------------- TOTALS
 #if TOTALS_ENABLE
@@ -1714,12 +1745,11 @@ static void test_never_received_state() {
   TEST_ASSERT_EQUAL_STRING("P --       win --", g.rows[3]);
   TEST_ASSERT_EQUAL_STRING("run --     mov --", g.rows[4]);
   TEST_ASSERT_EQUAL_STRING("mean --    src --", g.rows[5]);
-  g = build_grid(SCREEN_VESC_C, z, NOW);
-#if VESC_POLL_MS > 0
-  TEST_ASSERT_EQUAL_STRING("poll 0     ok 0", g.rows[2]);
-#else
-  TEST_ASSERT_EQUAL_STRING("poll off   ok --", g.rows[2]);
-#endif
+  g = build_grid(SCREEN_PEAKS, z, NOW);  // nothing ever seen: every peak unknown
+  TEST_ASSERT_EQUAL_STRING("Spd --", g.rows[0]);
+  TEST_ASSERT_EQUAL_STRING("P --       RPM --", g.rows[1]);
+  TEST_ASSERT_EQUAL_STRING("Ibat --    Imot --", g.rows[2]);
+  TEST_ASSERT_EQUAL_STRING("Tfet --    Tmot --", g.rows[3]);
   g = build_grid(SCREEN_GNSS, z, NOW);
   TEST_ASSERT_EQUAL_STRING("AUTOBAUD   pDOP --", g.rows[0]);
   TEST_ASSERT_EQUAL_STRING("UTC --", g.rows[5]);
@@ -2464,7 +2494,6 @@ int main(int, char **) {
   RUN_TEST(test_vesc_a_fault_and_stale);
   RUN_TEST(test_vesc_a_latched_fault_with_age);
   RUN_TEST(test_vesc_b_rows);
-  RUN_TEST(test_vesc_c_rows);
   RUN_TEST(test_gnss_rows);
   RUN_TEST(test_gnss_coordinates_rounding_and_hemispheres);
   RUN_TEST(test_gnss_without_fix_or_receiver);
@@ -2492,6 +2521,8 @@ int main(int, char **) {
   RUN_TEST(test_pump_alarm_overlay);
 #endif
 #endif
+  RUN_TEST(test_peaks_rows);
+  RUN_TEST(test_peaks_partial_and_extremes);
 #if TOTALS_ENABLE
   RUN_TEST(test_totals_rows);
   RUN_TEST(test_totals_save_row_states);

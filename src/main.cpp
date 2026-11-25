@@ -26,6 +26,7 @@
 #include "ble_scan.h"
 #include "deadman.h"
 #include "ota.h"
+#include "peaks.h"
 #include "pump.h"
 #include "status_led.h"
 #include "totals.h"
@@ -191,8 +192,8 @@ static bool hbOk(uint32_t hb, uint32_t now, uint32_t max_age)
 
 static void loop()
 {
-  static uint32_t nextVescLog = 0, nextGnssLog = 0, nextTripLog = 0, nextTotalsLog = 0, nextDmLog = 0, nextPumpLog = 0,
-                  nextSysLog = 0, nextStaleLog = 0, nextBlink = 0;
+  static uint32_t nextVescLog = 0, nextGnssLog = 0, nextTripLog = 0, nextTotalsLog = 0, nextPeaksLog = 0, nextDmLog = 0,
+                  nextPumpLog = 0, nextSysLog = 0, nextStaleLog = 0, nextBlink = 0;
   static bool led = false;
 
   // Snapshot BEFORE reading the clock: every timestamp inside s must be <= now,
@@ -270,6 +271,11 @@ static void loop()
   {
     nextTotalsLog = now + LOG_TOTALS_MS;
     totals_log_summary(s, now);
+  }
+  if (LOG_PEAKS_MS && (int32_t)(now - nextPeaksLog) >= 0)
+  {
+    nextPeaksLog = now + LOG_PEAKS_MS;
+    peaks_log_summary(s);
   }
   // Transitions every loop (a trip must not wait for the next summary), the summary on its
   // own deadline. All dead-man logging happens here: its own task must never block on the

@@ -180,6 +180,32 @@ struct TotalsState {
   bool failed;            // the last save failed (the next try is TOTALS_RETRY_S later)
 };
 
+// ---------------------------------------------------------------- Peaks since boot
+// Written by the producers inside their own locked writes (include/peaks.h: the CAN / UART
+// link task on every VESC frame, the GNSS task on every epoch); read by the PEAKS screen and
+// the log. RAM only: a reboot starts from nothing. The values are the smoothed ones the
+// dashboard shows (EMA currents / voltage), never a raw spike.
+enum PeakBit : uint8_t {
+  PEAK_POWER = 1u << 0,  // power_w
+  PEAK_IBAT = 1u << 1,   // i_bat_a (also: STATUS_4 has been seen at least once)
+  PEAK_IMOT = 1u << 2,   // i_mot_a
+  PEAK_RPM = 1u << 3,    // rpm
+  PEAK_TFET = 1u << 4,   // temp_fet_c
+  PEAK_TMOT = 1u << 5,   // temp_mot_c
+  PEAK_SPEED = 1u << 6,  // speed_mm_s
+};
+
+struct PeaksState {
+  float power_w;       // max v_in x battery current drawn, W (regen never counts: >= 0)
+  float i_bat_a;       // max battery current drawn, A (>= 0)
+  float i_mot_a;       // max |motor current|, A (reverse counts)
+  float rpm;           // max |mechanical rpm| (reverse counts)
+  float temp_fet_c;    // max plausible MOSFET temperature, C
+  float temp_mot_c;    // max plausible motor temperature, C
+  int32_t speed_mm_s;  // max usable GNSS ground speed, mm/s (>= 0)
+  uint8_t have;        // PeakBit: which fields hold a value (temperatures may be < 0, so 0 is not "none")
+};
+
 // ---------------------------------------------------------------- Display
 struct DisplayStats
 {
@@ -357,6 +383,7 @@ struct SharedState
   CanHealth can;
   GnssState gnss;
   TripState trip;
+  PeaksState peaks;
 #if TOTALS_ENABLE
   TotalsState totals;
 #endif

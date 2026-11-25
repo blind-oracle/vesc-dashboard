@@ -1,6 +1,7 @@
 // Pure, deterministic builders of everything shown on the 128x64 OLED: the main
-// dashboard (OledMain), the detail "grid" screens (OledGrid: efficiency, three
-// VESC pages, the coolant pump, GNSS, SYS), the overlays (dead-man alarm, FW UPDATE, update refused),
+// dashboard (OledMain), the detail "grid" screens (OledGrid: efficiency, two
+// VESC pages, the coolant pump, GNSS, lifetime totals, peaks since boot, SYS), the overlays
+// (dead-man alarm, FW UPDATE, update refused),
 // the screen enum, the layout constants shared by the renderer and the host tests
 // and the UTC -> local clock arithmetic.
 // Fault-code names come from vesc_getvalues.h (the CAN codec's 34-entry
@@ -58,40 +59,42 @@
 #endif
 
 // ---------------------------------------------------------------- screens
-// Cycled by short presses of PIN_BUTTON (wrapping); a long press (and the
-// SCREEN_AUTO_RETURN_MS timer, off by default) goes back to SCREEN_MAIN.
+// Cycled by short presses of PIN_BUTTON, backwards by double clicks (both wrapping);
+// a long press (and the SCREEN_AUTO_RETURN_MS timer, off by default) goes back to
+// SCREEN_MAIN. SYS is always the last page.
 enum OledScreen : uint8_t {
   SCREEN_MAIN = 0,  // speed, clock, fix, CAN line + 8 telemetry cells
   SCREEN_EFF,       // "EFFICIENCY": Wh per NM/km now (EFF_WINDOW_S) and per trip, trip distance / energy / times, mean speed
-  SCREEN_VESC_A,    // "VESC 1/3": fault (live, or the last latched one with its age), live electrical values, temperatures, Ah/Wh
-  SCREEN_VESC_B,    // "VESC 2/3": polled values (MOSFET 1 temp, avg input current, id/iq, vd/vq, tacho abs, status)
-  SCREEN_VESC_C,    // "VESC 3/3": inputs (PPM/ADC/PID) and CAN / poll counters
+  SCREEN_VESC_A,    // "VESC 1/2": fault (live, or the last latched one with its age), live electrical values, temperatures, Ah/Wh
+  SCREEN_VESC_B,    // "VESC 2/2": polled values (MOSFET 1 temp, avg input current, id/iq, vd/vq, tacho abs, status)
 #if PUMP_ENABLE
   SCREEN_PUMP,      // "PUMP": mode / duty / reason, temperatures against their targets, the VESC's limits, PID terms
 #endif
   SCREEN_GNSS,      // fix, position, accuracies, speed/heading, UTC date-time
-  SCREEN_SYS,       // firmware, uptime, heap, CAN/GNSS driver state, button/lock counters
 #if TOTALS_ENABLE
   SCREEN_TOTALS,    // "TOTALS": lifetime motor / powered hours, distance, net energy, this boot's motor time, last save
 #endif
+  SCREEN_PEAKS,     // "PEAKS": max speed, power, rpm, battery / motor current, temperatures since boot
+  SCREEN_SYS,       // firmware, uptime, heap, CAN/GNSS driver state, button/lock counters: ALWAYS the last page
   SCREEN_COUNT
 };
+static_assert(SCREEN_SYS == SCREEN_COUNT - 1, "SYS is the last page");
 
 inline const char *oled_screen_name(uint8_t screen) {
   switch (screen) {
     case SCREEN_MAIN: return "MAIN";
     case SCREEN_EFF: return "EFF";
-    case SCREEN_VESC_A: return "VESC 1/3";
-    case SCREEN_VESC_B: return "VESC 2/3";
-    case SCREEN_VESC_C: return "VESC 3/3";
+    case SCREEN_VESC_A: return "VESC 1/2";
+    case SCREEN_VESC_B: return "VESC 2/2";
 #if PUMP_ENABLE
     case SCREEN_PUMP: return "PUMP";
 #endif
     case SCREEN_GNSS: return "GNSS";
-    case SCREEN_SYS: return "SYS";
 #if TOTALS_ENABLE
     case SCREEN_TOTALS: return "TOTALS";
 #endif
+    case SCREEN_PEAKS: return "PEAKS";
+    case SCREEN_SYS: return "SYS";
     default: return "?";
   }
 }
@@ -205,7 +208,7 @@ struct OledMain {
 };
 
 struct OledGrid {
-  char title[16];    // "EFFICIENCY" / "VESC 1/3" / "SYS 0.1.0"  (<= 15, bold)
+  char title[16];    // "EFFICIENCY" / "VESC 1/2" / "SYS 0.1.0"  (<= 15, bold)
   char page[6];      // "2/7"                                   (<= 5, right-aligned in the bar)
   char rows[6][22];  // <= 21 monospace chars each
   uint8_t nrows;     // rows in use (always 6 here)
@@ -648,7 +651,7 @@ inline void fmt_age_short(char *buf, size_t n, uint32_t ms) {
   else snprintf(buf, n, "%lud", (unsigned long)(s / 86400u));
 }
 
-// Fault row of "VESC 1/3" (<= 21 chars). The VESC clears its live fault byte
+// Fault row of "VESC 1/2" (<= 21 chars). The VESC clears its live fault byte
 // ~500 ms after a fault, so at 1 Hz polling it reads 0 almost always; can_vesc
 // latches the last non-zero code (VescExt::last_fault / last_fault_ms):
 //   "FAULT <name>"       live byte non-zero in a fresh reply       (<= 14 chars)
@@ -780,11 +783,11 @@ inline void oled_build_main(const SharedState &s, uint32_t now, OledMain &out) {
   build_main_cells(s, f, out);
 }
 
-// "VESC 1/3": fault (live or latched, see build_fault_row), live electrical values,
+// "VESC 1/2": fault (live or latched, see build_fault_row), live electrical values,
 // duty, power/rpm, temperatures, Ah/Wh.
 inline void oled_build_vesc_a(const SharedState &s, uint32_t now, OledGrid &g) {
   using namespace oled_detail;
-  grid_begin(g, "VESC 1/3", SCREEN_VESC_A);
+  grid_begin(g, "VESC 1/2", SCREEN_VESC_A);
   const VescFresh f = vesc_freshness(s, now);
   const vesc_telemetry_t &t = s.vesc.t;
   char l[32], r[32], tmp[8];
@@ -816,10 +819,10 @@ inline void oled_build_vesc_a(const SharedState &s, uint32_t now, OledGrid &g) {
   row2(g.rows[5], l, r);
 }
 
-// "VESC 2/3": values only available by polling (COMM_GET_VALUES_SELECTIVE) + tacho + charged Ah/Wh.
+// "VESC 2/2": values only available by polling (COMM_GET_VALUES_SELECTIVE) + tacho + charged Ah/Wh.
 inline void oled_build_vesc_b(const SharedState &s, uint32_t now, OledGrid &g) {
   using namespace oled_detail;
-  grid_begin(g, "VESC 2/3", SCREEN_VESC_B);
+  grid_begin(g, "VESC 2/2", SCREEN_VESC_B);
   const VescFresh f = vesc_freshness(s, now);
   const VescExt &e = s.vesc_ext;
   char l[32], r[32];
@@ -860,54 +863,6 @@ inline void oled_build_vesc_b(const SharedState &s, uint32_t now, OledGrid &g) {
 
   labeled(l, sizeof l, "AhC", f.s2, s.vesc.t.amp_hours_charged, 3, 6);
   labeled(r, sizeof r, "WhC", f.s3, s.vesc.t.watt_hours_charged, 1, 6);
-  row2(g.rows[5], l, r);
-}
-
-// "VESC 3/3": inputs (PPM, ADC, PID position), poll counters ("poll off" when VESC_POLL_MS is 0) and CAN frame counters.
-inline void oled_build_vesc_c(const SharedState &s, uint32_t now, OledGrid &g) {
-  using namespace oled_detail;
-  grid_begin(g, "VESC 3/3", SCREEN_VESC_C);
-  const VescFresh f = vesc_freshness(s, now);
-  const vesc_telemetry_t &t = s.vesc.t;
-  char l[32], r[32], a[8], b[8], c[8];
-
-  labeled(l, sizeof l, "PPM", f.s6, t.ppm, 2, 6);
-  labeled(r, sizeof r, "PID", f.s4, t.pid_pos, 1, 6);
-  row2(g.rows[0], l, r);
-
-  if (f.s6) {
-    fmt_num(a, sizeof a, t.adc1, 2, 5);
-    fmt_num(b, sizeof b, t.adc2, 2, 5);
-    fmt_num(c, sizeof c, t.adc3, 2, 5);
-    snprintf(l, sizeof l, "ADC %s %s %s", a, b, c);
-  } else {
-    snprintf(l, sizeof l, "ADC --");
-  }
-  row1(g.rows[1], l);
-
-  // Poll counters (requests sent / complete replies / CRC-format failures /
-  // reply timeouts). A strictly passive build (VESC_POLL_MS 0) never polls:
-  // say so instead of showing zeros that look like a dead link.
-#if VESC_POLL_MS > 0
-  labeled_count(l, sizeof l, "poll", s.vesc_ext.polls_sent, 5);
-  labeled_count(r, sizeof r, "ok", s.vesc_ext.replies_ok, 5);
-  row2(g.rows[2], l, r);
-
-  labeled_count(l, sizeof l, "bad", s.vesc_ext.replies_bad, 5);
-  labeled_count(r, sizeof r, "tmo", s.vesc_ext.timeouts, 5);
-  row2(g.rows[3], l, r);
-#else
-  row2(g.rows[2], "poll off", "ok --");
-  row2(g.rows[3], "bad --", "tmo --");
-#endif
-
-  labeled_count(l, sizeof l, "frm", s.vesc.frames_total, 5);
-  labeled_count(r, sizeof r, "oth", s.vesc.frames_other_id, 5);
-  row2(g.rows[4], l, r);
-
-  // last row: no descenders (its baseline is the panel's last row): "misc" = non-status / odd-DLC frames
-  labeled_count(l, sizeof l, "misc", s.vesc.frames_dropped, 5);
-  labeled_count(r, sizeof r, "busoff", s.can.bus_off_count, 3);
   row2(g.rows[5], l, r);
 }
 
@@ -998,7 +953,7 @@ inline void oled_build_sys(const SharedState &s, uint32_t now, const OledSysInfo
 
 #if VESC_LINK_UART
   snprintf(l, sizeof l, "UART %s", can_state_name(s.can.state));
-  snprintf(r, sizeof r, "%lu", (unsigned long)VESC_UART_BAUD);  // no error counters: CRC failures are "bad" on VESC 3/3
+  snprintf(r, sizeof r, "%lu", (unsigned long)VESC_UART_BAUD);  // no error counters here: CRC failures are "bad" in the logs
 #else
   snprintf(l, sizeof l, "CAN %s", can_state_name(s.can.state));
   snprintf(r, sizeof r, "T%lu R%lu", (unsigned long)s.can.tec, (unsigned long)s.can.rec);  // TEC / REC error counters
@@ -1189,6 +1144,48 @@ inline void oled_build_totals(const SharedState &s, uint32_t now, OledGrid &g) {
   row1(g.rows[5], l);
 }
 #endif  // TOTALS_ENABLE
+
+// "PEAKS": the largest values since boot (include/peaks.h records them in the producers on
+// every VESC frame / GNSS epoch, from the smoothed values the dashboard shows). Same labels
+// and number formats as VESC 1/2; a peak is a record, so it is shown whatever its age and
+// "--" only means "never seen":
+//   Spd 14.2kn              max usable GNSS ground speed, in the speed unit
+//   P 5980W    RPM 3000     max power drawn (regen never counts); max |mechanical rpm|
+//   Ibat 123.4 Imot 235     max battery current drawn; max |motor current|
+//   Tfet 65.2  Tmot 72.1    max plausible temperatures; "Tmot n/a" = STATUS_4 seen, no motor NTC
+//   (empty)
+//   SINCE BOOT              static (an uptime here would refresh the panel every second)
+inline void oled_build_peaks(const SharedState &s, OledGrid &g) {
+  using namespace oled_detail;
+  grid_begin(g, "PEAKS", SCREEN_PEAKS);
+  const PeaksState &p = s.peaks;
+  char l[32], r[32], tmp[8];
+
+  labeled(l, sizeof l, "Spd", p.have & PEAK_SPEED, (float)p.speed_mm_s * SPEED_FACTOR, 1, 4 + strlen(SPEED_UNIT_STR),
+          SPEED_UNIT_STR);
+  row1(g.rows[0], l);
+
+  if (p.have & PEAK_POWER) fmt_power(tmp, sizeof tmp, p.power_w, 6);
+  else fmt_dashes(tmp, sizeof tmp);
+  snprintf(l, sizeof l, "P %s", tmp);
+  if (p.have & PEAK_RPM) fmt_rpm(tmp, sizeof tmp, p.rpm, 6);
+  else fmt_dashes(tmp, sizeof tmp);
+  snprintf(r, sizeof r, "RPM %s", tmp);
+  row2(g.rows[1], l, r);
+
+  labeled(l, sizeof l, "Ibat", p.have & PEAK_IBAT, p.i_bat_a, 1, 5);
+  labeled(r, sizeof r, "Imot", p.have & PEAK_IMOT, p.i_mot_a, 0, 5);
+  row2(g.rows[2], l, r);
+
+  labeled(l, sizeof l, "Tfet", p.have & PEAK_TFET, p.temp_fet_c, 1, 5);
+  // STATUS_4 (which carries both temperatures) was seen but the motor one never read plausibly: no NTC
+  if (!(p.have & PEAK_TMOT) && (p.have & PEAK_IBAT)) snprintf(r, sizeof r, "Tmot n/a");
+  else labeled(r, sizeof r, "Tmot", p.have & PEAK_TMOT, p.temp_mot_c, 1, 5);
+  row2(g.rows[3], l, r);
+
+  // last row: no descenders (its baseline is the panel's last row)
+  row1(g.rows[5], "SINCE BOOT");
+}
 
 #if PUMP_ENABLE
 // "PUMP" (every row <= 21 chars):
@@ -1570,15 +1567,15 @@ inline void oled_build_frame(const SharedState &s, uint32_t now, uint8_t screen,
     case SCREEN_EFF: oled_build_eff(s, now, out.grid); break;
     case SCREEN_VESC_A: oled_build_vesc_a(s, now, out.grid); break;
     case SCREEN_VESC_B: oled_build_vesc_b(s, now, out.grid); break;
-    case SCREEN_VESC_C: oled_build_vesc_c(s, now, out.grid); break;
 #if PUMP_ENABLE
     case SCREEN_PUMP: oled_build_pump(s, now, out.grid); break;
 #endif
     case SCREEN_GNSS: oled_build_gnss(s, now, out.grid); break;
-    case SCREEN_SYS: oled_build_sys(s, now, info, out.grid); break;
 #if TOTALS_ENABLE
     case SCREEN_TOTALS: oled_build_totals(s, now, out.grid); break;
 #endif
+    case SCREEN_PEAKS: oled_build_peaks(s, out.grid); break;
+    case SCREEN_SYS: oled_build_sys(s, now, info, out.grid); break;
     default: oled_build_main(s, now, out.main); break;
   }
 }

@@ -11,7 +11,7 @@ u-blox GNSS receiver and a small OLED. It:
   absolute tachometer);
 - **reads ground speed and time** from a u-blox GNSS receiver at 5 Hz;
 - **shows everything on a 128x64 monochrome OLED** (SSD1309 controller, I2C) as
-  nine screens cycled by a push button;
+  nine screens paged by a push button (click: next, double click: previous);
 - **keeps a trip log:** integrates speed and energy, with the boat's efficiency
   in Wh per nautical mile (or km);
 - **keeps an hour meter in flash:** motor running hours, powered hours, lifetime
@@ -47,7 +47,7 @@ passive (ACK only).
 - **VESC over UART** (`pio run -e deadman_uart`, section 3b). Without a CAN
   transceiver, this build talks to the VESC over its COMM-header UART instead:
   one `COMM_GET_VALUES` poll every 100 ms replaces both the broadcasts and the
-  CAN poll, and everything except the ADC/PPM row stays available.
+  CAN poll, and everything except the ADC/PPM values (log only) stays available.
 - **Waveshare ESP32-S3-Zero** (`pio run -e s3zero_deadman_uart`, section 2b).
   The same UART build also runs on this board.
 
@@ -186,7 +186,8 @@ it.
   heartbeat itself and reports `NO RADIO`);
 - 1 Hz VESC and GNSS log lines;
 - 5 s TRIP, DM and PUMP lines (`LOG_TRIP_MS`, `LOG_DEADMAN_MS`, `LOG_PUMP_MS`);
-- the 60 s TOTALS line (`LOG_TOTALS_MS`) and a line per totals save;
+- the 60 s TOTALS and PEAKS lines (`LOG_TOTALS_MS`, `LOG_PEAKS_MS`) and a line
+  per totals save;
 - 10 s SYS line with the display, button and poll counters and the BLE scan
   state;
 - LED.
@@ -201,7 +202,8 @@ it.
    GNSS --UART-> UART1 ISR -> 2048 B ring -------------------------> gnssTask
         <------- UBX configuration: 115200 baud, 5 Hz NAV-PVT <----- gnssTask
 
-   canTask, gnssTask --> g_state
+   canTask, gnssTask --> g_state (and, in the same locked write, the peaks
+                         since boot: g_state.peaks, include/peaks.h)
 
  Out of g_state:
 
@@ -277,7 +279,7 @@ where 0 means "never received" and all age arithmetic is wrap-safe.
 - `include/gnss_ubx.h`, `src/gnss_ubx.cpp`: UART1 setup, autobaud, MON-VER
   detection, baud switch, VALSET/legacy configuration.
 
-**Trip and lifetime totals**
+**Trip, lifetime totals and peaks**
 
 - `include/trip.h`, `src/trip.cpp`: header-only trip integrator (distance,
   energy sources, `EFF_WINDOW_S` window, efficiency; framework-free,
@@ -287,6 +289,9 @@ where 0 means "never received" and all age arithmetic is wrap-safe.
   blob layout and when to save (framework-free, unit-tested `totals.h`), and the
   NVS side (load at boot, write from the trip task, the supervisor's log lines);
   no-ops with `TOTALS_ENABLE` 0.
+- `include/peaks.h`, `src/peaks.cpp`: peaks since boot, recorded by canTask /
+  the UART link task / gnssTask inside their own locked writes (framework-free,
+  unit-tested `peaks.h`), and the supervisor's PEAKS log line.
 
 **Display**
 
@@ -297,8 +302,10 @@ where 0 means "never received" and all age arithmetic is wrap-safe.
   the dead-man row and alarm of a `deadman` build, the pump alarm and the FW
   UPDATE / UPDATE REFUSED overlays (character budgets, stale -> `--`, UTC ->
   local clock).
+- `include/button_logic.h`: the button's gesture decoder: debounce, short
+  press, double click, long and very long hold (framework-free, unit-tested).
 - `src/display_oled.cpp`: I2C bring-up and presence probe, u8g2 rendering,
-  button debounce, screen switching, change-detected refresh, idle dimming.
+  screen switching, change-detected refresh, idle dimming.
 - `include/u8g2_hal_idf.h`, `src/u8g2_hal_idf.cpp`: u8g2 HAL for ESP-IDF: I2C
   master byte callback, reset GPIO, delays, address probe.
 - `components/u8g2/`: u8g2 library (git submodule, tag 2.37.1): fonts, frame
@@ -944,7 +951,8 @@ Tool to the VESC, then App Settings > General:
 - **CAN Baud Rate** must match `CAN_BITRATE_KBPS`.
 - **CAN Mode:** the poll replies need VESC mode too: a VESC in UAVCAN or Comm
   Bridge mode ignores requests.
-- **Can Messages Rate 2:** add Status 6 if you want the ADC/PPM values.
+- **Can Messages Rate 2:** add Status 6 if you want the ADC/PPM values in the
+  VESC log line.
 - **VESC ID:** leave `VESC_CAN_ID -1` to lock onto whatever appears first, or
   pin that id. It must differ from `CAN_OWN_ID` (120).
 
@@ -967,15 +975,16 @@ Also note Motor Settings > Additional Info > Motor Poles and put it in
 
 Where each frame is shown:
 
-- **STATUS_1:** `MA`, `RPM` cells; `Imot`, `Duty`, `RPM` on VESC 1/3; CAN line
-  freshness.
-- **STATUS_2:** `Ah` / `AhC` on VESC 1/3 and 2/3.
+- **STATUS_1:** `MA`, `RPM` cells; `Imot`, `Duty`, `RPM` on VESC 1/2; `RPM`,
+  `Imot` on PEAKS; CAN line freshness.
+- **STATUS_2:** `Ah` / `AhC` on VESC 1/2 and 2/2.
 - **STATUS_3:** `WH` cell; `Wh` / `WhC`; trip energy (section "Efficiency and
   trip").
-- **STATUS_4:** `BA`, `PW`, `TF`, `TM` cells; `Ibat`, `Tfet`, `Tmot`, `PID`;
-  trip energy fallback (with STATUS_5).
-- **STATUS_5:** `BV`, `PW` cells; `Vin`, `Tach`; CAN line freshness.
-- **STATUS_6:** `ADC`, `PPM` on VESC 3/3.
+- **STATUS_4:** `BA`, `PW`, `TF`, `TM` cells; `Ibat`, `Tfet`, `Tmot` (VESC 1/2
+  and PEAKS); `pid=` in the VESC log line; trip energy fallback (with STATUS_5).
+- **STATUS_5:** `BV`, `PW` cells; `Vin`, `Tach`; PEAKS power (with STATUS_4);
+  CAN line freshness.
+- **STATUS_6:** no screen; `adc=` / `ppm=` in the VESC log line.
 
 STATUS 1/4/5 older than `VESC_STALE_R1_MS` (2 s) and STATUS 2/3/6 older than
 `VESC_STALE_R2_MS` (5 s) are shown as `--`.
@@ -1002,8 +1011,8 @@ single-shot frame `CAN_PACKET_PROCESS_SHORT_BUFFER` to the VESC id (EID
 
 **The reply.** The VESC answers with six `FILL_RX_BUFFER` frames and one
 `PROCESS_RX_BUFFER` (42 bytes, CRC-16/XMODEM), addressed to `CAN_OWN_ID`. The
-reply is checked, decoded into `g_state.vesc_ext` and shown on VESC 1/3 (fault)
-and VESC 2/3 (everything else), stale after `VESC_EXT_STALE_MS` (3 s).
+reply is checked, decoded into `g_state.vesc_ext` and shown on VESC 1/2 (fault)
+and VESC 2/2 (everything else), stale after `VESC_EXT_STALE_MS` (3 s).
 
 Eight frames per second is about 0.2 % of a 500 kbit/s bus.
 
@@ -1031,7 +1040,7 @@ Details:
 - **Fault latch:** the VESC clears its live fault byte about 500 ms after a
   fault (its "fault stop time"), so a 1 Hz poll usually sees a `0`.
   - canTask therefore latches the last non-zero code and its time in
-    `VescExt::last_fault` / `last_fault_ms`; VESC 1/3 shows `FAULT <name>` while
+    `VescExt::last_fault` / `last_fault_ms`; VESC 1/2 shows `FAULT <name>` while
     the live byte is set and `LAST <name> <age>` afterwards (section 6).
   - Names (34 codes, `vesc_getvalues.h`): `NONE OVER_V UNDER_V DRV ABS_OC OT_FET
     OT_MOT GATE_OV GATE_UV MCU_UV WDT_RST ENC_SPI ENC_LOW ENC_HIGH FLASH I_OFFS1
@@ -1102,7 +1111,7 @@ Every `VESC_POLL_MS` (100 ms) the board sends the 6-byte request
 
 That frame holds every field of STATUS_1..5 and every value the CAN build polls:
 fault, MOSFET temperatures, id/iq, vd/vq, absolute tachometer, controller id,
-and the timeout / kill-switch status byte. The main screen, VESC 1/3 and 2/3,
+and the timeout / kill-switch status byte. The main screen, VESC 1/2 and 2/2,
 the trip log and the dead-man's switch, including its `KILLSW` closed loop,
 therefore work unchanged.
 
@@ -1154,9 +1163,9 @@ Then "Write App Configuration".
 
 ### What differs from the CAN build
 
-- **PPM / ADC1..3 (VESC 3/3)**
+- **PPM / ADC1..3 (`adc=` / `ppm=` in the VESC log line)**
   - CAN build: STATUS_6.
-  - UART build: always `--`. GET_VALUES does not carry the raw pin voltages, and
+  - UART build: always 0. GET_VALUES does not carry the raw pin voltages, and
     `COMM_GET_DECODED_ADC/PPM` only report the apps' processed values (ADC only
     in ADC modes, no ADC3).
 - **Motor / battery current (`MA`, `BA`, `PW`)**
@@ -1173,16 +1182,17 @@ Then "Write App Configuration".
 - **SYS row 3**
   - CAN build: `CAN RUN T0 R0` (TEC / REC).
   - UART build: `UART RUN 115200`.
-- **VESC 3/3 counters**
-  - CAN build: `frm` status frames, `misc` odd frames, `busoff`.
-  - UART build: `frm` replies, `misc` bytes outside any frame, `busoff` always
-    0; `bad` = frames with a CRC or stop-byte mismatch.
+- **Link counters (VESC log line; poll counters in the SYS log line)**
+  - CAN build: `frames=` status frames, `misc=` odd frames, `busoff=`.
+  - UART build: `frames=` replies, `junk=` bytes outside any frame; `bad=` (SYS
+    line) = frames with a CRC or stop-byte mismatch.
 - **VESC id**
   - CAN build: locked from the first STATUS frame (`VESC_CAN_ID`).
   - UART build: the controller id field of each reply.
 - **Silent VESC**
   - CAN build: back-off to 5 s; a STATUS frame resumes polling at once.
-  - UART build: `tmo` counts up, back-off to `VESC_POLL_BACKOFF_MS` (1 s).
+  - UART build: `to=` (SYS log line) counts up, back-off to
+    `VESC_POLL_BACKOFF_MS` (1 s).
 - **Log**
   - CAN build: tag `can`, `VESC id=...` line ending in `can=RUN tec=...`.
   - UART build: tag `vesc`, the same line ending in
@@ -1609,7 +1619,7 @@ sampled every 10 ms, so with the ESP32 high-Z and the switch closed,
 | 100 k               | 3.15 V       | ok                              |
 
 Rule of thumb: **Rs <= Rpd/2**. Measure ADC2 with the switch closed before and
-after fitting Rs, and confirm the `KILLSW` indicator on the VESC 2/3 page
+after fitting Rs, and confirm the `KILLSW` indicator on the VESC 2/2 page
 follows both the mechanical switch and `PIN_DEADMAN_CUT`.
 
 `PIN_DEADMAN_CUT` defaults to GPIO1 (GPIO1, 8 and 18 are the free header pins);
@@ -1663,7 +1673,7 @@ What follows from this wiring:
   actually goes low. The NC wiring fails toward a kill instead. If your lanyard
   switch also has an NC contact (many are SPDT), use that one with the wiring
   above. Otherwise pull the lanyard at the dock before every outing and check
-  that `KILLSW` appears on VESC 2/3.
+  that `KILLSW` appears on VESC 2/2.
 
 **Unpowered dashboard.** The FireBeetle runs from its own USB-C or battery, not
 from the VESC. When it is wired in but unpowered, the line's run level (2.2..3.3
@@ -1826,7 +1836,7 @@ Do this in order; the first step costs nothing and catches most of the mistakes.
    not by guessing. After connecting it, measure ADC2 with a meter: at least 2.5
    V while running with the dashboard high-Z, about 0 V with the lanyard pulled.
 2. Connect the line. On the bench, prop out of the water: walk the tag away,
-   confirm the motor stops, `St KILLSW` appears on VESC 2/3 within two poll
+   confirm the motor stops, `St KILLSW` appears on VESC 2/2 within two poll
    periods and the alarm says `VESC: KILLSW ok`. Time "tag gone" to "motor
    stopped" with a clamp meter.
 3. **Negative test**: disable the kill switch in VESC Tool and repeat. The
@@ -1850,7 +1860,7 @@ Do this in order; the first step costs nothing and catches most of the mistakes.
    second person at the helm, mechanical lanyard still worn.
 
 With a normally-open mechanical switch, add one check before **every** outing:
-pull the lanyard at the dock and confirm that `KILLSW` appears on VESC 2/3. A
+pull the lanyard at the dock and confirm that `KILLSW` appears on VESC 2/2. A
 broken wire to that switch is otherwise invisible.
 
 Update mode (section 7) runs no dead-man and holds the cut instead. Check that
@@ -1886,17 +1896,17 @@ in `src/u8g2_hal_idf.cpp`):
 Only the three referenced fonts are linked (~4.7 KB of flash); the rest of the
 U8g2 font file costs nothing. A row of small text is 21 characters wide.
 
-Nine screens, cycled by the button (section "Button" below); the detail screens
-carry their page number `n/9` in the title bar. A build without the pump
+Nine screens, paged by the button (section "Button" below); the detail screens
+carry their page number `n/9` in the title bar, and SYS is always the last one. A build without the pump
 (`PIN_PUMP_PWM -1`) has no PUMP page, and one with `TOTALS_ENABLE 0` no TOTALS
 page: one screen less each.
 
 All value fields are fixed-width cells; `--` means stale or never received.
 
 ```
- MAIN (screen 1)           EFFICIENCY (2/9)          VESC 1/3 (3/9)
+ MAIN (screen 1)           EFFICIENCY (2/9)          VESC 1/2 (3/9)
  +---------------------+   +---------------------+   +---------------------+
- |   6.2   12:34 3D 9sv|   |[EFFICIENCY      2/9]|   |[VESC 1/3        3/9]|
+ |   6.2   12:34 3D 9sv|   |[EFFICIENCY      2/9]|   |[VESC 1/2        3/9]|
  | (24 px) VESC 74     |   |now 101 Wh/NM        |   |LAST OT_FET 34s      |
  |         kn          |   |avg 98.5 Wh/NM       |   |Vin 48.2   Ibat 12.4 |
  |---------------------|   |dist 6.10  601Wh     |   |Imot 35    Duty 45%  |
@@ -1906,26 +1916,26 @@ All value fields are fixed-width cells; `--` means stale or never received.
  |RPM   2350 WH   605.7|   +---------------------+   +---------------------+
  +---------------------+
 
- VESC 2/3 (4/9)            VESC 3/3 (5/9)            PUMP (6/9)
+ VESC 2/2 (4/9)            PUMP (5/9)                GNSS (6/9)
  +---------------------+   +---------------------+   +---------------------+
- |[VESC 2/3        4/9]|   |[VESC 3/3        5/9]|   |[PUMP            6/9]|
- |Tmos 45.1  Iin 12.4  |   |PPM 0.52   PID 12.3  |   |RUN 20% turning      |
- |Id 0.3     Iq 34.9   |   |ADC 1.23 2.10 0.00   |   |Tmot 32.1  tgt 66.0  |
- |Vd 1.23    Vq 23.45  |   |poll 123   ok 120    |   |Tfet 45.3  tgt 66.0  |
- |Tach 12345 Abs 23456 |   |bad 0      tmo 3     |   |Lim M85/100 F85/100  |
- |St OK      id 74     |   |frm 12345  oth 0     |   |dec 0.15   3450rpm   |
- |AhC 0.098  WhC 4.7   |   |misc 3     busoff 0  |   |err -20.7  int 0.0   |
+ |[VESC 2/2        4/9]|   |[PUMP            5/9]|   |[GNSS            6/9]|
+ |Tmos 45.1  Iin 12.4  |   |RUN 20% turning      |   |3D 9sv     pDOP 1.5  |
+ |Id 0.3     Iq 34.9   |   |Tmot 32.1  tgt 66.0  |   |59.43701N 24.75368E  |
+ |Vd 1.23    Vq 23.45  |   |Tfet 45.3  tgt 66.0  |   |Alt 12.3m  hAcc 2.1m |
+ |Tach 12345 Abs 23456 |   |Lim M85/100 F85/100  |   |Spd 6.2    sAcc 0.30 |
+ |St OK      id 74     |   |dec 0.15   3450rpm   |   |Hdg 123.4  vAcc 3.0m |
+ |AhC 0.098  WhC 4.7   |   |err -20.7  int 0.0   |   |2026-09-06 12:34:56Z |
  +---------------------+   +---------------------+   +---------------------+
 
- GNSS (7/9)                SYS (8/9)                 TOTALS (9/9)
+ TOTALS (7/9)              PEAKS (8/9)               SYS (9/9)
  +---------------------+   +---------------------+   +---------------------+
- |[GNSS            7/9]|   |[SYS 0.1.0       8/9]|   |[TOTALS          9/9]|
- |3D 9sv     pDOP 1.5  |   |up 1h23m   btn 12    |   |motor      1234.5 h  |
- |59.43701N 24.75368E  |   |heap 250k  min 240k  |   |powered    1502.3 h  |
- |Alt 12.3m  hAcc 2.1m |   |CAN RUN    T0 R0     |   |dist       4321.0 NM |
- |Spd 6.2    sAcc 0.30 |   |GNSS RUN 115200 34.10|   |energy     812.40kWh |
- |Hdg 123.4  vAcc 3.0m |   |ubx 1234/0 rd 0      |   |this boot  mot 1h02m |
- |2026-09-06 12:34:56Z |   |rst POWERON lock 0   |   |SAVED 0M12S AGO      |
+ |[TOTALS          7/9]|   |[PEAKS           8/9]|   |[SYS 0.1.0       9/9]|
+ |motor      1234.5 h  |   |Spd 14.2kn           |   |up 1h23m   btn 12    |
+ |powered    1502.3 h  |   |P 5980W    RPM 3000  |   |heap 250k  min 240k  |
+ |dist       4321.0 NM |   |Ibat 123.4 Imot 235  |   |CAN RUN    T0 R0     |
+ |energy     812.40kWh |   |Tfet 65.2  Tmot 72.1 |   |GNSS RUN 115200 34.10|
+ |this boot  mot 1h02m |   |                     |   |ubx 1234/0 rd 0      |
+ |SAVED 0M12S AGO      |   |SINCE BOOT           |   |rst POWERON lock 0   |
  +---------------------+   +---------------------+   +---------------------+
 ```
 
@@ -2005,7 +2015,7 @@ From `g_state.trip`, section "Efficiency and trip".
 - the whole screen `--` when the integrator has not stamped `trip.t_ms` for
   `TRIP_STALE_MS` (5 s) or never ran.
 
-#### VESC 1/3
+#### VESC 1/2
 
 Row 1 is the fault row:
 
@@ -2023,7 +2033,7 @@ Then:
 - FET and motor temperature with one decimal (raw, no plausibility filter);
 - Ah / Wh drawn.
 
-#### VESC 2/3
+#### VESC 2/2
 
 Polled values, `VESC_EXT_STALE_MS` window:
 
@@ -2036,16 +2046,6 @@ Polled values, `VESC_EXT_STALE_MS` window:
 - status `St OK` / `TIMEOUT` (no control input, timeout brake active) / `KILLSW`
   / `TO+KILL` and the controller id from the reply;
 - charged Ah / Wh.
-
-#### VESC 3/3
-
-- PPM input / PID position;
-- `ADC` 1/2/3 volts (`ADC --` when STATUS_6 is stale);
-- poll counters `poll` (requests sent) / `ok` (complete replies) / `bad` (CRC or
-  format failures) / `tmo` (reply timeouts) - `poll off   ok --` and
-  `bad --     tmo --` in a `VESC_POLL_MS 0` build;
-- `frm` accepted status frames / `oth` frames from another controller id;
-- `misc` non-status or odd-DLC frames / `busoff` events.
 
 #### PUMP
 
@@ -2102,16 +2102,6 @@ Only the dead-man's alarm and the update-mode screens rank above it.
 - heading of motion (only while moving) / vertical accuracy;
 - UTC date-time (`UTC --` when unknown).
 
-#### SYS `FW_VERSION`
-
-- uptime (`12m34s`, `1h23m`, `12d03h`) / debounced button presses;
-- free heap / minimum free heap in kB;
-- TWAI state (`UNINST` / `STOP` / `RUN` / `BUSOFF` / `RECOV`) with the TEC and
-  REC error counters;
-- GNSS phase, baud and PROTVER;
-- good/bad UBX frames and redetects;
-- reset reason / `state_lock()` timeouts.
-
 #### TOTALS
 
 `TOTALS_ENABLE`, section 4 "Lifetime totals".
@@ -2125,6 +2115,40 @@ Only the dead-man's alarm and the update-mode screens rank above it.
   `SAVE FAILED, RETRYING`, or `NVS ERROR: RAM ONLY`.
 
 Everything is `--` while the trip task is not publishing.
+
+#### PEAKS
+
+The largest values since power-on (since boot: RAM only, a reboot starts over).
+They are recorded by the producers themselves (`include/peaks.h`), inside the
+locked write of every VESC status frame / UART reply and every GNSS epoch, so a
+peak shorter than any display or log period is still caught. The values are the
+smoothed ones the dashboard shows (the `CAN_EMA_ALPHA` / `VESC_UART_EMA_ALPHA`
+EMA currents and voltage), never a raw switching spike, and only while they pass
+the same freshness and plausibility tests as the MAIN cells.
+
+- `Spd`: ground speed in the speed unit, only from a usable fix (fresh, `fix_ok`,
+  speed accuracy within `GNSS_MAX_SACC_MM_S`).
+- `P`: power drawn = voltage x battery current (both fresh); regen never counts.
+- `RPM`: mechanical rpm, by magnitude (reverse counts as much as ahead).
+- `Ibat`: battery current drawn; regen never counts.
+- `Imot`: motor current, by magnitude.
+- `Tfet` / `Tmot`: temperatures within -40..200 C; `Tmot n/a` when STATUS_4
+  was seen but no motor NTC ever read plausibly.
+
+A peak is a record, not live data: it stays on the page whatever its age, and
+`--` means "never seen since boot". The fifth row is left blank; the last one
+reads `SINCE BOOT`. The same values are logged every `LOG_PEAKS_MS` (60 s) as
+`PEAKS P=5980W Ibat=123.4A Imot=235.0A rpm=3000 Tfet=65.2C Tmot=72.1C spd=14.2kn`.
+
+#### SYS `FW_VERSION`
+
+- uptime (`12m34s`, `1h23m`, `12d03h`) / debounced button presses;
+- free heap / minimum free heap in kB;
+- TWAI state (`UNINST` / `STOP` / `RUN` / `BUSOFF` / `RECOV`) with the TEC and
+  REC error counters;
+- GNSS phase, baud and PROTVER;
+- good/bad UBX frames and redetects;
+- reset reason / `state_lock()` timeouts.
 
 #### Dead-man overlay
 
@@ -2200,21 +2224,30 @@ accepts a level once it has been stable for `BUTTON_DEBOUNCE_MS` (30 ms).
 
 - **Short press:** releasing before `BUTTON_LONG_PRESS_MS` (1500 ms) is a short
   press: next screen, wrapping from SYS back to MAIN.
+- **Double click:** a second short press that starts within
+  `BUTTON_DOUBLE_CLICK_MS` (350 ms) of the first one's release: previous screen,
+  wrapping from MAIN to SYS. To tell the two apart, a single short press only
+  acts once that window has passed with no second press, so paging forward
+  takes ~350 ms after the release. `-DBUTTON_DOUBLE_CLICK_MS=0` turns the double
+  click off and makes the short press act at once again.
 - **Long press:** holding for `BUTTON_LONG_PRESS_MS` is a long press: back to
   MAIN, fired once while the button is still held (the release then does
-  nothing).
+  nothing). A click followed by a held second press is a long press too.
 
 The selected screen then stays up indefinitely: `SCREEN_AUTO_RETURN_MS` is 0
 (off) by default, and setting it to a number of milliseconds brings back the
 automatic return to MAIN that long after the last button event.
 
-Every press counts (`btn` on the SYS screen, `btn=` in the SYS log line),
-restores the contrast if the panel was dimmed and restarts the idle timer.
+Every press counts (`btn` on the SYS screen, `btn=` in the SYS log line; a
+double click is two), and every gesture restores the contrast if the panel was
+dimmed and restarts the idle timer. On the pump alarm a short press or a double
+click only dismisses the alarm.
 
 A screen change is drawn immediately, not at the next tick, and logged as
-`display: screen 1 (EFF), short press` (screen indices 0..7 = MAIN, EFF, VESC
-1/3, VESC 2/3, VESC 3/3, PUMP, GNSS, SYS, or 0..6 without the pump; reasons:
-`short press`, `long press`, `auto-return`).
+`display: screen 1 (EFF), short press` (screen indices 0..8 = MAIN, EFF, VESC
+1/2, VESC 2/2, PUMP, GNSS, TOTALS, PEAKS, SYS, one fewer each without the pump
+or the totals; reasons: `short press`, `double click`, `long press`,
+`auto-return`).
 
 The button works even while no panel answers.
 
@@ -2810,8 +2843,8 @@ Each entry is a symptom, followed by what to check.
   - Bitrate mismatch (`CAN_BITRATE_KBPS` vs VESC Tool).
   - RXD level shifting missing or the divider output too low.
   - TXD not wired (no ACK, the VESC then stalls, see section 3).
-- **Status frames fine, but VESC 2/3 shows `--`, VESC 1/3 `FAULT --`, `tmo`
-  climbs and every 10 s `VESC poll: N request(s) without a complete reply within
+- **Status frames fine, but VESC 2/2 shows `--`, VESC 1/2 `FAULT --`, `to=` in
+  the SYS log line climbs and every 10 s `VESC poll: N request(s) without a complete reply within
   500 ms (VESC off, wrong id, CAN mode not VESC, or firmware without
   COMM_GET_VALUES_SELECTIVE); polling every 5000 ms`**
   - VESC Tool > App Settings > General > CAN Mode must be VESC (not UAVCAN /
@@ -2824,14 +2857,14 @@ Each entry is a symptom, followed by what to check.
     on the bus (VESC off? ack errors=N TEC=N)` and `CAN: error passive` are
     expected and stop as soon as it is back.
 - **`VESC poll: N bad reply/replies, last: length or CRC mismatch (len N,
-  expected 42 for mask 0x003EC03C)` now and then, `bad` on VESC 3/3**
+  expected 42 for mask 0x003EC03C)` now and then, `bad=` in the SYS log line**
   - Bus errors during a reply, or another CAN master (VESC Tool over CAN, a
     second display) whose traffic interleaves with ours; the next poll recovers.
   - Constant: a `VESC_GETVALUES_MASK` override the decoder does not know
     (`unknown layout`).
 - **`VESC poll: firmware answers 10 of 11 requested fields (41 of 42 B, ...)`
   once**
-  - VESC firmware < 5.03 has no status byte; harmless, `St` on VESC 2/3 stays
+  - VESC firmware < 5.03 has no status byte; harmless, `St` on VESC 2/2 stays
     `OK`.
 - **Repeated `CAN: BUS_OFF`, `CAN: error passive` or `CAN: N bus error(s)` with
   the VESC on**
@@ -2923,7 +2956,7 @@ Each entry is a symptom, followed by what to check.
   - Full speed with the page saying `OFF` or `RUN 20%`: the stage is wired
     non-inverting (set `PUMP_PWM_INVERT 0`) or the MOSFET/pull-up is missing.
 - **Pump never runs, PUMP page `OFF 0% no data`**
-  - No VESC temperatures since power-up: the VESC link is down (VESC 1/3
+  - No VESC temperatures since power-up: the VESC link is down (VESC 1/2
     `Tfet --`).
   - `OFF 0% cool` with the motor turning: the rpm is stale or below
     `PUMP_TURNING_RPM`.
@@ -3054,6 +3087,8 @@ Compile-time checks stop you:
 - from a `GNSS_RATE_MS` outside 50..10000 ms;
 - from an `EFF_WINDOW_S` outside 2..120 s;
 - from a `TASK_PRIO_BLE` at or above `TASK_PRIO_GNSS`;
+- from a `BUTTON_DOUBLE_CLICK_MS` other than 0 that is not between
+  `BUTTON_DEBOUNCE_MS` and `BUTTON_LONG_PRESS_MS`;
 - from a BLE scan window longer than its interval;
 - from `DEADMAN_ENABLE 1` without the NimBLE host in the sdkconfig
   (`sdkconfig.defaults.ble`);
@@ -3103,8 +3138,9 @@ Compile-time checks stop you:
 **Screens, button, clock**
 
 - `PIN_BUTTON` (-1 = none, 9 = BOOT button), `BUTTON_ACTIVE_LOW`,
-  `BUTTON_DEBOUNCE_MS`, `BUTTON_LONG_PRESS_MS`, `SCREEN_AUTO_RETURN_MS` (0 =
-  stay, the default), `TIME_UTC_OFFSET_MIN`.
+  `BUTTON_DEBOUNCE_MS`, `BUTTON_DOUBLE_CLICK_MS` (0 = no double click, instant
+  short press), `BUTTON_LONG_PRESS_MS`, `SCREEN_AUTO_RETURN_MS` (0 = stay, the
+  default), `TIME_UTC_OFFSET_MIN`.
 
 **CAN / VESC**
 
@@ -3179,8 +3215,8 @@ Compile-time checks stop you:
 
 - `TASK_PRIO_CAN`, `TASK_PRIO_GNSS`, `TASK_PRIO_DISP`, `WDT_TIMEOUT_MS`,
   `HB_MAX_CAN_MS`, `HB_MAX_GNSS_MS`, `HB_MAX_DISP_MS`, `LOG_VESC_MS`,
-  `LOG_GNSS_MS`, `LOG_TRIP_MS`, `LOG_SYS_MS`, `SERIAL_BOOT_DELAY_MS`, `PIN_LED`,
-  `FW_VERSION`.
+  `LOG_GNSS_MS`, `LOG_TRIP_MS`, `LOG_PEAKS_MS`, `LOG_SYS_MS`,
+  `SERIAL_BOOT_DELAY_MS`, `PIN_LED`, `FW_VERSION`.
 
 **Advanced** (defaults are fine)
 
@@ -3293,7 +3329,7 @@ Compile-time checks stop you:
   sign, not in magnitude.
   - The cells are EMA-smoothed (`CAN_EMA_ALPHA`) and may be up to
     `VESC_STALE_R1_MS` old.
-  - A fault shows on the VESC 1/3 page only after the next poll (up to
+  - A fault shows on the VESC 1/2 page only after the next poll (up to
     `VESC_POLL_MS` later) and only as long as the VESC keeps it or via the
     latch.
 - **Not a protection device.** With `DEADMAN_ENABLE` 0 (the default) this is a

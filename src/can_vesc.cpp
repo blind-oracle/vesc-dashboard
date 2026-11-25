@@ -55,6 +55,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "peaks.h"
 #include "pump.h"
 #include "shared_state.h"
 #include "vesc_getvalues.h"
@@ -857,6 +858,7 @@ static void handle_frame(const CanFrame &m, uint32_t now) {
   }
   v.frames_total++;
   v.last_frame_ms = now ? now : 1u;
+  peaks_vesc(g_state.peaks, v, now);  // every frame: a few compares, no sampling loss
   state_unlock();
 }
 
@@ -982,11 +984,11 @@ bool can_vesc_start() {
 // Log summary (called from the supervisor on a snapshot)
 // ---------------------------------------------------------------------------
 void can_vesc_log_summary(const SharedState &s, uint32_t now) {
-  char link[160];  // ~110 bytes with every counter saturated
-  snprintf(link, sizeof link, "can=%s tec=%lu rec=%lu buserr=%lu missed=%lu arb=%lu busoff=%lu recov=%lu",
+  char link[160];  // ~130 bytes with every counter saturated
+  snprintf(link, sizeof link, "can=%s tec=%lu rec=%lu buserr=%lu missed=%lu arb=%lu busoff=%lu recov=%lu misc=%lu",
            can_state_str(s.can.state), (unsigned long)s.can.tec, (unsigned long)s.can.rec,
            (unsigned long)s.can.bus_error_count, (unsigned long)s.can.rx_missed, (unsigned long)s.can.arb_lost,
-           (unsigned long)s.can.bus_off_count, (unsigned long)s.can.recoveries);
+           (unsigned long)s.can.bus_off_count, (unsigned long)s.can.recoveries, (unsigned long)s.vesc.frames_dropped);
   char line[1024];  // the main task has an 8 KB stack
   vesc_log_line(line, sizeof line, s, now, link);
   ESP_LOGI(TAG, "%s", line);

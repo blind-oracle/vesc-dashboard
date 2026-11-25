@@ -46,6 +46,7 @@
 #include <stdio.h>
 
 #include "config.h"
+#include "peaks.h"
 #include "pump.h"
 #include "shared_state.h"
 #include "vesc_getvalues.h"
@@ -254,6 +255,7 @@ static void handle_packet(const uint8_t *payload, uint16_t len, uint32_t now) {
   if (!state_lock()) return;
   g_state.vesc = v;
   g_state.vesc_ext = x;
+  peaks_vesc(g_state.peaks, v, now);
   s_prev_fault = x.fault_code;
   state_unlock();
 
@@ -276,7 +278,7 @@ static void handle_packet(const uint8_t *payload, uint16_t len, uint32_t now) {
 }
 
 // Publishes what the reassembler threw away since the last pass: stray bytes into
-// g_state.vesc.frames_dropped (the "misc" counter on VESC 3/3), damaged frames as bad replies.
+// g_state.vesc.frames_dropped ("junk" in the VESC log line), damaged frames as bad replies.
 static void publish_rx_errors(uint32_t now) {
   const uint32_t junk = s_rx.junk - s_seen_junk;
   const uint32_t bad = s_rx.bad - s_seen_bad;

@@ -37,6 +37,7 @@
 #include <string.h>
 
 #include "config.h"
+#include "peaks.h"
 #include "shared_state.h"
 #include "ubx_min.h"
 
@@ -268,6 +269,7 @@ void handle_frame() {
     g.sacc_mm_s = vel_sacc;
     g.fix_ok = vel_sacc < (uint32_t)GNSS_MAX_SACC_MM_S;
   }
+  if (have_pvt || have_vel) peaks_gnss(g_state.peaks, g, now);
   state_unlock();
 }
 

@@ -1,12 +1,15 @@
 // 128x64 SSD1309 OLED dashboard task (native u8g2 over ESP-IDF driver/i2c_master.h,
 // HAL in src/u8g2_hal_idf.cpp).
 //
-// Screens (include/display_strings_oled.h, OledScreen): MAIN, EFFICIENCY, VESC 1/3,
-// VESC 2/3, VESC 3/3, GNSS, SYS. A short press of PIN_BUTTON shows the next screen
-// (wrapping), a long press (>= BUTTON_LONG_PRESS_MS) returns to MAIN, and so does
-// SCREEN_AUTO_RETURN_MS without a press when that timer is enabled (it is 0 = off by
-// default). Holding on to OTA_LONG_PRESS_MS asks for update mode (src/ota.cpp); in update
-// mode a long press leaves it. PIN_BUTTON -1 compiles no button code at all.
+// Screens (include/display_strings_oled.h, OledScreen): MAIN, EFFICIENCY, VESC 1/2,
+// VESC 2/2, PUMP, GNSS, TOTALS, PEAKS, SYS (always last). A short press of PIN_BUTTON shows
+// the next screen, a double click (second press within BUTTON_DOUBLE_CLICK_MS) the previous
+// one (both wrapping; with the window on, a single press acts once it has passed), a long
+// press (>= BUTTON_LONG_PRESS_MS) returns to MAIN, and so does SCREEN_AUTO_RETURN_MS without
+// a press when that timer is enabled (it is 0 = off by default). Holding on to
+// OTA_LONG_PRESS_MS asks for update mode (src/ota.cpp); in update mode a long press leaves
+// it. The gestures are decoded by include/button_logic.h. PIN_BUTTON -1 compiles no button
+// code at all.
 //
 // Loop / refresh policy:
 //   * The task loop runs every OLED_BUTTON_POLL_MS (20 ms): it samples the
@@ -43,7 +46,7 @@
 //                  value right-aligned by advance to cell x + 62:  "BV 48.2v | BA 12.4A", "MA 35A | PW 598W",
 //                  "TF 45° | TM 32°", "RPM 2350 | WH 56.7"
 //   GRID (EFFICIENCY .. SYS)
-//     rows  0..9   inverted title bar: u8g2_font_6x13B_tf black on white, title at x 1, page "n/7"
+//     rows  0..9   inverted title bar: u8g2_font_6x13B_tf black on white, title at x 1, page "n/9"
 //                  right-aligned to x 127, baseline 9 (rows 0..8)
 //     rows 11..62  6 rows of 21 chars, 6x10 at x 1, baselines 18/27/36/45/54/63 (9 px pitch)
 //
@@ -61,6 +64,7 @@
 #include <math.h>
 #include <string.h>
 
+#include "button_logic.h"
 #include "deadman.h"
 #include "display_strings_oled.h"
 #include "ota.h"
@@ -237,52 +241,7 @@ static void draw_frame(const OledFrame &f) {
 
 // ---------------------------------------------------------------- button
 #if PIN_BUTTON >= 0
-enum class ButtonEvent : uint8_t { None, Short, Long, VeryLong };
-
-// Polled push button: the raw level must be stable for BUTTON_DEBOUNCE_MS before
-// it is accepted (time based, so the poll jitter of a frame push is harmless),
-// then the debounced level is edge-detected. Long fires ONCE while the button
-// is still held (at BUTTON_LONG_PRESS_MS) and the release after it produces no
-// Short; VeryLong fires once more if the same hold reaches OTA_LONG_PRESS_MS.
-// All stamps are state_now_ms(); the differences are unsigned (wrap-safe).
-struct Button {
-  bool raw_last = false;     // last raw sample (true = pressed)
-  uint32_t raw_since = 0;    // time of the last raw change
-  bool pressed = false;      // debounced level
-  uint32_t pressed_at = 0;   // debounced press time
-  bool long_fired = false;
-  bool very_long_fired = false;
-  uint32_t presses = 0;      // debounced presses (-> DisplayStats.button_presses)
-
-  ButtonEvent update(bool raw_pressed, uint32_t now) {
-    ButtonEvent ev = ButtonEvent::None;
-    if (raw_pressed != raw_last) {
-      raw_last = raw_pressed;
-      raw_since = now;
-    } else if (raw_pressed != pressed && (uint32_t)(now - raw_since) >= (uint32_t)BUTTON_DEBOUNCE_MS) {
-      pressed = raw_pressed;  // debounced edge
-      if (pressed) {
-        pressed_at = now;
-        long_fired = false;
-        very_long_fired = false;
-        ++presses;
-      } else if (!long_fired) {
-        ev = ButtonEvent::Short;  // release after a short press
-      }
-    }
-    if (pressed && !long_fired && (uint32_t)(now - pressed_at) >= (uint32_t)BUTTON_LONG_PRESS_MS) {
-      long_fired = true;
-      ev = ButtonEvent::Long;  // fires while still held
-    }
-#if OTA_ENABLE
-    else if (pressed && long_fired && !very_long_fired && (uint32_t)(now - pressed_at) >= (uint32_t)OTA_LONG_PRESS_MS) {
-      very_long_fired = true;
-      ev = ButtonEvent::VeryLong;  // the same hold, still held (OTA_LONG_PRESS_MS > BUTTON_LONG_PRESS_MS)
-    }
-#endif
-    return ev;
-  }
-};
+// The gesture decoder (debounce, Short / Double / Long / VeryLong) is pure: include/button_logic.h.
 
 // gpio_config() must have run (display_start).
 static bool button_raw_pressed() { return (gpio_get_level((gpio_num_t)PIN_BUTTON) == 0) == (BUTTON_ACTIVE_LOW != 0); }
@@ -296,7 +255,7 @@ static bool button_raw_pressed() { return (gpio_get_level((gpio_num_t)PIN_BUTTON
 // cycle that exercises the idle path (set -DOLED_IDLE_DIM_MS=20000 to see the
 // dimming). Everything, including the clock and the counters, derives from the
 // frozen time so the hold window really holds. A live fault code (OT_FET) shows
-// for 10 s per cycle (seconds 40..49); afterwards the VESC 1/3 page shows it as
+// for 10 s per cycle (seconds 40..49); afterwards the VESC 1/2 page shows it as
 // the latched "LAST OT_FET <age>" row, whose age is derived from the frozen
 // time as well (so it stands still during the hold window).
 static SharedState demo_state(uint32_t now) {
@@ -413,6 +372,20 @@ static SharedState demo_state(uint32_t now) {
   s.trip.motor_s = tsec;
   s.trip.on_s = tsec;
   s.trip.turning = true;
+
+  // Peaks since boot: fixed values near the maxima of the synthetic waves above (a real
+  // recorder reaches them within the first minute and then only holds them).
+  {
+    PeaksState &pk = s.peaks;
+    pk.power_w = 2915.0f;
+    pk.i_bat_a = 60.0f;
+    pk.i_mot_a = 120.0f;
+    pk.rpm = 3000.0f;
+    pk.temp_fet_c = 44.0f;
+    pk.temp_mot_c = 40.0f;
+    pk.speed_mm_s = (int32_t)(14.0f / SPEED_FACTOR);
+    pk.have = PEAK_POWER | PEAK_IBAT | PEAK_IMOT | PEAK_RPM | PEAK_TFET | PEAK_TMOT | PEAK_SPEED;
+  }
 
 #if TOTALS_ENABLE
   // Lifetime totals: a well-used boat (1234.5 h on the motor, 4321 NM) adding this trip; the
@@ -594,19 +567,22 @@ static bool poll_button(DispCtx &c, uint32_t now) {
     c.last_press_ms = now ? now : 1u;
     c.st.last_change_ms = now;
     restore_contrast(c, "button");
-    bool dismissed = false;  // a short press that only dismissed the pump alarm
+    bool dismissed = false;  // a short press / double click that only dismissed the pump alarm
 #if PUMP_TACH_ENABLE
-    // Any press on the pump alarm dismisses it (until the next stall). A short press does
-    // nothing else; a long one still goes back to MAIN below.
+    // Any press on the pump alarm dismisses it (until the next stall). A short press or a
+    // double click does nothing else; a long one still goes back to MAIN below.
     if (c.prev.overlay == OVERLAY_PUMP && ev != ButtonEvent::VeryLong) {
       c.st.pump_ack = c.pump_alarms;
-      dismissed = ev == ButtonEvent::Short;
+      dismissed = ev == ButtonEvent::Short || ev == ButtonEvent::Double;
       changed = true;
       ESP_LOGI(TAG, "display: pump alarm %lu dismissed", (unsigned long)c.pump_alarms);
     }
 #endif
     if (ev == ButtonEvent::Short) {
       if (!dismissed) changed = set_screen(c, (uint8_t)((c.screen + 1u) % SCREEN_COUNT), "short press");
+    } else if (ev == ButtonEvent::Double) {
+      if (!dismissed)
+        changed = set_screen(c, (uint8_t)((c.screen + SCREEN_COUNT - 1u) % SCREEN_COUNT), "double click");
     }
 #if OTA_ENABLE
     // The rest of a hold whose long press (1.5 s in) already went back to MAIN or asked the
@@ -781,9 +757,10 @@ bool display_start() {
   btn.pull_up_en = BUTTON_ACTIVE_LOW ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE;
   btn.pull_down_en = BUTTON_ACTIVE_LOW ? GPIO_PULLDOWN_DISABLE : GPIO_PULLDOWN_ENABLE;
   gpio_config(&btn);
-  ESP_LOGI(TAG, "OLED: button on GPIO%d (active %s, debounce %u ms, long press %u ms, auto-return %lu ms)", (int)PIN_BUTTON,
-           BUTTON_ACTIVE_LOW ? "low, pull-up" : "high, pull-down", (unsigned)BUTTON_DEBOUNCE_MS,
-           (unsigned)BUTTON_LONG_PRESS_MS, (unsigned long)SCREEN_AUTO_RETURN_MS);
+  ESP_LOGI(TAG,
+           "OLED: button on GPIO%d (active %s, debounce %u ms, double click %u ms, long press %u ms, auto-return %lu ms)",
+           (int)PIN_BUTTON, BUTTON_ACTIVE_LOW ? "low, pull-up" : "high, pull-down", (unsigned)BUTTON_DEBOUNCE_MS,
+           (unsigned)BUTTON_DOUBLE_CLICK_MS, (unsigned)BUTTON_LONG_PRESS_MS, (unsigned long)SCREEN_AUTO_RETURN_MS);
 #else
   ESP_LOGI(TAG, "OLED: no button (PIN_BUTTON -1): main screen only");
 #endif
