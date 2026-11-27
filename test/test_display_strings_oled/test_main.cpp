@@ -5,6 +5,12 @@
 // rules, character budgets, determinism. Fault names come from vesc_getvalues.h
 // (checked here as used).
 // Compiles with: -std=c++17 -DUNIT_TEST -Iinclude ; includes only Arduino-free headers.
+//
+// The PUMP screen expectations ("tgt 66.0") are written for a target 10 C below the VESC's
+// default derating start; fixed here, before config.h sees it, so retuning config.h does not
+// break the tests.
+#define PUMP_TARGET_MARGIN_C 10
+
 #include <unity.h>
 
 #include <stdint.h>

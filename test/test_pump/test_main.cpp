@@ -2,8 +2,15 @@
 // include/pump_logic.h: targets from the VESC's limits, the OFF / RUN / FULL / BLIND modes,
 // start / stop with hysteresis and after-run, the PI loop with its anti-windup and bumpless
 // transfers, the inputs taken from the VESC telemetry and the LEDC duty conversion.
-// Compiles with: -std=c++17 -DUNIT_TEST -Iinclude ; the config.h defaults apply (Kp 8,
-// Ki 0.1, Kd 0, min 20 %, blind 100 %, margin 10 C, band 15 C, hysteresis 5 C, after-run 60 s).
+// Compiles with: -std=c++17 -DUNIT_TEST -Iinclude.
+//
+// The scenarios below are written for a minimum duty of 20 % and a target 10 C below the
+// derating start (66 C with the VESC's default limits). Both are fixed here, before config.h
+// sees them, so retuning the shipped config.h does not break the tests. The other config.h
+// defaults apply (Kp 8, Ki 0.1, Kd 0, blind 100 %, band 15 C, hysteresis 5 C, after-run 60 s).
+#define PUMP_MIN_DUTY_PCT 20
+#define PUMP_TARGET_MARGIN_C 10
+
 #include <unity.h>
 
 #include <math.h>

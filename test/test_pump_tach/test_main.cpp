@@ -1,9 +1,15 @@
 // Unity tests (pio test -e native) for the coolant pump's tachometer logic in
 // include/pump_tach.h: the rpm over the window, the spin-up / spin-down grace, STALL and
 // NO_SIGNAL with their recovery, RUNS_AT_0, the alarm counter and the no-verdict band.
-// Compiles with: -std=c++17 -DUNIT_TEST -Iinclude ; the config.h defaults apply (period
-// 500 ms, window 2000 ms, 1 pulse/rev, min 200 rpm, spin-up 3 s, stall 5 s, spin-down 5 s,
-// OK hold 2 s, minimum duty 20 %).
+// Compiles with: -std=c++17 -DUNIT_TEST -Iinclude.
+//
+// The scenarios below are written for a 200 rpm "turning" threshold and a 20 % minimum duty.
+// Both are fixed here, before config.h sees them, so retuning the shipped config.h does not
+// break the tests. The other config.h defaults apply (period 500 ms, window 2000 ms,
+// 1 pulse/rev, spin-up 3 s, stall 5 s, spin-down 5 s, OK hold 2 s).
+#define PUMP_TACH_MIN_RPM 200
+#define PUMP_MIN_DUTY_PCT 20
+
 #include <unity.h>
 
 #include <stdint.h>
