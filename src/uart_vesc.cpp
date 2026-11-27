@@ -6,11 +6,9 @@
 //
 // Things this file is built around (see the README, section 3b):
 //
-//  * HP UART VESC_UART_PORT (config.h board block). FireBeetle C6: UART0 - UART1 is the
-//    GNSS, the LP UART's pins are fixed to the GNSS's 4/5 and the console is USB-Serial/
-//    JTAG (config.h refuses a UART console), so UART0 is free once the ROM is done with
-//    it. S3-Zero: UART2, which leaves UART0 and its ROM boot-log pads alone. Either way
-//    it is routed to the CAN transceiver's old pins.
+//  * HP UART VESC_UART_PORT (config.h): UART2. UART1 is the GNSS, the console is USB-Serial/
+//    JTAG (config.h refuses a UART console), and UART0 and its ROM boot-log pads are left
+//    alone. It is routed to the CAN transceiver's old pins.
 //
 //  * The only bytes ever transmitted are the 6-byte COMM_GET_VALUES request and, for the
 //    coolant pump's thresholds (PUMP_READS_MCCONF), a 6-byte COMM_GET_MCCONF in one poll

@@ -1,10 +1,9 @@
-# vesc-dashboard: ESP-IDF 6.1 defaults for both boards (ESP32-C6 FireBeetle 2, ESP32-S3-Zero).
+# vesc-dashboard: ESP-IDF 6.1 defaults for the Waveshare ESP32-S3-Zero (ESP32-S3).
 # These reproduce what the Arduino core used to set implicitly. The builder derives
 # sdkconfig.<env> from this file; edit here, never in the generated file.
 #
-# No CONFIG_IDF_TARGET here: the target is the board JSON's build.mcu (esp32c6 for the FireBeetle,
-# esp32s3 for the S3-Zero), which the builder passes as -DIDF_TARGET. ESP-IDF then also applies
-# sdkconfig.defaults.<target> right after this file (sdkconfig.defaults.esp32s3).
+# No CONFIG_IDF_TARGET here: the target is the board JSON's build.mcu (esp32s3), which the
+# builder passes as -DIDF_TARGET.
 
 # Flash: 4 MB, QIO, 80 MHz. The PlatformIO builder checks the size against boards/*.json.
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
@@ -32,8 +31,8 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
 # task heartbeats assume millisecond resolution.
 CONFIG_FREERTOS_HZ=1000
 
-# Console and ESP_LOG output over the USB-Serial/JTAG port (GPIO12/13). Output is dropped, never
-# blocked, while no host is attached. UART0 (GPIO16/17) stays the ROM boot console.
+# Console and ESP_LOG output over the USB-Serial/JTAG port (GPIO19/20). Output is dropped, never
+# blocked, while no host is attached. UART0 (GPIO43/44) stays the ROM boot console.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
 # Runtime log level info. Debug lines of this project's own tags are enabled per build with
@@ -42,6 +41,17 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
 # app_main() is the supervisor: it copies a SharedState snapshot and formats ~1 KB log lines.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Both cores, split by job (include/config.h checks every value below):
+#   core 0 (TASK_CORE_RADIO): the BLE controller, the NimBLE host and the ble task (pinned in
+#          sdkconfig.defaults.ble), plus ESP-IDF's own system tasks;
+#   core 1 (TASK_CORE_APP): app_main (the supervisor) and every other task of this firmware,
+#          so the UART / I2C / RMT / TWAI interrupts they install land there as well.
+# The firmware's own tasks therefore share one core, ordered by priority alone
+# (TASK_PRIO_DEADMAN above everything, every worker above the supervisor), and the radio's
+# tasks at priorities 21 / 23 never preempt them.
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
 
 # Optimise for size like the Arduino build (-Os).
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y

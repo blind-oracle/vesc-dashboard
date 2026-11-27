@@ -68,9 +68,8 @@ static const char *TAG = "gnss";
 
 namespace {
 
-// HP UART1 (on the C6 and the S3 alike). The C6's LP UART (16-byte FIFO, different clock) must
-// never be used here. Thin wrapper over driver/uart.h with exactly the
-// semantics the phase machine relies on; the driver is installed in gnss_start().
+// HP UART1. Thin wrapper over driver/uart.h with exactly the semantics the phase machine
+// relies on; the driver is installed in gnss_start().
 constexpr uart_port_t kUart = UART_NUM_1;
 
 struct GnssUart {

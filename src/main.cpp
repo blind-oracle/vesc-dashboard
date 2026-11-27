@@ -1,12 +1,12 @@
-// vesc-dashboard: ESP32-C6 (DFRobot FireBeetle 2) or ESP32-S3 (Waveshare ESP32-S3-Zero) VESC monitor
+// vesc-dashboard: ESP32-S3 (Waveshare ESP32-S3-Zero) VESC monitor
 // (CAN or UART) + SSD1309 OLED dashboard + u-blox GNSS speed
 //
 // app_main(): boot banner, shared state, task watchdog, start the worker tasks, then run
 // the supervisor loop forever on the main task (priority 1): it feeds the task watchdog
 // only while every worker heartbeat is fresh, blinks the LED and prints the periodic
 // telemetry / GNSS / trip / system log lines. It never touches the peripherals.
-// Every task this firmware starts runs on TASK_CORE_APP, the main task included (on the
-// dual-core S3 that is core 1, via CONFIG_ESP_MAIN_TASK_AFFINITY); the radio has core 0.
+// Every task this firmware starts runs on TASK_CORE_APP, the main task included (core 1,
+// via CONFIG_ESP_MAIN_TASK_AFFINITY); the radio has core 0.
 //
 // A boot asked for by the long button hold (src/ota.cpp) is UPDATE MODE instead: only the
 // display task and the Wi-Fi upload server run, the dead-man's cut is held, the coolant pump

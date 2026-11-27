@@ -15,7 +15,7 @@
 // liveness watchdog needs EVERY advert, not one per scan instance), BLE_HS_FOREVER. Nothing else
 // ever uses the radio - no connections, no advertising - so nothing interrupts the scan.
 //
-// On the dual-core S3 both tasks run on TASK_CORE_RADIO (core 0) and the dead-man task on core 1.
+// Both tasks run on TASK_CORE_RADIO (core 0) and the dead-man task on core 1.
 // What crosses the cores is single-writer, 32 bits or narrower and volatile (Xtensa GCC brackets
 // volatile accesses with memw), and the dead-man reads every age with signed arithmetic.
 #include "ble_scan.h"

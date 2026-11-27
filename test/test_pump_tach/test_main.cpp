@@ -14,7 +14,7 @@
 void setUp() {}
 void tearDown() {}
 
-static_assert(PUMP_TACH_ENABLE, "the native env builds the tach (PIN_PUMP_TACH defaults to 19)");
+static_assert(PUMP_TACH_ENABLE, "the native env builds the tach (PIN_PUMP_TACH defaults to 11)");
 
 // A pump simulator: `rpm` turns into pulses at PUMP_TACH_PPR per revolution.
 struct Sim {

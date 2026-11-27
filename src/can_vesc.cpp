@@ -143,7 +143,7 @@ static uint32_t s_warn_log_ms = 0;
 // Counters written in the TWAI ISR callbacks and read by canTask. Monotonic 32-bit
 // values: the task keeps the value it processed last and acts on the difference.
 // The ISR and canTask share one core (TASK_CORE_APP: the node is created from app_main or
-// canTask, both there) and aligned 32-bit stores are atomic on RV32 and Xtensa alike, so no
+// canTask, both there) and aligned 32-bit stores are atomic on the S3's Xtensa cores, so no
 // lock is needed.
 struct IsrCounters {
   uint32_t rx_dropped;   // on_rx_done: our queue was full, frame lost

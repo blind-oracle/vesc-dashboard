@@ -58,7 +58,7 @@ static_assert(DEADMAN_TIMEOUT_MS >= 1000 && DEADMAN_TIMEOUT_MS <= 60000, "DEADMA
 // ---------------------------------------------------------------- host-task -> task
 // Single writer (the NimBLE host task), single reader (deadmanTask). Plain volatiles:
 // nothing outside deadmanTask derives state from them, and a one-tick-late read is fine.
-// On the dual-core S3 the writer runs on TASK_CORE_RADIO and the reader on TASK_CORE_APP:
+// The writer runs on TASK_CORE_RADIO and the reader on TASK_CORE_APP:
 // each value is 32 bits or narrower (one store), and Xtensa GCC brackets volatile accesses
 // with memw, so a read sees either the old or the new value, never a torn one.
 static volatile uint32_t s_beacon_t_ms[DEADMAN_TAGS] = {0};

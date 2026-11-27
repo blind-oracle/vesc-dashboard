@@ -453,10 +453,10 @@ bool ota_update_mode_start() {
   char ip_str[16];
   snprintf(ip_str, sizeof ip_str, IPSTR, IP2STR(&ip.ip));
 
-  // Priority 1, like the supervisor: on the single-core C6 an upload that arrives faster than
-  // the flash takes it would otherwise run the handler back to back, starve the supervisor and
-  // let the task watchdog fire mid-write. Time slicing shares the core; the display (2) and
-  // the Wi-Fi / lwIP tasks stay above it.
+  // Priority 1, like the supervisor, on TASK_CORE_APP, which it shares with every other firmware
+  // task: an upload that arrives faster than the flash takes it would otherwise run the handler
+  // back to back, starve the supervisor and let the task watchdog fire mid-write. Time slicing
+  // shares the core; the display (2) and the Wi-Fi / lwIP tasks stay above it.
   httpd_config_t hc = HTTPD_DEFAULT_CONFIG();
   hc.task_priority = 1;
   hc.core_id = TASK_CORE_APP;
