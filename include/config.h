@@ -434,7 +434,7 @@
 #define PUMP_D_ALPHA 0.2f // low-pass on the derivative, (0, 1]; only matters with PUMP_KD > 0
 #endif
 #ifndef PUMP_TARGET_MARGIN_C
-#define PUMP_TARGET_MARGIN_C 50 // target = the VESC's derating start minus this (66 C with the VESC defaults)
+#define PUMP_TARGET_MARGIN_C 30 // target = the VESC's derating start minus this (66 C with the VESC defaults)
 #endif
 #ifndef PUMP_ON_BAND_C
 #define PUMP_ON_BAND_C 15 // a stopped pump starts once a temperature is within this of its target (51 C) ...
