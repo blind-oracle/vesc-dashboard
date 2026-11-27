@@ -89,11 +89,11 @@
 #define BOARD_USB_DP 13
 #define BOARD_BOOT_BUTTON 9
 #define BOARD_CUT_PIN_FORBIDDEN(p) ((p) == 8 || (p) == 9 || (p) == 15) // strapping pins 8/9, JTAG select / LED 15
-#define BOARD_PIN_RESERVED(p) 0                                          // nothing beyond the USB pair
+#define BOARD_PIN_RESERVED(p) 0                                        // nothing beyond the USB pair
 #ifndef VESC_UART_PORT
 #define VESC_UART_PORT 0 // UART0: UART1 is the GNSS and the C6 has no UART2
 #endif
-#define TASK_CORE_APP 0   // single core: everything on core 0
+#define TASK_CORE_APP 0 // single core: everything on core 0
 #define TASK_CORE_RADIO 0
 #endif
 
@@ -459,7 +459,7 @@
 #define PUMP_PWM_RES_BITS 10 // LEDC duty resolution, 8..11 (frequency x 2^bits must fit the 80 MHz timer clock)
 #endif
 #ifndef PUMP_MIN_DUTY_PCT
-#define PUMP_MIN_DUTY_PCT 20 // lowest running duty. Kamoer: 0..10 % = stopped, 11..100 % = speed range (measure yours)
+#define PUMP_MIN_DUTY_PCT 25 // lowest running duty. Kamoer: 0..10 % = stopped, 11..100 % = speed range (measure yours)
 #endif
 #ifndef PUMP_BLIND_DUTY_PCT
 #define PUMP_BLIND_DUTY_PCT 100 // temperatures seen, then lost (link down, VESC off): the motor may still be working hard
@@ -483,7 +483,7 @@
 #define PUMP_D_ALPHA 0.2f // low-pass on the derivative, (0, 1]; only matters with PUMP_KD > 0
 #endif
 #ifndef PUMP_TARGET_MARGIN_C
-#define PUMP_TARGET_MARGIN_C 10 // target = the VESC's derating start minus this (66 C with the VESC defaults)
+#define PUMP_TARGET_MARGIN_C 50 // target = the VESC's derating start minus this (66 C with the VESC defaults)
 #endif
 #ifndef PUMP_ON_BAND_C
 #define PUMP_ON_BAND_C 15 // a stopped pump starts once a temperature is within this of its target (51 C) ...
@@ -530,7 +530,7 @@
 #define PUMP_TACH_PPR 1 // FG pulses per revolution: Kamoer's brushless pumps give 1 (one motor series 6)
 #endif
 #ifndef PUMP_TACH_MIN_RPM
-#define PUMP_TACH_MIN_RPM 200 // below this the pump counts as not turning. Set to ~1/3 of the rpm at PUMP_MIN_DUTY_PCT
+#define PUMP_TACH_MIN_RPM 300 // below this the pump counts as not turning. Set to ~1/3 of the rpm at PUMP_MIN_DUTY_PCT
 #endif
 #ifndef PUMP_TACH_WINDOW_MS
 #define PUMP_TACH_WINDOW_MS 2000 // rpm = the pulses over this window (a multiple of PUMP_PERIOD_MS, <= 16 periods)
